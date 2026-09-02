@@ -1,0 +1,2 @@
+# Marker file: tells type checkers (mypy, pyright) that this package
+# ships inline type annotations and should be type-checked.

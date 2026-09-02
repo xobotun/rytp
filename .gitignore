@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# rytp runtime data
+data/
+yt-dlp.exe
+
+# Tests
+.pytest_tmp/**
