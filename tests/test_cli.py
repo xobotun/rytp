@@ -42,24 +42,18 @@ def test_each_group_help_lists_its_subcommands() -> None:
 
 
 def test_each_stub_exits_nonzero_without_crashing() -> None:
-    # A representative subset — every stub path goes through _not_implemented
-    # and exits 1. We just want to verify they don't crash on import / arg parse.
+    """Every v2 subcommand (still a stub) exits 1 cleanly.
+
+    The wired v1 subcommands (``channel add`` / ``sync`` / ``list``,
+    ``videos add`` / ``list``, ``queue add`` / ``pause`` / ``resume``
+    / ``list``, ``speakers add`` / ``list`` / ``recompute-pauses``,
+    ``transcripts export``) are exercised by their own dedicated
+    tests below. This list contains only the v2 stubs.
+    """
     commands: list[list[str]] = [
-        ["channel", "add", "https://example.com/foo"],
-        ["channel", "sync", "mychannel"],
-        ["channel", "list"],
-        ["videos", "add", "https://example.com/v"],
-        ["videos", "list"],
         ["download", "oSYPC3cc_4A"],
-        ["queue", "add", "1"],
-        ["queue", "list"],
-        ["queue", "pause"],
-        ["queue", "resume"],
         ["queue", "worker"],
         ["transcribe", "1"],
-        ["speakers", "add", "Alex"],
-        ["speakers", "list"],
-        ["speakers", "recompute-pauses"],
         ["speakers", "map", "1"],
         ["mine", "hello"],
         ["splice", "1", "--out", "out.mp4"],
@@ -67,9 +61,116 @@ def test_each_stub_exits_nonzero_without_crashing() -> None:
     ]
     for cmd in commands:
         result = runner.invoke(app, cmd)
-        # All are stubs — exit code 1 is expected. ImportError / parse errors
-        # would be exit code 2 with a stack trace.
+        # Stubs exit 1. ImportError / parse errors would be exit 2
+        # with a stack trace — we want neither.
         assert result.exit_code in (1, 2), f"{cmd!r}: unexpected exit {result.exit_code}\n{result.stdout}"
+
+
+# --- wired v1 subcommands (CRUD) ------------------------------------------
+
+
+def test_videos_add_registers_local_path(tmp_path, monkeypatch):
+    """The exact scenario from the bug report: ``python -m rytp videos add <local-file>`` should succeed."""
+    import sqlite3
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    # Use a fresh data dir so we don't touch the user's DB.
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    # Create a fake local video file.
+    fake = tmp_path / "fake.mp4"
+    fake.write_bytes(b"\x00" * 16)
+
+    result = _CR().invoke(app, ["videos", "add", str(fake)])
+    assert result.exit_code == 0, result.stdout
+    assert "video 1" in result.stdout
+
+    # Verify the row landed in the DB.
+    db = Database(config.paths.db)
+    try:
+        row = db.conn.execute("SELECT * FROM videos WHERE id = 1").fetchone()
+    finally:
+        db.close()
+    assert row is not None
+    assert row["source"] == "local"
+    assert row["downloaded"] == 1
+    assert row["local_path"].endswith("fake.mp4")
+
+
+def test_speakers_add_then_list(tmp_path, monkeypatch):
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["speakers", "add", "Alice", "--alias", "Al"])
+    assert r.exit_code == 0, r.stdout
+    assert "Alice" in r.stdout
+
+    r = _CR().invoke(app, ["speakers", "list"])
+    assert r.exit_code == 0, r.stdout
+    assert "Alice" in r.stdout
+    assert "Al" in r.stdout
+
+
+def test_queue_pause_resume_round_trip(tmp_path, monkeypatch):
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["queue", "pause"])
+    assert r.exit_code == 0, r.stdout
+    r = _CR().invoke(app, ["queue", "resume"])
+    assert r.exit_code == 0, r.stdout
+
+
+def test_channel_list_on_empty_db_says_no_channels(tmp_path, monkeypatch):
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["channel", "list"])
+    assert r.exit_code == 0, r.stdout
+    assert "no channels yet" in r.stdout.lower() or "no channels" in r.stdout.lower()
+
+
+def test_videos_list_unknown_channel_exits_nonzero(tmp_path, monkeypatch):
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["videos", "list", "--channel", "nope"])
+    assert r.exit_code == 1, r.stdout
+    assert "channel not found" in r.stdout.lower() or "channel not found" in (r.stderr or "").lower()
 
 
 # --- HF_TOKEN gate -------------------------------------------------------

@@ -199,17 +199,33 @@ python -m rytp tui # source checkout
 For anything that doesn't have a TUI screen yet, the CLI is the
 canonical interface.
 
+# Subcommand status (v1)
+
+The 21 subcommands from §6 split into two groups:
+
+* **Wired in v1 (12 commands + 1 already-canonical `transcripts export`):**
+  `channel add` / `sync` / `list`, `videos add` / `list`,
+  `queue add` / `pause` / `resume` / `list`,
+  `speakers add` / `list` / `recompute-pauses`,
+  `transcripts export`.
+* **v2 stubs (7 commands):** `download`, `queue worker`, `transcribe`,
+  `speakers map`, `mine`, `splice`, `tui`. Each prints
+  `not implemented yet` to stderr and exits 1.
+
+Run `python -m rytp <subcommand> --help` to see the exact options
+for any of the wired commands.
+
 # Tests
 
 ```bash
 pytest -q
 ```
 
-The test count sits at 165+ (3 skipped) and covers the DB / models /
+The test count sits at 176 (3 skipped) and covers the DB / models /
 config / CLI gate, channels + download + queue, transcribe
 (extract + chunking + faster-whisper), diarize (none + pyannote),
 the merger + transcribe pipeline, the speaker roster +
 pause-stats, mine + spectrogram, splice + loudnorm + manifest,
-and the markdown transcript export. They run with no external
-services (ffmpeg, faster-whisper, pyannote, yt-dlp, textual are
-all optional and mocked).
+the markdown transcript export, and the wired v1 CLI subcommands.
+They run with no external services (ffmpeg, faster-whisper,
+pyannote, yt-dlp, textual are all optional and mocked).

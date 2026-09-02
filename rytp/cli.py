@@ -7,9 +7,17 @@ The gate runs before any subcommand body so a missing token never
 displays a half-broken TUI: it prints one clear paragraph to stderr
 and exits non-zero.
 
-Each subcommand body is currently a stub. Later segments replace
-them in place — the wiring (group nesting, argument names, help
-text) is what this module commits to.
+**v1 subcommand status** (DESIGN §6):
+
+* **Wired (have a backend):** ``channel add`` / ``sync`` / ``list``,
+  ``videos add`` / ``list``, ``queue add`` / ``pause`` / ``resume`` /
+  ``list``, ``speakers add`` / ``list`` / ``recompute-pauses``,
+  ``transcripts export``.
+* **Stubs (no backend yet — v2 work):** ``download``, ``queue worker``,
+  ``transcribe``, ``speakers map`` (TUI), ``mine``, ``splice``, ``tui``.
+
+A stub exits 1 with a clear ``"not implemented yet"`` message so
+the user always knows where they stand.
 """
 from __future__ import annotations
 
@@ -147,75 +155,253 @@ def _main_callback(
 
 
 # ---------------------------------------------------------------------------
-# Subcommand stubs (DESIGN §6)
+# Helpers shared by the wired subcommands
 # ---------------------------------------------------------------------------
 
 
 def _not_implemented(name: str) -> None:
+    """Print a one-line stub message and exit 1.
+
+    Used by the v2 subcommands (``download``, ``transcribe``, etc.)
+    that have no working backend yet.
+    """
     typer.echo(f"rytp {name}: not implemented yet", err=True)
     raise typer.Exit(code=1)
 
 
-# --- channel group ---------------------------------------------------------
+def _open_db() -> "Database":
+    """Open the global DB, run migrations, return the connection holder.
+
+    Most subcommands take a copy of this. The returned object is
+    a real :class:`rytp.db.Database`; callers are expected to close
+    it (or use it via the ``with`` form).
+    """
+    from rytp.db import Database
+
+    db = Database(config.paths.db)
+    db.migrate()
+    return db
+
+
+def _print_table(headers: list[str], rows: list[list[str]]) -> None:
+    """Print a small fixed-width table for the ``list`` subcommands.
+
+    Columns are sized to fit the widest cell; first column left
+    aligned, the rest left aligned too (numbers read better
+    left-aligned for short rows).
+    """
+    widths = [
+        max(len(h), *(len(r[i]) for r in rows)) if rows else len(h)
+        for i, h in enumerate(headers)
+    ]
+    sep = "  "
+    fmt = sep.join(f"{{:<{w}}}" for w in widths)
+    typer.echo(fmt.format(*headers))
+    typer.echo(fmt.format(*("-" * w for w in widths)))
+    for r in rows:
+        typer.echo(fmt.format(*r))
+
+
+# ---------------------------------------------------------------------------
+# channel group (wired)
+# ---------------------------------------------------------------------------
 
 
 @channel_app.command("add")
-def channel_add(url: str) -> None:
-    """Register a channel."""
-    _not_implemented("channel add")
+def channel_add(
+    url: str = typer.Argument(..., help="Channel URL (YouTube or any yt-dlp-supported site)."),
+    title: Optional[str] = typer.Option(
+        None, "--title", help="Override the title. Probed from yt-dlp if not given."
+    ),
+) -> None:
+    """Register a channel in the ``channels`` table."""
+    from rytp.channels import add_channel
+    from rytp.download.ytdlp import RealYtDlpRunner
+
+    db = _open_db()
+    try:
+        try:
+            runner = RealYtDlpRunner()
+        except ImportError as e:
+            typer.echo(str(e), err=True)
+            raise typer.Exit(code=1) from e
+        cid = add_channel(db, runner, url, title=title)
+    finally:
+        db.close()
+    typer.echo(f"channel {cid}: {url}")
 
 
 @channel_app.command("sync")
-def channel_sync(name: str) -> None:
-    """yt-dlp flat-playlist, upsert into ``videos``."""
-    _not_implemented("channel sync")
+def channel_sync(
+    name: str = typer.Argument(
+        ...,
+        help="Channel title, URL, or id. The DB is searched for any of these.",
+    ),
+) -> None:
+    """yt-dlp flat-playlist listing; upsert every video into ``videos``."""
+    from rytp.channels import sync_channel
+    from rytp.download.ytdlp import RealYtDlpRunner
+
+    db = _open_db()
+    try:
+        try:
+            runner = RealYtDlpRunner()
+        except ImportError as e:
+            typer.echo(str(e), err=True)
+            raise typer.Exit(code=1) from e
+        new_count = sync_channel(db, runner, name)
+    finally:
+        db.close()
+    typer.echo(f"added {new_count} new videos for channel {name}")
 
 
 @channel_app.command("list")
 def channel_list() -> None:
-    """Show channels + counts."""
-    _not_implemented("channel list")
+    """Show channels + per-channel video count."""
+    from rytp.channels import list_channels
+
+    db = _open_db()
+    try:
+        rows = list_channels(db)
+    finally:
+        db.close()
+    if not rows:
+        typer.echo("(no channels yet — try `rytp channel add <url>`)")
+        return
+    _print_table(
+        ["id", "title", "videos", "url"],
+        [[str(r["id"]), r["title"], str(r["n_videos"]), r["url"]] for r in rows],
+    )
 
 
-# --- videos group ----------------------------------------------------------
+# ---------------------------------------------------------------------------
+# videos group (wired)
+# ---------------------------------------------------------------------------
 
 
 @videos_app.command("add")
-def videos_add(url_or_path: str) -> None:
-    """Register a single video: URL, any yt-dlp URL, or a local file path."""
-    _not_implemented("videos add")
+def videos_add(
+    url_or_path: str = typer.Argument(
+        ...,
+        help="A YouTube URL, any yt-dlp URL, or a local file path.",
+    ),
+) -> None:
+    """Register a single video: URL or local file path.
+
+    Local files are detected by :func:`rytp.channels._is_local_path`;
+    no yt-dlp call is made for them, and ``source='local'``,
+    ``downloaded=True`` are set in the resulting row. URLs are
+    probed via yt-dlp, which requires the ``[yt-dlp]`` extra to be
+    installed.
+    """
+    from rytp.channels import _is_local_path, register_video
+    from rytp.download.ytdlp import RealYtDlpRunner
+
+    db = _open_db()
+    try:
+        if _is_local_path(url_or_path):
+            # No runner needed for local files; ``register_video`` skips
+            # the probe entirely. Pass a placeholder to satisfy the
+            # type signature — the function never calls it.
+            class _UnusedRunner:
+                def probe(self, url: str):  # pragma: no cover
+                    raise RuntimeError("unreachable: local file branch")
+
+            runner: object = _UnusedRunner()
+        else:
+            try:
+                runner = RealYtDlpRunner()
+            except ImportError as e:
+                typer.echo(str(e), err=True)
+                raise typer.Exit(code=1) from e
+        vid = register_video(db, runner, url_or_path)
+    finally:
+        db.close()
+    typer.echo(f"video {vid}: {url_or_path}")
 
 
 @videos_app.command("list")
 def videos_list(
-    channel: Optional[str] = typer.Option(None, "--channel"),
-    kind: Optional[str] = typer.Option(None, "--kind"),
-    source: Optional[str] = typer.Option(None, "--source"),
+    channel: Optional[str] = typer.Option(
+        None, "--channel", help="Restrict to one channel (id, title, or URL)."
+    ),
+    kind: Optional[str] = typer.Option(
+        None, "--kind", help="Filter by kind: video, short, livestream, other."
+    ),
+    source: Optional[str] = typer.Option(
+        None, "--source", help="Filter by source: youtube, ytdlp, local."
+    ),
 ) -> None:
-    """Browse the index."""
-    _not_implemented("videos list")
+    """Browse the ``videos`` index."""
+    from rytp.channels import list_videos, resolve_channel_id
+
+    db = _open_db()
+    try:
+        channel_id: Optional[int] = None
+        if channel is not None:
+            channel_id = resolve_channel_id(db, channel)
+            if channel_id is None:
+                typer.echo(f"channel not found: {channel}", err=True)
+                raise typer.Exit(code=1)
+        rows = list_videos(db, channel_id=channel_id, kind=kind, source=source)
+    finally:
+        db.close()
+    if not rows:
+        typer.echo("(no videos match these filters)")
+        return
+    table_rows: list[list[str]] = []
+    for v in rows:
+        table_rows.append(
+            [
+                str(v.id),
+                v.source,
+                v.kind,
+                v.title or "",
+                "yes" if v.downloaded else "no",
+            ]
+        )
+    _print_table(
+        ["id", "source", "kind", "title", "downloaded"],
+        table_rows,
+    )
 
 
-# --- singleton: download ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# singleton: download (stub)
+# ---------------------------------------------------------------------------
 
 
 @app.command("download")
 def download_cmd(
     video_id_or_url: str = typer.Argument(...),
 ) -> None:
-    """Download a single video, mark ``downloaded``."""
+    """Download a single video, mark ``downloaded``.
+
+    Stub: backend wires up in v2. Use the ``yt-dlp`` Python API
+    directly (or the CLI) for now.
+    """
     _not_implemented("download")
 
 
-# --- queue group -----------------------------------------------------------
+# ---------------------------------------------------------------------------
+# queue group (mostly wired; worker is a stub)
+# ---------------------------------------------------------------------------
 
 
 @queue_app.command("add")
 def queue_add(
-    video_ids: list[int] = typer.Argument(...),
+    video_ids: list[int] = typer.Argument(..., help="Video row ids to enqueue."),
 ) -> None:
-    """Enqueue videos."""
-    _not_implemented("queue add")
+    """Enqueue videos for the download worker."""
+    from rytp.download.queue import Queue
+
+    db = _open_db()
+    try:
+        q = Queue(db)
+        new_ids = q.enqueue(video_ids)
+    finally:
+        db.close()
+    typer.echo(f"enqueued {len(new_ids)} (already pending/running: {len(video_ids) - len(new_ids)})")
 
 
 @queue_app.command("worker")
@@ -226,23 +412,68 @@ def queue_worker() -> None:
 
 @queue_app.command("pause")
 def queue_pause() -> None:
-    """Flip the global pause flag to True."""
-    _not_implemented("queue pause")
+    """Pause the queue: the worker stops claiming new items."""
+    from rytp.download.queue import Queue
+
+    db = _open_db()
+    try:
+        Queue(db).pause()
+    finally:
+        db.close()
+    typer.echo("queue paused")
 
 
 @queue_app.command("resume")
 def queue_resume() -> None:
-    """Flip the global pause flag to False."""
-    _not_implemented("queue resume")
+    """Resume the queue: the worker starts claiming new items again."""
+    from rytp.download.queue import Queue
+
+    db = _open_db()
+    try:
+        Queue(db).resume()
+    finally:
+        db.close()
+    typer.echo("queue resumed")
 
 
 @queue_app.command("list")
 def queue_list() -> None:
-    """Show queue contents."""
-    _not_implemented("queue list")
+    """Show queue contents (pending, running, done, failed counts + rows)."""
+    from rytp.download.queue import Queue
+
+    db = _open_db()
+    try:
+        q = Queue(db)
+        stats = q.stats()
+        rows = q.list_pending(limit=C.QUEUE_LIST_LIMIT)
+    finally:
+        db.close()
+    typer.echo(
+        f"pending={stats.get('pending', 0)} "
+        f"running={stats.get('running', 0)} "
+        f"done={stats.get('done', 0)} "
+        f"failed={stats.get('failed', 0)}"
+    )
+    if not rows:
+        return
+    _print_table(
+        ["id", "video_id", "status", "started_at", "attempts"],
+        [
+            [
+                str(r["id"]),
+                str(r["video_id"]),
+                r["status"],
+                r["started_at"] or "",
+                str(r["attempts"]),
+            ]
+            for r in rows
+        ],
+    )
 
 
-# --- singleton: transcribe -------------------------------------------------
+# ---------------------------------------------------------------------------
+# singleton: transcribe (stub)
+# ---------------------------------------------------------------------------
 
 
 @app.command("transcribe")
@@ -252,43 +483,79 @@ def transcribe_cmd(
     diarizer: Optional[str] = typer.Option(None, "--diarizer"),
     combined: Optional[str] = typer.Option(None, "--combined"),
 ) -> None:
-    """Extract audio WAV, run STT (chunked) + Diarizer (full audio), write ``words``."""
-    # The HF_TOKEN gate runs in the top-level callback. By the time we
-    # reach this body, either the token is present or the user picked
-    # a non-gated engine.
+    """Extract audio WAV, run STT (chunked) + Diarizer (full audio), write ``words``.
+
+    Stub: backend wires up in v2. The HF_TOKEN pre-launch gate
+    (DESIGN §12) still runs in the top-level callback for the
+    engines you named.
+    """
     _not_implemented("transcribe")
 
 
-# --- speakers group --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# speakers group (mostly wired; map is a stub)
+# ---------------------------------------------------------------------------
 
 
 @speakers_app.command("add")
 def speakers_add(
-    label: str = typer.Argument(...),
-    alias: list[str] = typer.Option([], "--alias"),
+    label: str = typer.Argument(..., help="Canonical speaker label (e.g. 'Alice')."),
+    alias: list[str] = typer.Option(
+        [], "--alias", help="Add an alias for the speaker. Repeatable."
+    ),
     notes: Optional[str] = typer.Option(None, "--notes"),
 ) -> None:
-    """Add to the global ``speakers`` roster."""
-    _not_implemented("speakers add")
+    """Add to the global ``speakers`` roster. Idempotent on ``label``."""
+    from rytp.speakers import add_speaker
+
+    db = _open_db()
+    try:
+        sid = add_speaker(db, label, aliases=alias, notes=notes)
+    finally:
+        db.close()
+    typer.echo(f"speaker {sid}: {label}")
 
 
 @speakers_app.command("list")
 def speakers_list() -> None:
-    """List the roster."""
-    _not_implemented("speakers list")
+    """List the global roster."""
+    from rytp.speakers import list_speakers
+
+    db = _open_db()
+    try:
+        rows = list_speakers(db)
+    finally:
+        db.close()
+    if not rows:
+        typer.echo("(no speakers yet — try `rytp speakers add <label>`)")
+        return
+    _print_table(
+        ["id", "label", "aliases", "notes"],
+        [
+            [str(s.id), s.label, ", ".join(s.aliases), s.notes or ""]
+            for s in rows
+        ],
+    )
 
 
 @speakers_app.command("recompute-pauses")
 def speakers_recompute_pauses() -> None:
-    """Recompute ``speaker_pause_stats`` for every speaker that has changed."""
-    _not_implemented("speakers recompute-pauses")
+    """Recompute ``speaker_pause_stats`` for every speaker."""
+    from rytp.speakers import recompute_pause_stats
+
+    db = _open_db()
+    try:
+        n = recompute_pause_stats(db)
+    finally:
+        db.close()
+    typer.echo(f"recomputed pause stats for {n} speaker(s)")
 
 
 @speakers_app.command("map")
 def speakers_map(
     video_id: int = typer.Argument(...),
 ) -> None:
-    """Open the TUI mapper for this video."""
+    """Open the TUI mapper for this video (stub: v2)."""
     _not_implemented("speakers map")
 
 

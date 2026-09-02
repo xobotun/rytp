@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 
 from rytp import channels
-from rytp.channels import add_channel, list_videos, register_video, sync_channel
+from rytp.channels import (
+    add_channel,
+    list_channels,
+    list_videos,
+    register_video,
+    resolve_channel_id,
+    sync_channel,
+)
 from rytp.download.ytdlp import ChannelVideo, VideoMetadata
 
 
@@ -139,3 +146,54 @@ def test_register_video_non_youtube_url_uses_ytdlp_source(db) -> None:
     vid = register_video(db, runner, "https://vimeo.com/12345")
     row = db.conn.execute("SELECT source FROM videos WHERE id = ?", (vid,)).fetchone()
     assert row["source"] == "ytdlp"
+
+
+# ---------------------------------------------------------------------------
+# list_channels + resolve_channel_id
+# ---------------------------------------------------------------------------
+
+
+def test_list_channels_empty(db) -> None:
+    assert list_channels(db) == []
+
+
+def test_list_channels_includes_video_count(db) -> None:
+    cid = add_channel(db, FakeRunner(), "https://example.com/@a", title="A")
+    # Two videos on this channel.
+    db.conn.execute(
+        "INSERT INTO videos (source, kind, title, channel_id) "
+        "VALUES ('youtube', 'video', 'v1', ?)",
+        (cid,),
+    )
+    db.conn.execute(
+        "INSERT INTO videos (source, kind, title, channel_id) "
+        "VALUES ('youtube', 'video', 'v2', ?)",
+        (cid,),
+    )
+    db.conn.commit()
+    rows = list_channels(db)
+    assert len(rows) == 1
+    assert rows[0]["id"] == cid
+    assert rows[0]["title"] == "A"
+    assert rows[0]["n_videos"] == 2
+
+
+def test_resolve_channel_id_by_id(db) -> None:
+    cid = add_channel(db, FakeRunner(), "https://example.com/@a", title="A")
+    assert resolve_channel_id(db, cid) == cid
+    assert resolve_channel_id(db, str(cid)) == cid
+
+
+def test_resolve_channel_id_by_title(db) -> None:
+    cid = add_channel(db, FakeRunner(), "https://example.com/@a", title="A")
+    assert resolve_channel_id(db, "A") == cid
+
+
+def test_resolve_channel_id_by_url(db) -> None:
+    cid = add_channel(db, FakeRunner(), "https://example.com/@a", title="A")
+    assert resolve_channel_id(db, "https://example.com/@a") == cid
+
+
+def test_resolve_channel_id_missing(db) -> None:
+    assert resolve_channel_id(db, "nope") is None
+    assert resolve_channel_id(db, 9999) is None

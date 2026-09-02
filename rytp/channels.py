@@ -10,6 +10,7 @@ Public surface:
 
 * :func:`add_channel` — register a YouTube (or yt-dlp-compatible)
   channel.
+* :func:`list_channels` — browse the channels table.
 * :func:`sync_channel` — re-list the channel and upsert all videos.
 * :func:`list_videos` — browse the videos table with optional filters.
 * :func:`register_video` — register a single URL or local file path.
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,23 @@ def add_channel(db: Database, runner: YtDlpRunner, url: str, title: str | None =
     )
     db.conn.commit()
     return cursor.lastrowid
+
+
+def list_channels(db: Database) -> list[sqlite3.Row]:
+    """Return every row of the ``channels`` table, newest first.
+
+    Returned rows include a derived ``n_videos`` column counting the
+    number of ``videos`` rows pointing at each channel — handy for
+    ``rytp channel list`` which shows a one-line summary per channel.
+    """
+    return db.conn.execute(
+        """
+        SELECT c.id, c.url, c.title, c.last_synced_at,
+               (SELECT COUNT(*) FROM videos v WHERE v.channel_id = c.id) AS n_videos
+        FROM channels c
+        ORDER BY c.id DESC
+        """
+    ).fetchall()
 
 
 def sync_channel(db: Database, runner: YtDlpRunner, channel_id_or_name: int | str) -> int:
@@ -229,6 +248,31 @@ def register_video(
         "metadata_json": "{}",
     }
     return db.upsert_video(row)
+
+
+def resolve_channel_id(db: Database, name_or_id: str | int) -> int | None:
+    """Look up a channel by id (int / numeric str) or by title/URL (str).
+
+    Returns the row id, or ``None`` if no match is found. Used by
+    the CLI's ``videos list --channel`` filter.
+    """
+    if isinstance(name_or_id, int):
+        row = db.conn.execute(
+            "SELECT id FROM channels WHERE id = ?", (name_or_id,)
+        ).fetchone()
+    else:
+        # Try id-as-string first (handy when shell passing a number).
+        if name_or_id.isdigit():
+            row = db.conn.execute(
+                "SELECT id FROM channels WHERE id = ?", (int(name_or_id),)
+            ).fetchone()
+            if row:
+                return row["id"]
+        row = db.conn.execute(
+            "SELECT id FROM channels WHERE title = ? OR url = ?",
+            (name_or_id, name_or_id),
+        ).fetchone()
+    return row["id"] if row else None
 
 
 def _is_local_path(s: str) -> bool:
