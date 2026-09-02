@@ -17,3 +17,8 @@ To have a console line tools to:
 	- depending on level of cohesion the user wants, either find single-word segments, or maximize uninterruptedness of a segment, preferring the longer ones over shorter ones.
 	- segments found should be close to each other in audio spectrum, to sound more naturally.
 - glue the result together. Given the original videos, the timestamps provided by the datamining stage, and ffmpeg – extract the clips from the originals, and glue them together in order. Also provide a list of original URLs used and timestamps cut out in order they appear in the final result.
+
+# Hardware:
+- 32 GiB RAM
+- 16 GiB RTX 3080 Laptop GPU
+- i7-11800H @ 2.30 GHz
