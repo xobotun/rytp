@@ -159,6 +159,32 @@ extras (``yt-dlp``, ``faster-whisper``, ``pyannote``, ``textual``)
 still need to be installed via pip for the corresponding features
 to work — there's no way around that.
 
+## Option C — work entirely offline (no yt-dlp, no YouTube)
+
+The pipeline doesn't require YouTube. If you already have media on
+disk — say, files from a manual ``yt-dlp`` run that produced split
+streams, or anything ffmpeg can read — register them directly and
+skip the network step entirely:
+
+```bash
+# Register a single video with a separate audio file (typical of
+# `yt-dlp -f "worstvideo+bestaudio"` without ffmpeg to merge):
+rytp videos add "/path/to/video.mp4" \
+    --audio "/path/to/audio.webm" \
+    --youtube-id oSYPC3cc_4A \
+    --title "Смерть чиновника"
+
+# Or register a single already-merged local file:
+rytp videos add "/path/to/merged.mp4"
+
+# Then run the same downstream pipeline:
+rytp transcribe 1 --stt faster-whisper --diarizer none
+rytp transcripts export 1
+```
+
+See [Separate audio/video files](#separate-audiovideo-files) for
+the full pair-registration story and what ``--audio`` does.
+
 # Data directory
 
 By default the SQLite database and the audio / output trees live
@@ -201,19 +227,140 @@ canonical interface.
 
 # Subcommand status (v1)
 
-The 21 subcommands from §6 split into two groups:
+All 21 subcommands from §6 are wired in v1. The CRUD subcommands
+(channel / videos / queue / speakers / transcripts) just work; the
+heavy-lift subcommands (download / transcribe / mine / splice / tui /
+speakers map) require their respective optional extras
+(`pip install rytp[yt-dlp]`, `rytp[stt]`, `rytp[pyannote]`,
+`rytp[all]`) to actually run, and otherwise print a one-line
+install-hint error to stderr.
 
-* **Wired in v1 (12 commands + 1 already-canonical `transcripts export`):**
-  `channel add` / `sync` / `list`, `videos add` / `list`,
-  `queue add` / `pause` / `resume` / `list`,
-  `speakers add` / `list` / `recompute-pauses`,
-  `transcripts export`.
-* **v2 stubs (7 commands):** `download`, `queue worker`, `transcribe`,
-  `speakers map`, `mine`, `splice`, `tui`. Each prints
-  `not implemented yet` to stderr and exits 1.
+Quick reference:
+
+* **Channels:** `channel add` / `sync` / `list`
+* **Videos:** `videos add` / `list`
+* **Download:** `download` (single), `queue add` / `worker` / `pause` / `resume` / `list`
+* **Transcribe:** `transcribe` (per video)
+* **Speakers:** `speakers add` / `list` / `recompute-pauses` / `map`
+* **Mine:** `mine <query>`
+* **Splice:** `splice <clip-id> --out out.mp4 [--mode concat|stream-copy]`
+* **TUI:** `tui`
+* **Transcripts:** `transcripts export <video-id>`
 
 Run `python -m rytp <subcommand> --help` to see the exact options
-for any of the wired commands.
+for any of these.
+
+# Separate audio/video files
+
+yt-dlp can download audio and video streams as separate files when
+the format selector contains a ``+`` (e.g.,
+``worstvideo[height=720]+bestaudio[language=ru]``). rytp handles
+this transparently:
+
+* **Download stage**: detects when audio/video are downloaded
+  separately and merges them into a single container using ffmpeg.
+  The merged file is stored as ``videos.downloaded_path`` and the
+  original audio file path is stored as ``videos.downloaded_audio_path``.
+* **Audio extraction**: when a separate audio file is present, the
+  ``extract_audio`` stage reads from the audio file instead of
+  extracting from the video file. This is faster and avoids
+  re-decoding the video stream.
+* **Splice (stream-copy mode)**: uses the merged video file for
+  video stream extraction.
+
+To use a format selector that downloads separate streams, just
+use it as-is with ``rytp download`` — the merging happens
+automatically. For example:
+
+```bash
+rytp download <video-id> --format "worstvideo[height=720]+bestaudio[language=ru]"
+```
+
+The ``--format`` flag (also ``-f``) defaults to the same selector
+used in this README's sample yt-dlp run; pass any other selector
+to override it.
+
+## Registering an existing audio+video pair
+
+If you already have separate audio and video files on disk
+(downloaded manually, from a previous yt-dlp run without ffmpeg,
+or pulled out of an existing archive), you can register both at
+once with ``rytp videos add``. Pass the video file as the argument
+and the audio file with ``--audio``:
+
+```bash
+rytp videos add "Смерть чиновника [oSYPC3cc_4A].f311.mp4" \
+    --audio "Смерть чиновника [oSYPC3cc_4A].f251-1.webm" \
+    --youtube-id oSYPC3cc_4A \
+    --title "Смерть чиновника"
+```
+
+The row lands in the ``videos`` table with ``source='local'``,
+``downloaded=1``, and both paths populated — the same shape as a
+freshly-downloaded YouTube row produced by ``rytp download``.
+Subsequent ``rytp transcribe`` invocations read from the audio
+file directly, skipping the video decode.
+
+The ``--youtube-id`` flag is what makes re-registration idempotent:
+passing the same id twice updates the same row instead of
+inserting a duplicate.
+
+# Re-running transcribe
+
+Re-running ``rytp transcribe <video-id>`` on the same video will
+**replace** the previous transcript with the new one, not append to
+it. This prevents duplicate words from appearing in the transcript
+export when you re-run the command (e.g., after changing engines
+or parameters). The ``transcribe_runs`` table keeps a record of
+every run for audit purposes, but only the most recent run's words
+are used by downstream stages like mine and transcripts export.
+
+# Speaker diarization
+
+rytp supports three diarization backends:
+
+* **none** (default) — assigns all words to ``SPEAKER_00``. Fast,
+  no external dependencies, no HF token required.
+* **energy** — simple energy-based speaker diarization. Detects
+  speaker changes by analyzing audio energy patterns, zero-crossing
+  rate, and spectral characteristics. No external dependencies or
+  HF token required. Includes a ``--diarizer-sensitivity`` parameter
+  to control how aggressively the diarizer splits speakers.
+* **pyannote** — state-of-the-art neural diarization using
+  pyannote-audio 3.x. Requires ``pip install rytp[pyannote]`` and
+  an ``HF_TOKEN`` environment variable.
+
+## Using the energy diarizer
+
+The energy diarizer is a good middle ground when you want some
+speaker separation but don't want to set up pyannote. It works
+by:
+
+1. Detecting speech segments using energy thresholding
+2. Computing voice features (energy, zero-crossing rate, spectral
+   centroid) for each segment
+3. Clustering segments by feature similarity
+
+You can adjust the ``sensitivity`` parameter (0.0 to 1.0) to
+control how aggressively the diarizer splits speakers:
+
+```bash
+# Conservative: fewer speakers, may merge similar voices
+rytp transcribe 1 --diarizer energy --diarizer-sensitivity 0.0
+
+# Balanced (default)
+rytp transcribe 1 --diarizer energy --diarizer-sensitivity 0.5
+
+# Aggressive: more speakers, may split a single speaker
+rytp transcribe 1 --diarizer energy --diarizer-sensitivity 1.0
+```
+
+**Limitations**: The energy diarizer is not as accurate as pyannote
+or other neural approaches. It works best when speakers have
+distinct voice characteristics (different pitch, volume, or
+speaking style) and there are clear pauses between speaker turns.
+For interview-style content with two distinct speakers, a
+sensitivity of 0.0-0.3 usually works well.
 
 # Tests
 
@@ -221,11 +368,22 @@ for any of the wired commands.
 pytest -q
 ```
 
-The test count sits at 176 (3 skipped) and covers the DB / models /
+The test count sits at 215 (3 skipped) and covers the DB / models /
 config / CLI gate, channels + download + queue, transcribe
-(extract + chunking + faster-whisper), diarize (none + pyannote),
-the merger + transcribe pipeline, the speaker roster +
+(extract + chunking + faster-whisper), diarize (none + energy +
+pyannote), the merger + transcribe pipeline, the speaker roster +
 pause-stats, mine + spectrogram, splice + loudnorm + manifest,
-the markdown transcript export, and the wired v1 CLI subcommands.
-They run with no external services (ffmpeg, faster-whisper,
-pyannote, yt-dlp, textual are all optional and mocked).
+the markdown transcript export, the wired v1 CLI subcommands, the
+heavy-lift download pipeline (``download_one`` +
+``run_queued_item`` with a fake ``YtDlpRunner``), the
+audio/video merge inside the download stage, and the
+local-file-pair registration path (downloaded-but-not-via-rytp
+files registered with ``rytp videos add VIDEO --audio AUDIO``).
+Integration tests that exercise the user's bundled
+``oSYPC3cc_4A.f311.mp4`` + ``oSYPC3cc_4A.f251-1.webm`` pair
+skip cleanly when the files aren't present.
+
+Tests run with no external services (ffmpeg, faster-whisper,
+pyannote, yt-dlp, textual are all optional and mocked); the
+real-files integration test requires ffmpeg on PATH and the
+bundled files.

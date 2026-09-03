@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -129,10 +130,9 @@ def sync_channel(db: Database, runner: YtDlpRunner, channel_id_or_name: int | st
         db.upsert_video(row)
 
     # Update last_synced_at
-    from datetime import datetime
     db.conn.execute(
         "UPDATE channels SET last_synced_at = ? WHERE id = ?",
-        (datetime.utcnow().isoformat(), channel_id),
+        (datetime.now(UTC).isoformat(), channel_id),
     )
     db.conn.commit()
 
@@ -199,6 +199,10 @@ def register_video(
     metadata; the ``source`` is ``"youtube"`` if the URL is a
     YouTube URL (and ``youtube_id`` is set from the probe or the
     URL), otherwise ``"ytdlp"``.
+
+    For a pair of separate audio/video files (the result of a
+    ``+``-format yt-dlp download or a manual pre-merge), use
+    :func:`register_local_video_with_separate_audio` instead.
     """
     # Check if it looks like a local file path
     if _is_local_path(url_or_path):
@@ -245,6 +249,58 @@ def register_video(
         "published_at": metadata.published_at,
         "downloaded": False,
         "downloaded_path": None,
+        "metadata_json": "{}",
+    }
+    return db.upsert_video(row)
+
+
+def register_local_video_with_separate_audio(
+    db: Database,
+    video_path: Path,
+    audio_path: Path,
+    *,
+    youtube_id: str | None = None,
+    title: str | None = None,
+) -> int:
+    """Register a video that lives as two files: ``video_path`` and ``audio_path``.
+
+    Use this when you already have audio and video streams as
+    separate files on disk — e.g. the output of an yt-dlp run with
+    a ``+`` format selector that downloaded them separately and you
+    didn't run the merger afterwards. The resulting videos table
+    row mirrors a freshly-downloaded YouTube row that the download
+    stage would have produced: ``source='local'``,
+    ``downloaded=1``, ``downloaded_path`` is the video file, and
+    ``downloaded_audio_path`` is the audio file.
+
+    Both files must exist on disk; the function raises
+    :class:`FileNotFoundError` otherwise. The natural key for
+    :meth:`Database.upsert_video` is ``(source, local_path)``;
+    when ``youtube_id`` is supplied the key falls back to
+    ``(source, youtube_id)`` so re-registering the same YouTube
+    video twice in this mode updates the same row instead of
+    creating a duplicate.
+    """
+    if not video_path.exists():
+        raise FileNotFoundError(f"video file not found: {video_path}")
+    if not audio_path.exists():
+        raise FileNotFoundError(f"audio file not found: {audio_path}")
+
+    row: dict[str, Any] = {
+        "source": "local",
+        "kind": "video",
+        "channel_id": None,
+        # When youtube_id is set, the (source, youtube_id) unique key
+        # applies; upsert_video will use it as the natural key.
+        "youtube_id": youtube_id,
+        "url": None,
+        "local_path": str(video_path.resolve()),
+        "title": title or video_path.stem,
+        "duration": None,
+        "published_at": None,
+        "downloaded": True,
+        "downloaded_path": str(video_path.resolve()),
+        "downloaded_audio_path": str(audio_path.resolve()),
         "metadata_json": "{}",
     }
     return db.upsert_video(row)

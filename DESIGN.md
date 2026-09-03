@@ -180,7 +180,8 @@ One database file: `data/rytp.db`. Logical groups:
 **Videos (unified)**
 - `videos(id, source, kind, channel_id NULLABLE, youtube_id NULLABLE,
   url NULLABLE, local_path NULLABLE, title, duration, published_at NULLABLE,
-  downloaded, downloaded_path NULLABLE, metadata_json)`
+  downloaded, downloaded_path NULLABLE, downloaded_audio_path NULLABLE,
+  metadata_json)`
   - `source` is `youtube` | `ytdlp` | `local`.
   - `kind` is `video` | `short` | `livestream` | `other`. One table,
     one column — kinds differ only in how yt-dlp lists them, not in
@@ -189,9 +190,20 @@ One database file: `data/rytp.db`. Logical groups:
   - `channel_id` is nullable: a video added with
     `rytp videos add <url>` (off-channel) or `rytp videos add <path>`
     (local) has no channel. The FK to `channels` is therefore loose.
-  - `youtube_id` is nullable: only set for `source=youtube` rows.
+  - `youtube_id` is nullable: only set for `source=youtube` rows
+    (and for `source=local` rows registered from a `+`-format
+    download where the user supplied the id via `--youtube-id`).
   - `downloaded` and `downloaded_path` only make sense for non-local
     sources; local videos have them set at registration time.
+  - `downloaded_audio_path` is set when yt-dlp downloads audio and
+    video as separate files (format selector with `+`). The download
+    stage merges them into a single container stored in
+    `downloaded_path`, but keeps the original audio file path here
+    so the audio extraction stage can read it directly. The same
+    field is set for `source=local` rows registered with
+    `rytp videos add VIDEO --audio AUDIO` (see §6), so the
+    local-file-pair path uses the same downstream audio-extract
+    code as a fresh download.
 
 **Download queue**
 - `queue_items(id, video_id, status, attempts, last_error, enqueued_at,
@@ -413,7 +425,7 @@ One binary, subcommand groups:
 | `rytp channel add <url>` | Register a channel. |
 | `rytp channel sync <name>` | yt-dlp flat-playlist, upsert into `videos`. |
 | `rytp channel list` | Show channels + counts. |
-| `rytp videos add <url-or-path>` | Register a single video: YouTube URL, any yt-dlp URL, or a local file path. Probes metadata, inserts a `videos` row, marks `downloaded=true` for local sources. |
+| `rytp videos add <url-or-path>` | Register a single video: YouTube URL, any yt-dlp URL, or a local file path. Probes metadata, inserts a `videos` row, marks `downloaded=true` for local sources. Accepts `--audio <path>` for a separate audio file (typical of a manual `+`-format yt-dlp run without ffmpeg to merge), in which case `downloaded_audio_path` is also populated. |
 | `rytp videos list [--channel ...] [--kind ...] [--source ...]` | Browse the index. |
 | `rytp download <video-id-or-url>` | Download a single video, mark `downloaded`. |
 | `rytp queue add <video-id>...` | Enqueue videos. |

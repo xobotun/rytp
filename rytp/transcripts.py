@@ -28,7 +28,7 @@ Public surface:
 """
 from __future__ import annotations
 
-import datetime as _dt
+from datetime import UTC as _UTC, datetime as _dt
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -281,7 +281,7 @@ def export_markdown(
     words = _fetch_words(db, video_id)
     blocks = build_blocks(words, min_block_s=min_block_s)
 
-    now = _dt.datetime.utcnow().isoformat()
+    now = _dt.now(_UTC).isoformat()
     lines: list[str] = []
     lines.append(f"# {title}")
     lines.append("")

@@ -12,7 +12,7 @@ Public surface:
 """
 from __future__ import annotations
 
-import datetime as _dt
+from datetime import UTC as _UTC, datetime as _dt
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +96,7 @@ def transcribe_video(
     combined_engine: str | None = None,
     language: str | None = None,
     video_path: Path | None = None,
+    diarizer_sensitivity: float | None = None,
 ) -> TranscribeResult:
     """Run the full transcribe pipeline for one video.
 
@@ -139,15 +140,20 @@ def transcribe_video(
         )
 
     # 2. Extract audio.
+    # Use separate audio file if available (downloaded separately)
+    downloaded_audio_path = video_row["downloaded_audio_path"]
     audio_path = extract_audio(
-        media_path, config_paths.audio, video_id=str(video_id)
+        media_path,
+        config_paths.audio,
+        video_id=str(video_id),
+        audio_path=Path(downloaded_audio_path) if downloaded_audio_path else None,
     )
 
     # 3. Plan chunks.
     chunks = chunk_audio(audio_path)
 
     # 8. Open transcribe_runs row up front so failures are visible.
-    now_iso = _dt.datetime.utcnow().isoformat()
+    now_iso = _dt.now(_UTC).isoformat()
     cur = db.conn.execute(
         """
         INSERT INTO transcribe_runs (
@@ -166,6 +172,14 @@ def transcribe_video(
     run_id = cur.lastrowid
     db.conn.commit()
 
+    # Clear existing words for this video to prevent duplicates on re-runs.
+    # DESIGN §4 mentions incremental re-runs, but in practice re-running
+    # with the same engine should replace the previous results, not append
+    # to them. The chunks table tracks per-run state for resumability, but
+    # the words table is the final output that downstream stages read from.
+    db.conn.execute("DELETE FROM words WHERE video_id = ?", (video_id,))
+    db.conn.commit()
+
     # 4–7. Run STT (or combined), then Diarizer, merge, insert words.
     diarizer_used = diarizer  # default for the run summary
     if combined_engine is not None:
@@ -175,7 +189,7 @@ def transcribe_video(
     else:
         words_iter = _run_stt_engine(stt_engine, chunks, language)
         if diarizer != "none":
-            segments = _run_diarizer(diarizer, audio_path)
+            segments = _run_diarizer(diarizer, audio_path, diarizer_sensitivity)
         else:
             segments = NullDiarizer().diarize(audio_path)
         joined = merge_words_with_diarization(words_iter, segments)
@@ -194,7 +208,7 @@ def transcribe_video(
     # Mark the run finished.
     db.conn.execute(
         "UPDATE transcribe_runs SET finished_at = ? WHERE id = ?",
-        (_dt.datetime.utcnow().isoformat(), run_id),
+        (_dt.now(_UTC).isoformat(), run_id),
     )
     db.conn.commit()
 
@@ -228,11 +242,23 @@ def _run_stt_engine(
             yield w
 
 
-def _run_diarizer(diarizer: str, audio_path: Path) -> Iterable[DiarSegment]:
+def _run_diarizer(
+    diarizer: str, audio_path: Path, sensitivity: float | None = None
+) -> Iterable[DiarSegment]:
     from rytp import engines
 
     cls = engines.resolve_diarizer(diarizer)
-    engine = cls()  # type: ignore[abstract]
+    # If the diarizer accepts a sensitivity parameter and one was provided,
+    # pass it. This allows tuning diarization without changing the interface
+    # for diarizers that don't support it.
+    try:
+        if sensitivity is not None:
+            engine = cls(sensitivity=sensitivity)  # type: ignore[abstract]
+        else:
+            engine = cls()  # type: ignore[abstract]
+    except TypeError:
+        # Diarizer doesn't accept sensitivity
+        engine = cls()  # type: ignore[abstract]
     return engine.diarize(audio_path)
 
 

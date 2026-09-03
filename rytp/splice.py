@@ -23,7 +23,7 @@ Public surface:
 """
 from __future__ import annotations
 
-import datetime as _dt
+from datetime import UTC as _UTC, datetime as _dt
 import enum
 import json
 import random
@@ -244,9 +244,9 @@ def splice_clips(
     if not clip_ids:
         raise ValueError("no clips to splice")
 
-    now = _dt.datetime.utcnow().isoformat()
+    now = _dt.now(_UTC).isoformat()
     if output_path is None:
-        stamp = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        stamp = _dt.now(_UTC).strftime("%Y%m%d-%H%M%S")
         output_path = config_paths.output / f"splice-{stamp}.mp4"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -266,7 +266,7 @@ def splice_clips(
     rows = db.conn.execute(
         f"""
         SELECT c.id AS clip_id, c.video_id, c.start_ms, c.end_ms,
-               c.source_query, v.downloaded_path, v.local_path,
+               c.source_query, v.downloaded_path, v.downloaded_audio_path, v.local_path,
                COALESCE(m.speaker_id, w.speaker_id) AS resolved_speaker_id
         FROM clips c
         JOIN videos v ON v.id = c.video_id
@@ -436,6 +436,7 @@ def _stream_copy_mode(
     list_file = output_path.with_suffix(".concat.txt")
     lines: list[str] = []
     for r, p in zip(rows, pauses):
+        # Prefer merged video file, then local_path
         media = r["downloaded_path"] or r["local_path"]
         if not media:
             raise FileNotFoundError(f"no media for video {r['video_id']}")

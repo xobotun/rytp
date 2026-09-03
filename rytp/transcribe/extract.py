@@ -41,6 +41,7 @@ def extract_audio(
     *,
     video_id: str,
     overwrite: bool = False,
+    audio_path: Path | None = None,
 ) -> Path:
     """Extract a 16 kHz mono WAV from ``video_path``.
 
@@ -51,6 +52,10 @@ def extract_audio(
         out_dir: Target directory — created if missing.
         video_id: Used as the output filename stem.
         overwrite: Re-run ffmpeg even if the output file exists.
+        audio_path: Optional separate audio file. If provided, this is
+            used instead of extracting audio from the video file. This
+            is useful when audio was downloaded separately (e.g.,
+            bestaudio format).
 
     Returns:
         The path to the written WAV.
@@ -75,8 +80,11 @@ def extract_audio(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{video_id}.wav"
 
-    if not video_path.exists():
-        raise FileNotFoundError(f"video file not found: {video_path}")
+    # If we have a separate audio file, use that instead
+    source_path = audio_path if audio_path and audio_path.exists() else video_path
+
+    if not source_path.exists():
+        raise FileNotFoundError(f"source file not found: {source_path}")
 
     if out_path.exists() and not overwrite:
         return out_path
@@ -86,7 +94,7 @@ def extract_audio(
         "-nostdin",
         "-y",  # overwrite at the ffmpeg level; we already gated above
         "-i",
-        str(video_path),
+        str(source_path),
         "-vn",  # drop video stream — audio only
         "-ac",
         str(C.AUDIO_CHANNELS),

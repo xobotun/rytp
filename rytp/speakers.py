@@ -16,7 +16,7 @@ Public surface:
 """
 from __future__ import annotations
 
-import datetime as _dt
+from datetime import UTC as _UTC, datetime as _dt
 import json
 import sqlite3
 from collections.abc import Iterable
@@ -60,7 +60,7 @@ def add_speaker(
             label,
             json.dumps(list(aliases)),
             notes,
-            _dt.datetime.utcnow().isoformat(),
+            _dt.now(_UTC).isoformat(),
         ),
     )
     db.conn.commit()
@@ -290,7 +290,7 @@ def recompute_pause_stats(db: Database) -> int:
         """
     ).fetchall()
     n_written = 0
-    now = _dt.datetime.utcnow().isoformat()
+    now = _dt.now(_UTC).isoformat()
     for row in speakers:
         sid = row["speaker_id"]
         stats = compute_pause_stats(db, sid)

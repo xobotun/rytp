@@ -137,3 +137,71 @@ def test_transcribe_video_writes_words_with_null_diarizer(
         assert all(r["diarizer_speaker"] == "SPEAKER_00" for r in rows)
     finally:
         engines.STTS.pop("fake-stt", None)
+
+
+def test_transcribe_video_clears_existing_words_on_rerun(
+    db, fake_video_row, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Re-running transcribe on the same video should not create duplicate words.
+
+    This prevents the issue where running transcribe multiple times would
+    result in words being repeated 2x, 3x, etc. in the transcript export.
+    """
+    from rytp.transcribe import run as run_mod
+    from rytp import engines
+
+    # Build a synthetic 1-second 16kHz mono WAV
+    import wave
+
+    audio = tmp_path / "audio.wav"
+    with wave.open(str(audio), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 16000)
+    audio_for_vid = tmp_path / "fake.wav"
+    audio_for_vid.write_bytes(audio.read_bytes())
+
+    # Mock extract_audio
+    monkeypatch.setattr(
+        run_mod,
+        "extract_audio",
+        lambda *a, **kw: audio_for_vid,
+    )
+
+    # Register a fake STT engine
+    class FakeSTT:
+        name = "fake-stt-rerun"
+        requires_hf_token = False
+
+        def transcribe(self, audio_path, *, language=None):
+            yield Word(start_ms=0, end_ms=500, text="hello", confidence=0.9)
+            yield Word(start_ms=500, end_ms=1000, text="world", confidence=0.9)
+
+    engines.register_stt(FakeSTT)
+    try:
+        fake_video_row["downloaded_path"] = str(audio)
+        vid = db.upsert_video(fake_video_row)
+
+        # Run transcribe first time
+        result1 = transcribe_video(
+            db, video_id=vid, stt_engine="fake-stt-rerun", diarizer="none"
+        )
+        assert result1.n_words == 2
+
+        # Run transcribe second time - should clear and re-insert
+        result2 = transcribe_video(
+            db, video_id=vid, stt_engine="fake-stt-rerun", diarizer="none"
+        )
+        assert result2.n_words == 2
+
+        # Verify no duplicates
+        rows = db.conn.execute(
+            "SELECT text FROM words WHERE video_id = ? ORDER BY start_ms",
+            (vid,),
+        ).fetchall()
+        texts = [r["text"] for r in rows]
+        assert texts == ["hello", "world"], f"Expected no duplicates, got {texts}"
+        assert len(rows) == 2, f"Expected 2 words, got {len(rows)}"
+    finally:
+        engines.STTS.pop("fake-stt-rerun", None)

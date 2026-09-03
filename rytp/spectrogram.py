@@ -32,7 +32,7 @@ Public surface:
 """
 from __future__ import annotations
 
-import datetime as _dt
+from datetime import UTC as _UTC, datetime as _dt
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -266,7 +266,7 @@ def get_or_compute_clip_features(
             end_ms,
             feats.mfcc.astype(np.float32).tobytes(),
             feats.spectral_centroid_hz,
-            _dt.datetime.utcnow().isoformat(),
+            _dt.now(_UTC).isoformat(),
         ),
     )
     db.conn.commit()

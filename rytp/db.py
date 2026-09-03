@@ -75,6 +75,7 @@ MIGRATIONS: list[tuple[int, str]] = [
             published_at TEXT NULL,
             downloaded INTEGER NOT NULL DEFAULT 0,
             downloaded_path TEXT NULL,
+            downloaded_audio_path TEXT NULL,
             metadata_json TEXT NOT NULL DEFAULT '{}',
             UNIQUE (source, youtube_id),
             UNIQUE (source, local_path)
@@ -279,6 +280,17 @@ MIGRATIONS: list[tuple[int, str]] = [
         END;
         """,
     ),
+    (
+        17,
+        """
+        -- Add downloaded_audio_path column to videos table for separate audio/video files
+        -- Note: for fresh databases, migration 2 already includes this column, so this is a no-op
+        -- For existing databases, this adds the column
+        -- SQLite doesn't support IF NOT EXISTS for ALTER TABLE ADD COLUMN, so we handle this
+        -- in the migrate() method by checking if the column exists first
+        SELECT 1;  -- placeholder
+        """,
+    ),
 ]
 
 
@@ -356,7 +368,20 @@ class Database:
         # Apply any migrations with version > current_version.
         for version, sql in MIGRATIONS:
             if version > current_version:
-                self.conn.executescript(sql)
+                # Special handling for migration 17 (add downloaded_audio_path column)
+                # SQLite doesn't support IF NOT EXISTS for ALTER TABLE ADD COLUMN
+                if version == 17:
+                    # Check if column already exists (it will for fresh databases from migration 2)
+                    col_check = self.conn.execute(
+                        "PRAGMA table_info(videos)"
+                    ).fetchall()
+                    has_column = any(row[1] == "downloaded_audio_path" for row in col_check)
+                    if not has_column:
+                        self.conn.execute(
+                            "ALTER TABLE videos ADD COLUMN downloaded_audio_path TEXT NULL"
+                        )
+                else:
+                    self.conn.executescript(sql)
                 self.conn.execute(
                     "UPDATE schema_version SET value = ? WHERE key = 'version'",
                     (str(version),),
@@ -447,7 +472,7 @@ class Database:
                     UPDATE videos SET
                         kind = ?, channel_id = ?, url = ?, local_path = ?,
                         title = ?, duration = ?, published_at = ?,
-                        downloaded = ?, downloaded_path = ?, metadata_json = ?
+                        downloaded = ?, downloaded_path = ?, downloaded_audio_path = ?, metadata_json = ?
                     WHERE id = ?
                     """,
                     (
@@ -460,6 +485,7 @@ class Database:
                         row.get("published_at"),
                         1 if row.get("downloaded") else 0,
                         row.get("downloaded_path"),
+                        row.get("downloaded_audio_path"),
                         row.get("metadata_json", "{}"),
                         video_id,
                     ),
@@ -479,7 +505,7 @@ class Database:
                     UPDATE videos SET
                         kind = ?, channel_id = ?, youtube_id = ?, url = ?,
                         title = ?, duration = ?, published_at = ?,
-                        downloaded = ?, downloaded_path = ?, metadata_json = ?
+                        downloaded = ?, downloaded_path = ?, downloaded_audio_path = ?, metadata_json = ?
                     WHERE id = ?
                     """,
                     (
@@ -492,6 +518,7 @@ class Database:
                         row.get("published_at"),
                         1 if row.get("downloaded") else 0,
                         row.get("downloaded_path"),
+                        row.get("downloaded_audio_path"),
                         row.get("metadata_json", "{}"),
                         video_id,
                     ),
@@ -504,8 +531,8 @@ class Database:
             """
             INSERT INTO videos (
                 source, kind, channel_id, youtube_id, url, local_path,
-                title, duration, published_at, downloaded, downloaded_path, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                title, duration, published_at, downloaded, downloaded_path, downloaded_audio_path, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["source"],
@@ -519,6 +546,7 @@ class Database:
                 row.get("published_at"),
                 1 if row.get("downloaded") else 0,
                 row.get("downloaded_path"),
+                row.get("downloaded_audio_path"),
                 row.get("metadata_json", "{}"),
             ),
         )

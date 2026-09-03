@@ -265,3 +265,50 @@ def test_foreign_keys_enforced(db: Database) -> None:
             """,
             (999_999, 0, 100, "x", "x", 1.0),
         )
+
+
+def test_videos_has_downloaded_audio_path_column(db: Database) -> None:
+    """The videos table should have a downloaded_audio_path column for separate audio files."""
+    cols = db.conn.execute("PRAGMA table_info(videos)").fetchall()
+    col_names = {row[1] for row in cols}
+    assert "downloaded_audio_path" in col_names
+
+
+def test_migration_adds_downloaded_audio_path_to_existing_db(tmp_path) -> None:
+    """Migration 17 should add downloaded_audio_path column to existing databases."""
+    from rytp.db import MIGRATIONS
+
+    db_path = tmp_path / "test.db"
+    db = Database(db_path)
+    db.migrate()
+
+    # Simulate an older database by dropping the column
+    db.conn.execute(
+        "CREATE TABLE videos_backup AS SELECT id, source, kind, channel_id, youtube_id, url, local_path, title, duration, published_at, downloaded, downloaded_path, metadata_json FROM videos"
+    )
+    db.conn.execute("DROP TABLE videos")
+    db.conn.execute("ALTER TABLE videos_backup RENAME TO videos")
+    db.conn.commit()
+
+    # Verify the column is gone
+    cols = db.conn.execute("PRAGMA table_info(videos)").fetchall()
+    col_names = {row[1] for row in cols}
+    assert "downloaded_audio_path" not in col_names
+
+    # Reset schema version to force migration 17 to run
+    db.conn.execute("UPDATE schema_version SET value = '16'")
+    db.conn.commit()
+    db.close()
+
+    # Reopen and migrate
+    db2 = Database(db_path)
+    db2.migrate()
+
+    # Verify the column is now present
+    cols = db2.conn.execute("PRAGMA table_info(videos)").fetchall()
+    col_names = {row[1] for row in cols}
+    assert "downloaded_audio_path" in col_names
+
+    # Verify migration 17 is in the MIGRATIONS list
+    assert 17 in [v for v, _ in MIGRATIONS]
+    db2.close()

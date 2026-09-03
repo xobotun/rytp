@@ -75,6 +75,7 @@ def test_video_is_frozen() -> None:
         published_at=None,
         downloaded=False,
         downloaded_path=None,
+        downloaded_audio_path=None,
     )
     with pytest.raises(Exception):
         v.title = "other"  # type: ignore[misc]
@@ -107,12 +108,12 @@ def test_video_from_row() -> None:
             id INTEGER, source TEXT, kind TEXT, channel_id INTEGER,
             youtube_id TEXT, url TEXT, local_path TEXT, title TEXT,
             duration INTEGER, published_at TEXT, downloaded INTEGER,
-            downloaded_path TEXT, metadata_json TEXT
+            downloaded_path TEXT, downloaded_audio_path TEXT, metadata_json TEXT
         )
         """
     )
     conn.execute(
-        "INSERT INTO videos VALUES (1,'youtube','video',NULL,'yid','u',NULL,'t',100,NULL,1,'/p','{}')"
+        "INSERT INTO videos VALUES (1,'youtube','video',NULL,'yid','u',NULL,'t',100,NULL,1,'/p',NULL,'{}')"
     )
     row = conn.execute("SELECT * FROM videos").fetchone()
     v = Video.from_row(row)

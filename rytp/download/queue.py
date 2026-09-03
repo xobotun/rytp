@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from rytp import constants as C
@@ -36,7 +36,7 @@ class Queue:
     def enqueue(self, video_ids: Iterable[int]) -> list[int]:
         """Add video IDs to the queue. Idempotent: skips already pending/running."""
         enqueued: list[int] = []
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(UTC).isoformat()
 
         for video_id in video_ids:
             # Check if already pending or running
@@ -79,7 +79,7 @@ class Queue:
             The claimed ``queue_items`` row (with ``started_at``
             populated), or ``None`` if the queue is empty.
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(UTC).isoformat()
 
         # Try RETURNING clause (SQLite 3.35+)
         try:
@@ -127,7 +127,7 @@ class Queue:
 
     def mark_done(self, queue_item_id: int) -> None:
         """Mark a queue item as done."""
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(UTC).isoformat()
         self._db.conn.execute(
             "UPDATE queue_items SET status = 'done', finished_at = ? WHERE id = ?",
             (now, queue_item_id),
@@ -136,7 +136,7 @@ class Queue:
 
     def mark_failed(self, queue_item_id: int, error: str) -> None:
         """Mark a queue item as failed and record the error."""
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(UTC).isoformat()
         self._db.conn.execute(
             "UPDATE queue_items SET status = 'failed', finished_at = ?, last_error = ?, attempts = attempts + 1 WHERE id = ?",
             (now, error, queue_item_id),

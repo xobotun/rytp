@@ -294,6 +294,12 @@ LOUDNORM_PARSE_TAIL_CHARS: int = 400
 #: "more than enough for one inspection cycle".
 QUEUE_LIST_LIMIT: int = 100
 
+#: Seconds the queue worker sleeps between claim attempts when the
+#: queue is empty. ``2.0 s`` is a reasonable trade-off between
+#: latency (lower = faster pickup) and DB load (higher = fewer
+#: no-op queries). CLI-overridable via ``--poll-s``.
+QUEUE_POLL_INTERVAL_S: float = 2.0
+
 
 # ---------------------------------------------------------------------------
 # Seconds → ms conversion factor

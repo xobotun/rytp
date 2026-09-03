@@ -41,29 +41,27 @@ def test_each_group_help_lists_its_subcommands() -> None:
             assert sub in result.stdout, f"{group} {sub} missing"
 
 
-def test_each_stub_exits_nonzero_without_crashing() -> None:
-    """Every v2 subcommand (still a stub) exits 1 cleanly.
+def test_no_stubs_remain() -> None:
+    """All subcommands are wired in v1.
 
-    The wired v1 subcommands (``channel add`` / ``sync`` / ``list``,
-    ``videos add`` / ``list``, ``queue add`` / ``pause`` / ``resume``
-    / ``list``, ``speakers add`` / ``list`` / ``recompute-pauses``,
-    ``transcripts export``) are exercised by their own dedicated
-    tests below. This list contains only the v2 stubs.
+    The actual behavior of each heavy-lift command is covered by
+    its own test below. This test only confirms the v1 wiring is
+    complete: every command group has a real body, not the
+    ``_not_implemented`` stub. We check by inspecting the source of
+    :mod:`rytp.cli` for the marker string.
     """
-    commands: list[list[str]] = [
-        ["download", "oSYPC3cc_4A"],
-        ["queue", "worker"],
-        ["transcribe", "1"],
-        ["speakers", "map", "1"],
-        ["mine", "hello"],
-        ["splice", "1", "--out", "out.mp4"],
-        ["tui"],
-    ]
-    for cmd in commands:
-        result = runner.invoke(app, cmd)
-        # Stubs exit 1. ImportError / parse errors would be exit 2
-        # with a stack trace — we want neither.
-        assert result.exit_code in (1, 2), f"{cmd!r}: unexpected exit {result.exit_code}\n{result.stdout}"
+    import inspect
+
+    src = inspect.getsource(cli)
+    # There should be no calls to _not_implemented still in the file
+    # (only the function definition itself).
+    function_def_count = src.count("def _not_implemented(")
+    call_count = src.count("_not_implemented(")
+    # One occurrence is the def itself; the rest would be calls.
+    assert call_count <= function_def_count, (
+        f"unexpected _not_implemented calls left in cli.py: "
+        f"{call_count - function_def_count}"
+    )
 
 
 # --- wired v1 subcommands (CRUD) ------------------------------------------
@@ -219,8 +217,10 @@ def test_gate_fails_loudly_without_token(gated_stt: type, no_token: None) -> Non
 def test_gate_passes_silently_with_token(gated_stt: type, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HF_TOKEN", "hf_test")
     result = runner.invoke(app, ["--stt", "gated-test", "transcribe", "1"])
-    # Token set → gate silent, command body runs and emits "not implemented"
-    # (exit 1). The point is: not exit 2, and no HF_TOKEN paragraph.
+    # Token set → gate silent, command body runs. v1's body fails
+    # with a "no media" or "video not found" error (exit 1) because
+    # no real video row exists. The point is: not exit 2, and no
+    # HF_TOKEN paragraph.
     assert result.exit_code != 2, result.stdout
     assert "HF_TOKEN is required" not in ((result.stdout or "") + (result.output or ""))
 
@@ -242,3 +242,77 @@ def test_gate_skips_unknown_engine_silently(no_token: None) -> None:
     # Either the body fails (1) or the resolve_stt in the gate raises (2).
     # The point is the *paragraph* is not printed.
     assert "HF_TOKEN is required" not in (result.stdout or "")
+
+
+# --- heavy-lift subcommands (v1 wired) ------------------------------------
+
+
+def test_download_unknown_id_exits_nonzero(tmp_path, monkeypatch) -> None:
+    """`rytp download 9999` should exit 1 with a clear message."""
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["download", "9999"])
+    assert r.exit_code == 1, r.stdout
+    combined = (r.stdout or "") + (r.output or "")
+    assert "not found" in combined.lower() or "9999" in combined
+
+
+def test_transcribe_unknown_id_exits_nonzero(tmp_path, monkeypatch) -> None:
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["transcribe", "9999"])
+    assert r.exit_code == 1, r.stdout
+
+
+def test_mine_no_matches_says_so(tmp_path, monkeypatch) -> None:
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["mine", "no-such-string-xyz"])
+    assert r.exit_code == 0, r.stdout
+    assert "no matches" in r.stdout.lower() or "0" in r.stdout
+
+
+def test_speakers_map_lists_empty(tmp_path, monkeypatch) -> None:
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    # Insert a video so the video_id lookup doesn't bail early.
+    db.conn.execute(
+        "INSERT INTO videos (source, kind, title, duration) "
+        "VALUES ('local', 'video', 'v', 1000)"
+    )
+    db.conn.commit()
+    db.close()
+
+    r = _CR().invoke(app, ["speakers", "map", "1"])
+    assert r.exit_code == 0, r.stdout
+    assert "no diarizer labels" in r.stdout.lower() or "video 1 has no" in r.stdout.lower()

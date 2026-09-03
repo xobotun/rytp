@@ -84,11 +84,14 @@ class Video:
     published_at: str | None
     downloaded: bool
     downloaded_path: str | None
+    downloaded_audio_path: str | None
     metadata_json: str = "{}"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Video:
         """Construct a Video from a sqlite3.Row from the ``videos`` table."""
+        # Handle missing downloaded_audio_path column for backward compatibility
+        downloaded_audio_path = row["downloaded_audio_path"] if "downloaded_audio_path" in row.keys() else None
         return cls(
             id=row["id"],
             source=row["source"],
@@ -102,6 +105,7 @@ class Video:
             published_at=row["published_at"],
             downloaded=bool(row["downloaded"]),
             downloaded_path=row["downloaded_path"],
+            downloaded_audio_path=downloaded_audio_path,
             metadata_json=row["metadata_json"],
         )
 

@@ -137,3 +137,53 @@ def test_extract_audio_raises_when_ffmpeg_missing_at_run(
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(FfmpegNotFoundError):
         extract_audio(video, tmp_path / "out", video_id="vid-1")
+
+
+def test_extract_audio_uses_separate_audio_when_provided(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When audio_path is provided and exists, it should be used instead of video_path."""
+    monkeypatch.setattr(config, "ffmpeg_binary", lambda: "ffmpeg")
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    audio = tmp_path / "audio.webm"
+    audio.write_bytes(b"audio")
+    out_dir = tmp_path / "out"
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        Path(cmd[-1]).write_bytes(b"RIFF....")
+        return _fake_completed_process(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    out_path = extract_audio(video, out_dir, video_id="vid-1", audio_path=audio)
+    assert out_path == out_dir / "vid-1.wav"
+    cmd = captured["cmd"]
+    # The audio file should be the input, not the video file
+    assert str(audio) in cmd
+    assert str(video) not in cmd
+
+
+def test_extract_audio_falls_back_to_video_when_audio_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When audio_path is provided but doesn't exist, fall back to video_path."""
+    monkeypatch.setattr(config, "ffmpeg_binary", lambda: "ffmpeg")
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    audio = tmp_path / "audio.webm"  # doesn't exist
+    out_dir = tmp_path / "out"
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        Path(cmd[-1]).write_bytes(b"RIFF....")
+        return _fake_completed_process(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    out_path = extract_audio(video, out_dir, video_id="vid-1", audio_path=audio)
+    assert out_path == out_dir / "vid-1.wav"
+    cmd = captured["cmd"]
+    # The video file should be the input since audio doesn't exist
+    assert str(video) in cmd

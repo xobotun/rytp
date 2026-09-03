@@ -36,7 +36,7 @@ Public surface:
 """
 from __future__ import annotations
 
-import datetime as _dt
+from datetime import UTC as _UTC, datetime as _dt
 import enum
 import math
 from collections.abc import Iterable
@@ -371,7 +371,7 @@ def mine(
     scored = score_windows(db, windows)
     chosen = scored[:max_clips]
 
-    now = _dt.datetime.utcnow().isoformat()
+    now = _dt.now(_UTC).isoformat()
     ids: list[int] = []
     for w, _score in chosen:
         cur = db.conn.execute(
