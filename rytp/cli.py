@@ -16,6 +16,7 @@ to actually run, and otherwise print a one-line install-hint error.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -26,12 +27,50 @@ from rytp import config
 from rytp import constants as C
 from rytp import engines as engines_mod
 
+# Quieten huggingface_hub's noisy "Ignored error while writing commit
+# hash to ... PermissionError" warning. It fires every time we re-run
+# ``faster-whisper`` against a cached model whose ``refs/main`` file
+# is read-only (the common case on Windows when the cache was created
+# by another user / app). The cache is otherwise fine, so printing the
+# traceback every run is just noise — drop the warning to ERROR.
+logging.getLogger("huggingface_hub._snapshot_download").setLevel(logging.ERROR)
+
 app = typer.Typer(
     name="rytp",
     help="Download YouTube videos, transcribe them locally, datamine, and splice.",
     no_args_is_help=True,
     add_completion=False,
 )
+
+
+def _configure_stdio() -> None:
+    """Reconfigure ``sys.stdout`` and ``sys.stderr`` to UTF-8.
+
+    Help text contains ``§`` (DESIGN §7) and ``—`` em-dashes. On Windows
+    the default code page (cp1251 / cp1252) silently replaces these
+    with ``?`` or the U+FFFD replacement character, which then shows up
+    in the help banner as a broken glyph. Forcing UTF-8 here makes the
+    bytes valid UTF-8 regardless of the attached console; terminals
+    that understand UTF-8 will render the original characters, and
+    the rest will at least fail cleanly rather than producing mojibake.
+
+    Silently no-ops on streams that can't be reconfigured (older
+    Python, captured pipes under pytest, etc.) — the user's locale
+    wins in those cases.
+    """
+    import sys
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
+
+_configure_stdio()
 
 # Subcommand groups (channel, videos, queue, speakers) — added below.
 channel_app = typer.Typer(help="Manage YouTube channels in the index.", no_args_is_help=True)
@@ -133,6 +172,18 @@ def _main_callback(
     ),
 ) -> None:
     """rytp — YouTube → transcript → datamine → splice pipeline."""
+    # Mutual exclusion: --combined may not be combined with --stt or
+    # --diarizer. The help text promises this; we enforce it here so
+    # users don't silently get the wrong engine (the per-subcommand
+    # fallback would otherwise pick --stt/--diarizer first).
+    if combined is not None and (stt is not None or diarizer is not None):
+        typer.echo(
+            "--combined is mutually exclusive with --stt and --diarizer; "
+            "pick one group of options, not both.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
     # Only run the gate when an engine has been *named* on the command line.
     # We deliberately don't read the defaults here: if the user picks a
     # gated engine explicitly, fail loudly. If they leave the default and
@@ -196,6 +247,122 @@ def _print_table(headers: list[str], rows: list[list[str]]) -> None:
     typer.echo(fmt.format(*("-" * w for w in widths)))
     for r in rows:
         typer.echo(fmt.format(*r))
+
+
+def _cohesion_callback(value: Optional[str]) -> Optional[str]:
+    """Validate ``--cohesion`` and return the canonical string.
+
+    Used as a typer ``Option(callback=...)`` so that ``mine --cohesion bogus``
+    fails fast with a clean ``Invalid value for '--cohesion'`` message
+    instead of leaking an ``enum.Enum`` ``ValueError`` traceback from
+    deep inside :func:`rytp.mine.mine`.
+
+    The default ``"med"`` is supplied via ``typer.Option(..., default="med")``;
+    this callback sees that string, not ``None``. We still accept
+    ``None`` defensively for callers that explicitly pass the option
+    without a default.
+    """
+    if value is None:
+        return value
+    from rytp.mine import Cohesion
+
+    try:
+        return Cohesion(value).value
+    except ValueError as e:
+        allowed = ", ".join(c.value for c in Cohesion)
+        raise typer.BadParameter(
+            f"{value!r} is not a valid cohesion; choose from {allowed}."
+        ) from e
+
+
+# Allowed values for ``videos list --kind`` and ``--source``. Kept in
+# sync with the SQLite CHECK constraints on the ``videos`` table
+# (:mod:`rytp.db` migration 2). Listed as tuples so the order is
+# deterministic in error messages.
+_ALLOWED_KIND: tuple[str, ...] = ("video", "short", "livestream", "other")
+_ALLOWED_SOURCE: tuple[str, ...] = ("youtube", "ytdlp", "local")
+
+
+def _kind_callback(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return value
+    if value not in _ALLOWED_KIND:
+        raise typer.BadParameter(
+            f"{value!r} is not a valid kind; "
+            f"choose from {', '.join(_ALLOWED_KIND)}."
+        )
+    return value
+
+
+def _source_callback(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return value
+    if value not in _ALLOWED_SOURCE:
+        raise typer.BadParameter(
+            f"{value!r} is not a valid source; "
+            f"choose from {', '.join(_ALLOWED_SOURCE)}."
+        )
+    return value
+
+
+def _splice_mode_callback(value: Optional[str]) -> Optional[str]:
+    """Validate ``--mode`` against :class:`rytp.splice.SpliceMode`.
+
+    Without this callback, ``splice --mode bogus`` raised a bare
+    ``ValueError`` from deep inside ``rytp.splice.splice_clips``,
+    leaking a 12-line traceback (the same shape as the original
+    ``mine --cohesion bogus`` bug). Routing the validation through
+    Typer's BadParameter makes it consistent with every other validated
+    flag.
+    """
+    if value is None:
+        return value
+    from rytp.splice import SpliceMode
+
+    try:
+        return SpliceMode(value).value
+    except ValueError as e:
+        allowed = ", ".join(m.value for m in SpliceMode)
+        raise typer.BadParameter(
+            f"{value!r} is not a valid SpliceMode; choose from {allowed}."
+        ) from e
+
+
+def _handle_business_error(e: BaseException) -> None:
+    """Translate a caught business exception into a clean CLI exit.
+
+    Centralizes the "no traceback, just one line, exit 1" pattern.
+    Falls back to a generic message if the exception is something
+    exotic we don't have a friendlier re-phrasing for.
+    """
+    import sqlite3
+
+    if isinstance(e, sqlite3.IntegrityError) and "FOREIGN KEY" in str(e):
+        # Best-effort: pull a video id out of the message and reuse the
+        # wording the rest of the CLI uses ("video N not found").
+        msg = str(e)
+        typer.echo(
+            f"database constraint violated: {msg}. "
+            "Check that any referenced id (channel, video, speaker) exists.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from e
+    if isinstance(e, FileNotFoundError):
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    if isinstance(e, PermissionError):
+        typer.echo(
+            f"cannot write to {e.filename or 'the target path'} "
+            f"(Access is denied). Check that the parent directory is writable.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from e
+    if isinstance(e, (ValueError, ImportError, RuntimeError)):
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    # Anything else: re-raise — typer/Click will print a traceback,
+    # which is appropriate for an unknown bug.
+    raise e
 
 
 # ---------------------------------------------------------------------------
@@ -329,33 +496,39 @@ def videos_add(
 
     db = _open_db()
     try:
-        if _is_local_path(url_or_path) and audio is not None:
-            # Local video + local audio pair. ``register_video``
-            # doesn't model this case; use the dedicated helper.
-            vid = register_local_video_with_separate_audio(
-                db,
-                Path(url_or_path),
-                audio,
-                youtube_id=youtube_id,
-                title=title,
-            )
-        elif _is_local_path(url_or_path):
-            # No runner needed for local files; ``register_video`` skips
-            # the probe entirely. Pass a placeholder to satisfy the
-            # type signature — the function never calls it.
-            class _UnusedRunner:
-                def probe(self, url: str):  # pragma: no cover
-                    raise RuntimeError("unreachable: local file branch")
+        try:
+            if _is_local_path(url_or_path) and audio is not None:
+                # Local video + local audio pair. ``register_video``
+                # doesn't model this case; use the dedicated helper.
+                vid = register_local_video_with_separate_audio(
+                    db,
+                    Path(url_or_path),
+                    audio,
+                    youtube_id=youtube_id,
+                    title=title,
+                )
+            elif _is_local_path(url_or_path):
+                # No runner needed for local files; ``register_video`` skips
+                # the probe entirely. Pass a placeholder to satisfy the
+                # type signature — the function never calls it.
+                class _UnusedRunner:
+                    def probe(self, url: str):  # pragma: no cover
+                        raise RuntimeError("unreachable: local file branch")
 
-            runner: object = _UnusedRunner()
-            vid = register_video(db, runner, url_or_path)
-        else:
-            try:
-                runner = RealYtDlpRunner()
-            except ImportError as e:
-                typer.echo(str(e), err=True)
-                raise typer.Exit(code=1) from e
-            vid = register_video(db, runner, url_or_path)
+                runner: object = _UnusedRunner()
+                vid = register_video(db, runner, url_or_path)
+            else:
+                try:
+                    runner = RealYtDlpRunner()
+                except ImportError as e:
+                    typer.echo(str(e), err=True)
+                    raise typer.Exit(code=1) from e
+                vid = register_video(db, runner, url_or_path)
+        except FileNotFoundError as e:
+            # Local file branch detects ``not path.exists()`` and raises.
+            # Translate to a clean exit instead of a stack trace.
+            typer.echo(str(e), err=True)
+            raise typer.Exit(code=1) from e
     finally:
         db.close()
     typer.echo(f"video {vid}: {url_or_path}")
@@ -367,10 +540,16 @@ def videos_list(
         None, "--channel", help="Restrict to one channel (id, title, or URL)."
     ),
     kind: Optional[str] = typer.Option(
-        None, "--kind", help="Filter by kind: video, short, livestream, other."
+        None,
+        "--kind",
+        help="Filter by kind: video, short, livestream, other.",
+        callback=_kind_callback,
     ),
     source: Optional[str] = typer.Option(
-        None, "--source", help="Filter by source: youtube, ytdlp, local."
+        None,
+        "--source",
+        help="Filter by source: youtube, ytdlp, local.",
+        callback=_source_callback,
     ),
 ) -> None:
     """Browse the ``videos`` index."""
@@ -490,8 +669,20 @@ def queue_add(
 
     db = _open_db()
     try:
-        q = Queue(db)
-        new_ids = q.enqueue(video_ids)
+        try:
+            q = Queue(db)
+            new_ids = q.enqueue(video_ids)
+        except sqlite3.IntegrityError as e:
+            # Foreign key failure — one of the video ids doesn't exist.
+            # Match the wording the rest of the CLI uses for video
+            # lookups so users see a consistent message.
+            missing = ", ".join(str(v) for v in video_ids)
+            typer.echo(
+                f"video {missing} not found in videos table "
+                "(the queue table references videos.id)",
+                err=True,
+            )
+            raise typer.Exit(code=1) from e
     finally:
         db.close()
     typer.echo(f"enqueued {len(new_ids)} (already pending/running: {len(video_ids) - len(new_ids)})")
@@ -692,11 +883,15 @@ def transcribe_cmd(
                 language=language,
                 diarizer_sensitivity=diarizer_sensitivity,
             )
-        except (ImportError, ValueError, FileNotFoundError) as e:
-            typer.echo(str(e), err=True)
-            raise typer.Exit(code=1) from e
+        except (ImportError, ValueError, FileNotFoundError, RuntimeError) as e:
+            _handle_business_error(e)
     finally:
-        db.close()
+        try:
+            db.close()
+        except sqlite3.ProgrammingError:
+            # Connection already closed (e.g. via context-manager); don't
+            # let a double-close mask the real result.
+            pass
     typer.echo(
         f"video {video_id}: wrote {result.n_words} words "
         f"(run {result.transcribe_run_id}, diarizer={diarizer_name})"
@@ -716,15 +911,65 @@ def speakers_add(
     ),
     notes: Optional[str] = typer.Option(None, "--notes"),
 ) -> None:
-    """Add to the global ``speakers`` roster. Idempotent on ``label``."""
-    from rytp.speakers import add_speaker
+    """Add to the global ``speakers`` roster. Idempotent on ``label``.
+
+    If the label already exists, ``--alias`` and ``--notes`` updates are
+    silently ignored by ``add_speaker``; this command prints a clear
+    warning so the user knows their second invocation was a no-op. Use
+    a future ``speakers update`` (planned for v2) to mutate an existing
+    speaker's aliases/notes.
+    """
+    from rytp.speakers import add_speaker, find_alias_collisions
 
     db = _open_db()
     try:
-        sid = add_speaker(db, label, aliases=alias, notes=notes)
+        sid, was_inserted = add_speaker(db, label, aliases=alias, notes=notes)
+        # Only check for alias collisions when the alias was actually
+        # stored. If ``add_speaker`` returned ``was_inserted=False``,
+        # the new aliases were dropped on the floor and any collision
+        # warning would be misleading (the alias isn't in the roster
+        # yet).
+        collisions: list[tuple[str, int]] = []
+        if was_inserted and alias:
+            collisions = find_alias_collisions(
+                db, aliases=alias, exclude_speaker_id=sid
+            )
     finally:
         db.close()
-    typer.echo(f"speaker {sid}: {label}")
+    if was_inserted:
+        typer.echo(f"speaker {sid}: {label} (added)")
+    else:
+        typer.echo(f"speaker {sid}: {label}")
+    # Tell the user when the idempotent path silently dropped their
+    # --alias / --notes input. ``add_speaker`` is documented as
+    # idempotent, but "idempotent" doesn't explain that *modifiers* are
+    # dropped on re-call -- this warning is what closes that gap.
+    if not was_inserted and (alias or notes is not None):
+        dropped: list[str] = []
+        if alias:
+            dropped.append(f"--alias ({len(alias)} value(s))")
+        if notes is not None:
+            dropped.append("--notes")
+        typer.echo(
+            "warning: speaker " + f'"{label}"' + " already exists; "
+            + ", ".join(dropped)
+            + " were not applied because `add` is idempotent on label. "
+            "Use `rytp speakers update` (planned v2) to mutate existing "
+            "speakers' aliases/notes.",
+            err=True,
+        )
+    if collisions:
+        # De-dupe by conflicting speaker for the message.
+        unique_targets = sorted({sid for _, sid in collisions})
+        target_list = ", ".join(
+            f"speaker {sid}" for sid in unique_targets
+        )
+        typer.echo(
+            f"warning: {len(collisions)} alias(es) collide with "
+            f"{target_list} — the speaker-mapping step may pick the "
+            "wrong speaker for matching labels.",
+            err=True,
+        )
 
 
 @speakers_app.command("list")
@@ -759,7 +1004,7 @@ def speakers_recompute_pauses() -> None:
         n = recompute_pause_stats(db)
     finally:
         db.close()
-    typer.echo(f"recomputed pause stats for {n} speaker(s)")
+    typer.echo(f"recomputed pause stats for {n} speaker" + ("s" if n != 1 else ""))
 
 
 @speakers_app.command("map")
@@ -784,16 +1029,31 @@ def speakers_map(
 
     db = _open_db()
     try:
+        # Validate the video id first -- ``distinct_diarizer_speakers``
+        # returns an empty list for any unknown id, which the previous
+        # version of this command conflated with "no labels yet" and
+        # silently printed the global roster instead. A nonexistent
+        # video_id is an error, not an empty result.
+        video_row = db.conn.execute(
+            "SELECT id FROM videos WHERE id = ?", (video_id,)
+        ).fetchone()
+        if video_row is None:
+            typer.echo(
+                f"video {video_id} not found in videos table",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
         mapper = SpeakerMapper(db, video_id)
-        rows = mapper.right_pane()
+        labels = mapper.left_pane()
     finally:
         db.close()
-    if not rows:
+    if not labels:
         typer.echo(f"video {video_id} has no diarizer labels yet")
         return
-    typer.echo(f"canonical speakers with raw labels in video {video_id}:")
-    for s in rows:
-        typer.echo(f"  - id={s.id}  label={s.label!r}  aliases={s.aliases}")
+    typer.echo(f"raw diarizer labels in video {video_id}:")
+    for label in labels:
+        typer.echo(f"  - {label!r}")
 
 
 # --- singleton: mine -------------------------------------------------------
@@ -806,6 +1066,7 @@ def mine_cmd(
         "med",
         "--cohesion",
         help="Window cohesion: low (single word), med (5 s window), high (15 s window).",
+        callback=_cohesion_callback,
     ),
     max_clips: int = typer.Option(
         C.DEFAULT_MAX_CLIPS,
@@ -817,7 +1078,7 @@ def mine_cmd(
 
     See DESIGN §7 and :func:`rytp.mine.mine` for the algorithm.
     """
-    from rytp.mine import Cohesion, mine
+    from rytp.mine import mine
 
     db = _open_db()
     try:
@@ -852,6 +1113,7 @@ def splice_cmd(
         "concat",
         "--mode",
         help="Splice mode: 'concat' (re-encode + loudnorm) or 'stream-copy'.",
+        callback=_splice_mode_callback,
     ),
 ) -> None:
     """Run ffmpeg; write the spliced output + a sidecar manifest JSON.
@@ -871,10 +1133,12 @@ def splice_cmd(
                 db, [clip_set_id], output_path=out, mode=mode
             )
         except (FileNotFoundError, ValueError, RuntimeError) as e:
-            typer.echo(str(e), err=True)
-            raise typer.Exit(code=1) from e
+            _handle_business_error(e)
     finally:
-        db.close()
+        try:
+            db.close()
+        except sqlite3.ProgrammingError:
+            pass
     typer.echo(
         f"wrote {result.output_path} (manifest: {result.manifest_path}, "
         f"{result.n_clips} clip)"
@@ -891,14 +1155,29 @@ def tui_cmd() -> None:
     The TUI exposes two read-only screens (videos, speakers) and
     is the v1 baseline; per DESIGN §6 the full §6 subcommand set
     in the TUI is v2.
-    """
-    from rytp.tui.app import run_tui
 
+    Requires the optional ``textual`` dependency; install with
+    ``pip install rytp[all]`` (or just ``pip install textual rich``)
+    if you see an ``ImportError`` about a missing module on launch.
+    """
     db = _open_db()
     try:
-        run_tui(db)
+        try:
+            # Import inside the try so a missing textual package
+            # surfaces as the friendly ``ImportError`` from
+            # ``rytp.tui.app`` instead of a raw traceback at module
+            # import time.
+            from rytp.tui.app import run_tui
+
+            run_tui(db)
+        except ImportError as e:
+            typer.echo(str(e), err=True)
+            raise typer.Exit(code=1) from e
     finally:
-        db.close()
+        try:
+            db.close()
+        except sqlite3.ProgrammingError:
+            pass
 
 
 # --- transcripts group ------------------------------------------------------
@@ -934,12 +1213,29 @@ def transcripts_export(
 
     db = Database(config_paths.db)
     try:
-        db.migrate()
-        written = export_markdown(
-            db, video_id, min_block_s=min_block_s, out_path=out
-        )
+        try:
+            db.migrate()
+            written = export_markdown(
+                db, video_id, min_block_s=min_block_s, out_path=out
+            )
+        except ValueError as e:
+            # ``export_markdown`` raises ``ValueError`` when the video
+            # id doesn't exist — turn that into a clean exit instead
+            # of leaking the traceback.
+            typer.echo(str(e), err=True)
+            raise typer.Exit(code=1) from e
+        except PermissionError as e:
+            typer.echo(
+                f"cannot write to {e.filename or 'the target path'} "
+                f"(Access is denied). Check that the parent directory is writable.",
+                err=True,
+            )
+            raise typer.Exit(code=1) from e
     finally:
-        db.close()
+        try:
+            db.close()
+        except sqlite3.ProgrammingError:
+            pass
     typer.echo(str(written))
 
 

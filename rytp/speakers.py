@@ -31,26 +31,107 @@ from rytp.models import Speaker
 # ---------------------------------------------------------------------------
 
 
+def find_alias_collisions(
+    db: Database,
+    *,
+    aliases: Iterable[str],
+    exclude_speaker_id: int | None = None,
+) -> list[tuple[str, int]]:
+    """Return ``[(alias, conflicting_speaker_id), ...]`` for any alias
+    that already resolves to a different speaker.
+
+    Matches an alias against:
+
+    * another speaker's ``label`` (so a label like ``"Bob"`` cannot also
+      be someone else's alias);
+    * any other speaker's stored alias list.
+
+    The comparison is case-insensitive: ``"bob"`` and ``"Bob"`` are
+    treated as the same alias. ``exclude_speaker_id`` lets callers
+    exclude themselves when validating an update to an existing
+    speaker's aliases -- without it, every alias on a speaker would
+    "collide" with itself.
+    """
+    alias_list = [a for a in aliases if a]
+    if not alias_list:
+        return []
+    lowered = {a.lower() for a in alias_list}
+
+    out: list[tuple[str, int]] = []
+
+    # 1. Other speakers whose label collides with one of our aliases.
+    label_query = "SELECT id, label FROM speakers"
+    label_params: tuple[object, ...] = ()
+    if exclude_speaker_id is not None:
+        label_query += " WHERE id != ?"
+        label_params = (exclude_speaker_id,)
+    for row in db.conn.execute(label_query, label_params).fetchall():
+        if row["label"].lower() in lowered:
+            out.append((row["label"], row["id"]))
+
+    # 2. Other speakers whose stored alias list contains one of ours.
+    # Pull every existing alias list and intersect in Python -- the
+    # roster is small (one row per real person) so this is cheap.
+    alias_query = "SELECT id, aliases_json FROM speakers"
+    alias_params: tuple[object, ...] = ()
+    if exclude_speaker_id is not None:
+        alias_query += " WHERE id != ?"
+        alias_params = (exclude_speaker_id,)
+    for row in db.conn.execute(alias_query, alias_params).fetchall():
+        try:
+            existing_aliases = json.loads(row["aliases_json"] or "[]")
+        except (ValueError, TypeError):
+            continue
+        existing_set = {a.lower() for a in existing_aliases}
+        for candidate in lowered:
+            if candidate in existing_set:
+                # Report the alias as the user typed it (preserves
+                # case in the returned list).
+                typed = next(a for a in alias_list if a.lower() == candidate)
+                out.append((typed, row["id"]))
+
+    # Deduplicate (an alias can match both another speaker's label
+    # and their alias list).
+    seen: set[tuple[str, int]] = set()
+    deduped: list[tuple[str, int]] = []
+    for alias, sid in out:
+        if (alias, sid) not in seen:
+            seen.add((alias, sid))
+            deduped.append((alias, sid))
+    return deduped
+
+
 def add_speaker(
     db: Database,
     label: str,
     *,
     aliases: Iterable[str] = (),
     notes: str | None = None,
-) -> int:
+) -> tuple[int, bool]:
     """Insert a speaker into the global roster.
 
     Idempotent on ``label``: if the speaker already exists, returns the
-    existing id without modification (use ``update_speaker`` to change
-    aliases/notes).
+    existing id **without modification** (use :func:`update_speaker` to
+    change aliases/notes). The second tuple element is ``True`` iff a
+    fresh insert happened -- callers that want to surface "your alias
+    update was dropped because the speaker was already there" use this
+    to emit a warning.
 
-    Returns the speaker id.
+    Alias collisions with another speaker's label or alias list are
+    *not* rejected -- the insert succeeds so the on-disk roster stays
+    consistent with existing rows in legacy DBs. Callers that want to
+    surface collisions should use :func:`find_alias_collisions` after
+    the insert (the CLI's ``speakers add`` does this and warns on
+    stderr).
+
+    Returns ``(speaker_id, was_inserted)``: ``was_inserted`` is ``True``
+    for a fresh row, ``False`` when the label already existed.
     """
     existing = db.conn.execute(
         "SELECT id FROM speakers WHERE label = ?", (label,)
     ).fetchone()
     if existing:
-        return existing["id"]
+        return existing["id"], False
     cur = db.conn.execute(
         """
         INSERT INTO speakers (label, aliases_json, notes, created_at)
@@ -64,7 +145,7 @@ def add_speaker(
         ),
     )
     db.conn.commit()
-    return cur.lastrowid
+    return cur.lastrowid, True
 
 
 def update_speaker(

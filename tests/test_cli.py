@@ -122,6 +122,52 @@ def test_speakers_add_then_list(tmp_path, monkeypatch):
     assert "Al" in r.stdout
 
 
+def test_speakers_add_idempotent_warns_on_alias_drop(tmp_path, monkeypatch):
+    """Re-running ``speakers add`` for an existing label must warn
+    that --alias / --notes were ignored, instead of silently dropping
+    the user's input.
+
+    Regression test for ANALYSIS-2.md issue A: the previous behavior
+    was a silent no-op.
+    """
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    cr = _CR()
+    r1 = cr.invoke(app, ["speakers", "add", "Liam", "--alias", "L1"])
+    assert r1.exit_code == 0, r1.stdout
+
+    # Re-add the same label with a fresh alias. The CLI must
+    # explicitly tell the user the alias was dropped, otherwise the
+    # "idempotent" promise is misleading.
+    r2 = cr.invoke(app, ["speakers", "add", "Liam", "--alias", "L2"])
+    assert r2.exit_code == 0, r2.stdout
+    combined = (r2.stdout or "") + (r2.output or "")
+    assert "already exists" in combined.lower(), (
+        f"expected a 'already exists' warning; got: {combined!r}"
+    )
+    assert "--alias" in combined
+    assert "L2" not in combined or "not applied" in combined
+
+    # The alias really is not in the DB.
+    db = Database(config.paths.db)
+    try:
+        row = db.conn.execute(
+            "SELECT aliases_json FROM speakers WHERE label = ?", ("Liam",)
+        ).fetchone()
+    finally:
+        db.close()
+    import json as _json
+    assert _json.loads(row["aliases_json"]) == ["L1"]
+
+
 def test_queue_pause_resume_round_trip(tmp_path, monkeypatch):
     from typer.testing import CliRunner as _CR
 
@@ -169,6 +215,48 @@ def test_videos_list_unknown_channel_exits_nonzero(tmp_path, monkeypatch):
     r = _CR().invoke(app, ["videos", "list", "--channel", "nope"])
     assert r.exit_code == 1, r.stdout
     assert "channel not found" in r.stdout.lower() or "channel not found" in (r.stderr or "").lower()
+
+
+def test_videos_list_invalid_source_errors(tmp_path, monkeypatch) -> None:
+    """``videos list --source <unknown>`` should fail fast with the list
+    of allowed sources -- not silently return an empty result.
+
+    Regression test for ANALYSIS-2.md observation C-2.
+    """
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["videos", "list", "--source", "bogus"])
+    assert r.exit_code == 2, r.stdout  # Typer BadParameter exits 2.
+    combined = (r.stdout or "") + (r.output or "")
+    assert "bogus" in combined
+    assert "youtube" in combined  # the allowed list
+
+
+def test_videos_list_invalid_kind_errors(tmp_path, monkeypatch) -> None:
+    """Same as ``--source`` above, but for ``--kind``."""
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["videos", "list", "--kind", "bogus"])
+    assert r.exit_code == 2, r.stdout
+    combined = (r.stdout or "") + (r.output or "")
+    assert "bogus" in combined
+    assert "video" in combined  # the allowed list mentions "video"
 
 
 # --- HF_TOKEN gate -------------------------------------------------------
@@ -316,3 +404,25 @@ def test_speakers_map_lists_empty(tmp_path, monkeypatch) -> None:
     r = _CR().invoke(app, ["speakers", "map", "1"])
     assert r.exit_code == 0, r.stdout
     assert "no diarizer labels" in r.stdout.lower() or "video 1 has no" in r.stdout.lower()
+
+
+def test_speakers_map_unknown_video_errors(tmp_path, monkeypatch) -> None:
+    """``speakers map <unknown-id>`` must error out, not silently dump
+    the global roster. Regression test for ANALYSIS-2.md issue D: the
+    previous implementation ignored the video_id and printed the
+    entire roster as if every label belonged to the requested video.
+    """
+    from typer.testing import CliRunner as _CR
+
+    from rytp import config
+    from rytp.db import Database
+
+    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
+    db = Database(config.paths.db)
+    db.migrate()
+    db.close()
+
+    r = _CR().invoke(app, ["speakers", "map", "999"])
+    assert r.exit_code == 1, r.stdout
+    combined = (r.stdout or "") + (r.output or "")
+    assert "not found" in combined.lower()

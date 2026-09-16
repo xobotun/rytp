@@ -160,7 +160,7 @@ def test_export_markdown_writes_expected_file(db: Database, data_dir: Path) -> N
     video_id = db.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 
     # 2. Register a canonical speaker.
-    speaker_id = add_speaker(db, "Alice")
+    speaker_id, _ = add_speaker(db, "Alice")
 
     # 3. Register a raw diarizer label mapping.
     map_diarizer_to_speaker(db, video_id, "SPEAKER_00", speaker_id)
@@ -233,7 +233,7 @@ def test_export_markdown_uses_default_min_block_when_not_passed(
         "VALUES ('youtube', 'video', 'Defaults', 10000)"
     )
     video_id = db.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-    speaker_id = add_speaker(db, "Bob")
+    speaker_id, _ = add_speaker(db, "Bob")
     map_diarizer_to_speaker(db, video_id, "SPEAKER_00", speaker_id)
     # Three long Bob blocks, each > 2 s, with no other speakers in
     # between. Result: 3 blocks (one per change point, but here

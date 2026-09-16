@@ -30,7 +30,7 @@ def test_sample_pause_cross_speaker_skips(db: Database) -> None:
 
 
 def test_sample_pause_no_data_uses_default(db: Database) -> None:
-    sid = add_speaker(db, "Alice")
+    sid, _ = add_speaker(db, "Alice")
     p = sample_pause(db, prev_speaker_id=sid, curr_speaker_id=sid)
     # No stats row → defaults
     assert p.video_strategy == VideoStrategy.FREEZE
@@ -42,7 +42,7 @@ def test_sample_pause_uses_speaker_stats_when_available(
 ) -> None:
     # Populate words with predictable 100ms gaps.
     vid = db.upsert_video(fake_video_row)
-    sid = add_speaker(db, "Alice")
+    sid, _ = add_speaker(db, "Alice")
     rows_data = [(i * 200, i * 200 + 100) for i in range(50)]
     db.conn.executemany(
         """
@@ -117,7 +117,7 @@ def _insert_clip_with_speaker(
 def test_splice_clips_writes_manifest_and_db_rows(
     db: Database, fake_video_row, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    sid = add_speaker(db, "Alice")
+    sid, _ = add_speaker(db, "Alice")
     clip_id = _insert_clip_with_speaker(
         db, fake_video_row, speaker_id=sid
     )

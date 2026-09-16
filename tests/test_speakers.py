@@ -22,21 +22,33 @@ from rytp.speakers import (
 
 
 def test_add_speaker_returns_id(db) -> None:
-    sid = add_speaker(db, "Alice", aliases=("Al", "Алиса"))
+    sid, inserted = add_speaker(db, "Alice", aliases=("Al", "Алиса"))
     assert sid > 0
+    assert inserted is True
     s = list_speakers(db)[0]
     assert s.label == "Alice"
     assert s.aliases == ["Al", "Алиса"]
 
 
 def test_add_speaker_is_idempotent(db) -> None:
-    sid1 = add_speaker(db, "Alice")
-    sid2 = add_speaker(db, "Alice")
+    sid1, _ = add_speaker(db, "Alice")
+    sid2, _ = add_speaker(db, "Alice")
     assert sid1 == sid2
 
 
+def test_add_speaker_existing_returns_inserted_false(db) -> None:
+    sid1, inserted1 = add_speaker(db, "Alice")
+    sid2, inserted2 = add_speaker(db, "Alice", aliases=("new_alias",))
+    assert sid1 == sid2
+    assert inserted1 is True
+    assert inserted2 is False
+    # Existing aliases were *not* updated by the second call.
+    s = list_speakers(db)[0]
+    assert s.aliases == []
+
+
 def test_update_speaker(db) -> None:
-    sid = add_speaker(db, "Alice")
+    sid, _ = add_speaker(db, "Alice")
     update_speaker(db, sid, aliases=("Al",), notes="comedian")
     s = list_speakers(db)[0]
     assert s.aliases == ["Al"]
@@ -44,9 +56,9 @@ def test_update_speaker(db) -> None:
 
 
 def test_list_speakers_ordered_by_label(db) -> None:
-    add_speaker(db, "Charlie")
-    add_speaker(db, "Alice")
-    add_speaker(db, "Bob")
+    _, _ = add_speaker(db, "Charlie")
+    _, _ = add_speaker(db, "Alice")
+    _, _ = add_speaker(db, "Bob")
     labels = [s.label for s in list_speakers(db)]
     assert labels == ["Alice", "Bob", "Charlie"]
 
@@ -90,7 +102,7 @@ def test_map_diarizer_to_speaker_writes_through_to_words(db, fake_video_row) -> 
     vid = _make_video_with_words(
         db, fake_video_row, [(0, "A"), (200, "B"), (400, "A")]
     )
-    sid = add_speaker(db, "Alice")
+    sid, _ = add_speaker(db, "Alice")
     map_diarizer_to_speaker(db, vid, "A", sid)
     # The mapping row is written
     mapping = video_speaker_map(db, vid)
@@ -107,7 +119,7 @@ def test_map_diarizer_to_speaker_writes_through_to_words(db, fake_video_row) -> 
 
 def test_map_diarizer_to_speaker_clear(db, fake_video_row) -> None:
     vid = _make_video_with_words(db, fake_video_row, [(0, "A")])
-    sid = add_speaker(db, "Alice")
+    sid, _ = add_speaker(db, "Alice")
     map_diarizer_to_speaker(db, vid, "A", sid)
     map_diarizer_to_speaker(db, vid, "A", None)
     rows = db.conn.execute(
@@ -123,7 +135,7 @@ def test_compute_pause_stats_simple(db, fake_video_row) -> None:
     vid = _make_video_with_words(
         db, fake_video_row, [(0, "A"), (200, "A"), (400, "A"), (600, "A")]
     )
-    sid = add_speaker(db, "Alice")
+    sid, _ = add_speaker(db, "Alice")
     # Mark every word's speaker_id to make compute_pause_stats count them.
     db.conn.execute(
         "UPDATE words SET speaker_id = ? WHERE video_id = ?", (sid, vid)
@@ -143,7 +155,7 @@ def test_compute_pause_stats_skips_across_videos(db, fake_video_row) -> None:
     v2 = _make_video_with_words(
         db, {**fake_video_row, "youtube_id": "v2"}, [(0, "A"), (200, "A")]
     )
-    sid = add_speaker(db, "Alice")
+    sid, _ = add_speaker(db, "Alice")
     db.conn.execute("UPDATE words SET speaker_id = ?", (sid,))
     db.conn.commit()
     stats = compute_pause_stats(db, sid)
@@ -157,7 +169,7 @@ def test_recompute_pause_stats_persists(db, fake_video_row) -> None:
     _make_video_with_words(
         db, fake_video_row, [(0, "A"), (200, "A"), (400, "A")]
     )
-    sid = add_speaker(db, "Alice")
+    sid, _ = add_speaker(db, "Alice")
     db.conn.execute("UPDATE words SET speaker_id = ?", (sid,))
     db.conn.commit()
     n = recompute_pause_stats(db)
@@ -170,7 +182,7 @@ def test_recompute_pause_stats_persists(db, fake_video_row) -> None:
 
 
 def test_recompute_pause_stats_handles_no_samples(db) -> None:
-    add_speaker(db, "Lonely")
+    _, _ = add_speaker(db, "Lonely")
     n = recompute_pause_stats(db)
     assert n == 0  # no words → no stats row written
 
@@ -182,8 +194,8 @@ def test_speaker_mapper_left_and_right_pane(db, fake_video_row) -> None:
     vid = _make_video_with_words(
         db, fake_video_row, [(0, "SPEAKER_00"), (200, "SPEAKER_01")]
     )
-    add_speaker(db, "Alice")
-    add_speaker(db, "Bob")
+    _, _ = add_speaker(db, "Alice")
+    _, _ = add_speaker(db, "Bob")
     mapper = SpeakerMapper(db, vid)
     assert mapper.left_pane() == ["SPEAKER_00", "SPEAKER_01"]
     assert [s.label for s in mapper.right_pane()] == ["Alice", "Bob"]
@@ -191,10 +203,10 @@ def test_speaker_mapper_left_and_right_pane(db, fake_video_row) -> None:
 
 def test_speaker_mapper_fuzzy_match(db, fake_video_row) -> None:
     vid = _make_video_with_words(db, fake_video_row, [(0, "SPEAKER_07")])
-    add_speaker(db, "Alice", aliases=("Al",))
+    _, _ = add_speaker(db, "Alice", aliases=("Al",))
     mapper = SpeakerMapper(db, vid)
     # No match
     assert mapper.fuzzy_match("SPEAKER_07") is None
     # Match by label
-    add_speaker(db, "SPEAKER_07 Person")
+    _, _ = add_speaker(db, "SPEAKER_07 Person")
     assert mapper.fuzzy_match("SPEAKER_07").label == "SPEAKER_07 Person"

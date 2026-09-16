@@ -17,8 +17,10 @@ try:
     from textual.binding import Binding
 except ImportError as e:  # pragma: no cover - import guard
     raise ImportError(
-        "textual is not installed. Install with `pip install rytp[all]` "
-        "(or just `pip install textual rich`) to use `rytp tui`."
+        "textual is not installed. Install with `pip install rytp` "
+        "(which pulls in textual as a base dependency) or, if you "
+        "installed the package without its dependencies, run "
+        "`pip install textual rich` to use `rytp tui`."
     ) from e
 
 from rytp.tui.screens.speakers import SpeakersScreen
