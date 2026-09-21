@@ -219,6 +219,7 @@ __marimo__/
 
 # rytp runtime data
 data/
+sample_inputs/
 yt-dlp.exe
 
 # Tests

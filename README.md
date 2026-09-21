@@ -171,7 +171,7 @@ skip the network step entirely:
 # `yt-dlp -f "worstvideo+bestaudio"` without ffmpeg to merge):
 rytp videos add "/path/to/video.mp4" \
     --audio "/path/to/audio.webm" \
-    --youtube-id oSYPC3cc_4A \
+    --youtube-id sample_youtube_id \
     --title "Смерть чиновника"
 
 # Or register a single already-merged local file:
@@ -289,9 +289,9 @@ once with ``rytp videos add``. Pass the video file as the argument
 and the audio file with ``--audio``:
 
 ```bash
-rytp videos add "Смерть чиновника [oSYPC3cc_4A].f311.mp4" \
-    --audio "Смерть чиновника [oSYPC3cc_4A].f251-1.webm" \
-    --youtube-id oSYPC3cc_4A \
+rytp videos add "Смерть чиновника [sample_youtube_id].f311.mp4" \
+    --audio "Смерть чиновника [sample_youtube_id].f251-1.webm" \
+    --youtube-id sample_youtube_id \
     --title "Смерть чиновника"
 ```
 
@@ -380,7 +380,7 @@ audio/video merge inside the download stage, and the
 local-file-pair registration path (downloaded-but-not-via-rytp
 files registered with ``rytp videos add VIDEO --audio AUDIO``).
 Integration tests that exercise the user's bundled
-``oSYPC3cc_4A.f311.mp4`` + ``oSYPC3cc_4A.f251-1.webm`` pair
+``sample_youtube_id.f311.mp4`` + ``sample_youtube_id.f251-1.webm`` pair
 skip cleanly when the files aren't present.
 
 Tests run with no external services (ffmpeg, faster-whisper,

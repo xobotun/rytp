@@ -105,14 +105,14 @@ def test_merge_audio_video_preserves_cyrillic_filenames(
     """Filenames with non-ASCII characters must round-trip cleanly.
 
     The user's sample run produced files like
-    ``Смерть чиновника [oSYPC3cc_4A].f311.mp4`` — Russian title plus
+    ``Смерть чиновника [sample_youtube_id].f311.mp4`` — Russian title plus
     the yt-dlp suffix — and the merge output should keep that
     title in the merged name.
     """
     monkeypatch.setattr(shutil, "which", lambda _: "ffmpeg")
 
-    video = tmp_path / "Смерть чиновника [oSYPC3cc_4A].f311.mp4"
-    audio = tmp_path / "Смерть чиновника [oSYPC3cc_4A].f251-1.webm"
+    video = tmp_path / "Смерть чиновника [sample_youtube_id].f311.mp4"
+    audio = tmp_path / "Смерть чиновника [sample_youtube_id].f251-1.webm"
     video.write_bytes(b"video")
     audio.write_bytes(b"audio")
 
@@ -123,9 +123,9 @@ def test_merge_audio_video_preserves_cyrillic_filenames(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     runner = RealYtDlpRunner.__new__(RealYtDlpRunner)
-    out = runner._merge_audio_video(tmp_path, video, audio, youtube_id="oSYPC3cc_4A")
+    out = runner._merge_audio_video(tmp_path, video, audio, youtube_id="sample_youtube_id")
 
-    assert out.name == "Смерть чиновника [oSYPC3cc_4A].f311_merged.mp4"
+    assert out.name == "Смерть чиновника [sample_youtube_id].f311_merged.mp4"
     assert out.exists()
 
 

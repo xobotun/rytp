@@ -1,7 +1,7 @@
 """Integration test: the user's real downloaded files.
 
-The repo ships ``oSYPC3cc_4A.f311.mp4`` (video) and
-``oSYPC3cc_4A.f251-1.webm`` (audio) — split files from an
+The repo ships ``sample_youtube_id.f311.mp4`` (video) and
+``sample_youtube_id.f251-1.webm`` (audio) — split files from an
 ``yt-dlp -f "worstvideo[height=720]+bestaudio[language=ru]"``
 download. This test exercises the full pipeline against those files:
 
@@ -25,8 +25,8 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-REAL_VIDEO = REPO_ROOT / "oSYPC3cc_4A.f311.mp4"
-REAL_AUDIO = REPO_ROOT / "oSYPC3cc_4A.f251-1.webm"
+REAL_VIDEO = REPO_ROOT / "sample_youtube_id.f311.mp4"
+REAL_AUDIO = REPO_ROOT / "sample_youtube_id.f251-1.webm"
 
 
 pytestmark = pytest.mark.skipif(
@@ -46,7 +46,7 @@ def test_real_files_extract_audio_from_webm(
         db,
         REAL_VIDEO,
         REAL_AUDIO,
-        youtube_id="oSYPC3cc_4A",
+        youtube_id="sample_youtube_id",
         title="Смерть чиновника",
     )
 
@@ -84,15 +84,15 @@ def test_real_files_full_transcribe_pipeline(
         db,
         REAL_VIDEO,
         REAL_AUDIO,
-        youtube_id="oSYPC3cc_4A",
+        youtube_id="sample_youtube_id",
         title="Смерть чиновника",
     )
 
     # 2. The repo ships a pre-extracted 16 kHz mono WAV at
-    #    ``data/audio/oSYPC3cc_4A.wav``. We point the mocked
+    #    ``data/audio/sample_youtube_id.wav``. We point the mocked
     #    ``extract_audio`` at it so the chunker and STT engine see a
     #    real canonical-format file.
-    pre_extracted = REPO_ROOT / "data" / "audio" / "oSYPC3cc_4A.wav"
+    pre_extracted = REPO_ROOT / "data" / "audio" / "sample_youtube_id.wav"
     if not pre_extracted.exists():
         pytest.skip(
             f"pre-extracted WAV not found at {pre_extracted} — "

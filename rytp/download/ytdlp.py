@@ -306,7 +306,7 @@ class RealYtDlpRunner:
         """Merge separate audio and video files into a single container.
 
         The output name is ``{video_path.stem}_merged{video_path.suffix}``,
-        e.g. ``Смерть чиновника [oSYPC3cc_4A].f311_merged.mp4``. We
+        e.g. ``Смерть чиновника [sample_youtube_id].f311_merged.mp4``. We
         keep the original audio and video files on disk so the audio
         extraction stage can read ``audio_path`` directly without
         re-decoding the merged mp4; ``DownloadResult.audio_path``

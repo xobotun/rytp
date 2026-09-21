@@ -62,7 +62,7 @@ def test_register_local_pair_with_youtube_id_is_idempotent(
     audio1 = _touch(tmp_path / "a1.webm")
 
     vid = register_local_video_with_separate_audio(
-        db, video1, audio1, youtube_id="oSYPC3cc_4A"
+        db, video1, audio1, youtube_id="sample_youtube_id"
     )
     assert vid > 0
 
@@ -70,7 +70,7 @@ def test_register_local_pair_with_youtube_id_is_idempotent(
     video2 = _touch(tmp_path / "v2.mp4")
     audio2 = _touch(tmp_path / "a2.webm")
     vid2 = register_local_video_with_separate_audio(
-        db, video2, audio2, youtube_id="oSYPC3cc_4A"
+        db, video2, audio2, youtube_id="sample_youtube_id"
     )
     assert vid2 == vid
 
@@ -121,7 +121,7 @@ def test_videos_add_cli_with_audio_path(
             "--audio",
             str(audio),
             "--youtube-id",
-            "oSYPC3cc_4A",
+            "sample_youtube_id",
             "--title",
             "Смерть чиновника",
         ],
@@ -137,7 +137,7 @@ def test_videos_add_cli_with_audio_path(
     assert row["downloaded_path"] == str(video.resolve())
     assert row["downloaded_audio_path"] == str(audio.resolve())
     assert row["title"] == "Смерть чиновника"
-    assert row["youtube_id"] == "oSYPC3cc_4A"
+    assert row["youtube_id"] == "sample_youtube_id"
 
 
 def test_videos_add_cli_audio_missing_raises(

@@ -463,7 +463,7 @@ def videos_add(
         None,
         "--youtube-id",
         help=(
-            "YouTube video id (e.g. ``oSYPC3cc_4A``). Only used when "
+            "YouTube video id (e.g. ``sample_youtube_id``). Only used when "
             "registering a local file pair so re-registration updates "
             "the same row instead of creating a duplicate."
         ),
