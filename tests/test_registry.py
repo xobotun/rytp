@@ -8,6 +8,8 @@ import pytest
 
 from rytp import commands
 from rytp.commands import (
+    COMMANDS,
+    GROUP_SUMMARIES,
     REQUIRED,
     Command,
     CommandResult,
@@ -201,3 +203,35 @@ def test_cli_only_defaults_to_false(registry: dict[str, Command]) -> None:
     """Contracts §5: a surface launcher is a registry command the TUI hides."""
     assert register(make("videos.list", "videos")).cli_only is False
     assert register(make("tui", "", cli_only=True)).cli_only is True
+
+
+# --- GROUP_SUMMARIES (contracts §5, BUGS.md entry 6) ------------------
+
+
+def test_a_group_with_no_summary_is_refused(registry: dict[str, Command]) -> None:
+    """A new group cannot ship undescribed: registering into a group absent
+    from GROUP_SUMMARIES is a programming error, not a user error."""
+    with pytest.raises(ValueError, match="GROUP_SUMMARIES"):
+        register(make("wobble.list", "wobble"))
+
+
+def test_a_top_level_command_needs_no_group_summary(
+    registry: dict[str, Command],
+) -> None:
+    """`group == ""` is exempt: contracts §5 pins one entry per *non-empty*
+    group, and a top-level command has none to describe."""
+    register(make("ingest", ""))
+
+
+def test_every_real_group_has_a_summary() -> None:
+    """The regression guard `GROUP_SUMMARIES` is a error-catching net for:
+    every group any registered command actually uses must have an entry, or
+    the CLI's `--help` shows a blank line where the description belongs."""
+    real_groups = {cmd.group for cmd in COMMANDS.values() if cmd.group}
+    missing = real_groups - set(GROUP_SUMMARIES)
+    assert not missing, f"groups with no GROUP_SUMMARIES entry: {sorted(missing)}"
+
+
+def test_every_group_summary_is_a_short_non_empty_phrase() -> None:
+    for group, summary in GROUP_SUMMARIES.items():
+        assert summary.strip(), f"group {group!r} has a blank summary"

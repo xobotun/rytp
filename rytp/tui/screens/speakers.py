@@ -31,6 +31,7 @@ from textual.widgets import DataTable, Footer, Header, Input, Static
 from rytp import constants as C
 from rytp.diarize import store
 from rytp.diarize.mapper import MappingSession
+from rytp.tui.text import plain_row, set_text
 
 if TYPE_CHECKING:
     from rytp.db import Database
@@ -43,7 +44,7 @@ def _fill(table: DataTable, columns: tuple[str, ...], rows: list[tuple[str, ...]
     table.clear(columns=True)
     table.add_columns(*columns)
     for row in rows:
-        table.add_row(*row)
+        table.add_row(*plain_row(row))
 
 
 class SpeakerMapperScreen(Screen[None]):
@@ -114,8 +115,9 @@ class SpeakerMapperScreen(Screen[None]):
         text = message if message is not None else self.session.status
         remaining = self.session.n_unmapped()
         suffix = f"{remaining} voice{'' if remaining == 1 else 's'} still unnamed"
-        self.query_one("#mapper-status", Static).update(
-            f"{text} — {suffix}" if text else suffix
+        set_text(
+            self.query_one("#mapper-status", Static),
+            f"{text} — {suffix}" if text else suffix,
         )
 
     # -- events ----------------------------------------------------------
@@ -227,10 +229,11 @@ class SpeakerVideosScreen(Screen[None]):
                 for row in rows
             ],
         )
-        self.query_one("#videos-status", Static).update(
+        set_text(
+            self.query_one("#videos-status", Static),
             f"{len(rows)} diarized video{'' if len(rows) == 1 else 's'}"
             if rows
-            else "nothing diarized yet — `rytp speakers diarize <video>`"
+            else "nothing diarized yet — `rytp speakers diarize <video>`",
         )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:

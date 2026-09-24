@@ -78,6 +78,38 @@ def _states(db: Database) -> dict[str, str]:
     return out
 
 
+def _cuda_note(db: Database, wanted: str) -> str:
+    """BUGS.md entry 33 for the configured diarizer: pair "it can run" with
+    "does its interpreter's torch see a GPU", the same probe entry 7 already
+    pays for. Empty for `none` (no dependency at all) and for any diarizer
+    whose class was replaced by a test double with no ``required_module``.
+    """
+    from rytp.diarize.base import DIARIZERS
+    from rytp.transcribe.registry import interpreter_for, probe_engine
+
+    cls = DIARIZERS.get(wanted)
+    if cls is None or not getattr(cls, "out_of_process", False):
+        return ""
+    required = getattr(cls, "required_module", None)
+    if not required:
+        return ""
+    interpreter = interpreter_for(db, wanted)
+    from pathlib import Path
+
+    if not Path(interpreter).exists():
+        return ""
+    probe = probe_engine(interpreter, "", required)
+    torch_version = probe.get("torch")
+    cuda_available = probe.get("cuda_available")
+    if torch_version is None:
+        return ""
+    if cuda_available is False:
+        return f"; torch {torch_version} has no CUDA (device={probe.get('device')})"
+    if cuda_available is True:
+        return f"; CUDA available (device={probe.get('device')})"
+    return ""
+
+
 def check_diarizers(db: Database) -> HealthResult:
     """Which diarizers could run here, and whether the configured one can.
 
@@ -108,7 +140,7 @@ def check_diarizers(db: Database) -> HealthResult:
             ),
         )
     if not missing:
-        return HealthResult(ok=True, detail=detail)
+        return HealthResult(ok=True, detail=f"{detail}{_cuda_note(db, wanted)}")
 
     # Lead with the engine this machine is actually set up to use: that is
     # the one whose absence will bite today.

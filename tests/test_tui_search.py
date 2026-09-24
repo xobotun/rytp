@@ -137,6 +137,15 @@ def test_cuttable_only_filters_through_the_same_command(db: Database) -> None:
     assert [row[0] for row in rows] == [f"v{aligned}:0-1"]
 
 
+def test_cuttable_only_status_explains_what_cuttable_means(db: Database) -> None:
+    """BUGS.md entry 19: "cuttable only" said nothing about what it meant."""
+    corpus(db, "Добрый вечер")
+    session = SearchSession(db, cuttable=True)
+    session.run("добрый вечер")
+    assert "aligned" in session.status
+    assert "--allow-timed" in session.status
+
+
 def test_play_routes_the_highlighted_row_through_the_play_command(
     db: Database, never_spawn_a_player: list[list[str]]
 ) -> None:

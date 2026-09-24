@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from rytp import config
+from rytp import config, progress
 from rytp.acquire import fetchable_video
 from rytp.acquire.policy import DownloadPolicy, NoCaptions
 from rytp.acquire.ytdlp import RealYtDlpRunner, YtDlpRunner, translate_error
@@ -45,6 +45,7 @@ def acquire_captions(
     runner = runner or RealYtDlpRunner()
 
     out_dir = config.ensure_dir(config.paths().media_dir(video_id))
+    progress.report("captions", detail=f"video {video_id}")
     try:
         tracks = runner.download_captions(
             row["url"],
@@ -55,6 +56,7 @@ def acquire_captions(
         )
     except Exception as exc:
         raise translate_error(exc) from exc
+    progress.report("captions", done=1, total=1, detail=f"video {video_id}")
 
     if not tracks:
         raise NoCaptions(

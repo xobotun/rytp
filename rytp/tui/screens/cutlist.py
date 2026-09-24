@@ -23,6 +23,7 @@ from rytp import constants as C
 from rytp.db import Database
 from rytp.tui.cutlist_view import CutlistView, available_cutlists
 from rytp.tui.navigation import BACK_KEY
+from rytp.tui.text import plain_row, set_text
 
 __all__ = ["CutlistPickerScreen", "CutlistScreen"]
 
@@ -34,7 +35,7 @@ def _fill(
     if columns:
         table.add_columns(*columns)
         for row in rows:
-            table.add_row(*row)
+            table.add_row(*plain_row(row))
 
 
 class CutlistPickerScreen(Screen[None]):
@@ -80,10 +81,11 @@ class CutlistPickerScreen(Screen[None]):
                 for item in found
             ),
         )
-        self.query_one("#cutlist-picker-status", Static).update(
+        set_text(
+            self.query_one("#cutlist-picker-status", Static),
             f"{len(found)} cut list{'' if len(found) == 1 else 's'}"
             if found
-            else "no cut lists yet — plan one with `rytp assemble plan \"…\"`"
+            else "no cut lists yet — plan one with `rytp assemble plan \"…\"`",
         )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -92,7 +94,26 @@ class CutlistPickerScreen(Screen[None]):
 
 
 class CutlistScreen(Screen[None]):
-    """The timeline, the highlighted slot's options, and five verbs."""
+    """The timeline, the highlighted slot's options, and its verbs.
+
+    BUGS.md entry 29: this is the screen with the most bindings by some
+    margin, and its footer used to run off the end of an 80-column terminal
+    — recoverable only because PowerShell keeps scrollback. Most keys below
+    are bound with ``show=False``: they still work, and they still appear in
+    full on the help screen (``F1``, or ``?`` from here — `navigation.
+    ScreenEntry.children` is what makes this screen's bindings reach that
+    table), but the footer itself shows only the handful used on every pass
+    over a cut list — swap, snap, undo, save — plus how to see the rest.
+
+    This screen's own contribution to the footer fits comfortably inside an
+    80-column terminal in isolation (`tests/test_tui_cutlist.py`). The
+    *running app's* footer also always carries the F1-F8 navigation strip and
+    the Ctrl+P command-palette key (`rytp/tui/app.py`, `rytp/tui/
+    navigation.py`), and that baseline is already wider than 80 columns on
+    every screen, this one included — a second, separate overflow that is not
+    this task's to fix. Entry 29 was this screen's twelve keys; the app-level
+    strip is Task 17's ("the footer lesson" the QA batch plan hands it).
+    """
 
     DEFAULT_CSS = """
     #cutlist-slots   { height: 2fr; }
@@ -102,16 +123,57 @@ class CutlistScreen(Screen[None]):
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding(BACK_KEY, "app.pop_screen", "Back"),
-        Binding("s", "swap", "Swap in option"),
-        Binding("[", "nudge_start_back", "Start earlier"),
-        Binding("]", "nudge_start_on", "Start later"),
-        Binding("ctrl+left", "nudge_end_back", "End earlier"),
-        Binding("ctrl+right", "nudge_end_on", "End later"),
-        Binding("g", "set_gap", "Pause before"),
-        Binding("c", "clear_gap", "Measured pause"),
+        Binding("s", "swap", "Swap"),
+        # Word-edge nudging (BUGS.md entry 30): plain is
+        # `TUI_CUTLIST_NUDGE_MS` (10 ms), Shift is `TUI_CUTLIST_SHIFT_NUDGE_MS`
+        # (100 ms) — coarser, not finer: a wrong fragment is usually wrong by
+        # a syllable, not by a millisecond. Bracket keys move the start,
+        # Ctrl+arrow the end, matching the split this screen already had.
+        Binding(
+            "[", f"nudge('start', {-C.TUI_CUTLIST_NUDGE_MS})", "Start earlier",
+            show=False,
+        ),
+        Binding(
+            "]", f"nudge('start', {C.TUI_CUTLIST_NUDGE_MS})", "Start later",
+            show=False,
+        ),
+        Binding(
+            "shift+[", f"nudge('start', {-C.TUI_CUTLIST_SHIFT_NUDGE_MS})",
+            "Start earlier (coarse)", show=False,
+        ),
+        Binding(
+            "shift+]", f"nudge('start', {C.TUI_CUTLIST_SHIFT_NUDGE_MS})",
+            "Start later (coarse)", show=False,
+        ),
+        Binding(
+            "ctrl+left", f"nudge('end', {-C.TUI_CUTLIST_NUDGE_MS})", "End earlier",
+            show=False,
+        ),
+        Binding(
+            "ctrl+right", f"nudge('end', {C.TUI_CUTLIST_NUDGE_MS})", "End later",
+            show=False,
+        ),
+        Binding(
+            "ctrl+shift+left", f"nudge('end', {-C.TUI_CUTLIST_SHIFT_NUDGE_MS})",
+            "End earlier (coarse)", show=False,
+        ),
+        Binding(
+            "ctrl+shift+right", f"nudge('end', {C.TUI_CUTLIST_SHIFT_NUDGE_MS})",
+            "End later (coarse)", show=False,
+        ),
+        # The snap-to-clean-boundary key (BUGS.md entry 30): one press does
+        # what forty 1 ms nudges do, and does it better, because a clicking
+        # seam comes from an amplitude discontinuity rather than from timing
+        # precision. `z` pairs with the bracket keys (start), `x` with
+        # Ctrl+arrow (end).
+        Binding("z", "snap('start')", "Snap"),
+        Binding("x", "snap('end')", "Snap end", show=False),
+        Binding("g", "set_gap", "Pause before", show=False),
+        Binding("c", "clear_gap", "Measured pause", show=False),
         Binding("u", "undo", "Undo"),
-        Binding("r", "reload", "Discard edits"),
+        Binding("r", "reload", "Discard edits", show=False),
         Binding("ctrl+s", "save", "Save"),
+        Binding("?", "app.help", "Help"),
     ]
 
     def __init__(self, db: Database, path: Path) -> None:
@@ -136,25 +198,11 @@ class CutlistScreen(Screen[None]):
     def action_swap(self) -> None:
         self._after(self.view.swap(self._slot(), self._option()))
 
-    def action_nudge_start_back(self) -> None:
-        self._after(
-            self.view.nudge(self._slot(), edge="start", delta_ms=-C.TUI_CUTLIST_NUDGE_MS)
-        )
+    def action_nudge(self, edge: str, delta_ms: int) -> None:
+        self._after(self.view.nudge(self._slot(), edge=edge, delta_ms=delta_ms))
 
-    def action_nudge_start_on(self) -> None:
-        self._after(
-            self.view.nudge(self._slot(), edge="start", delta_ms=C.TUI_CUTLIST_NUDGE_MS)
-        )
-
-    def action_nudge_end_back(self) -> None:
-        self._after(
-            self.view.nudge(self._slot(), edge="end", delta_ms=-C.TUI_CUTLIST_NUDGE_MS)
-        )
-
-    def action_nudge_end_on(self) -> None:
-        self._after(
-            self.view.nudge(self._slot(), edge="end", delta_ms=C.TUI_CUTLIST_NUDGE_MS)
-        )
+    def action_snap(self, edge: str) -> None:
+        self._after(self.view.snap(self._slot(), edge=edge))
 
     def action_set_gap(self) -> None:
         self._after(self.view.set_gap_before(self._slot(), C.TUI_CUTLIST_COARSE_NUDGE_MS))
@@ -183,7 +231,7 @@ class CutlistScreen(Screen[None]):
         if self.view.rows:
             table.move_cursor(row=min(index, len(self.view.rows) - 1))
         self._draw_options()
-        self.query_one("#cutlist-status", Static).update(self.view.status)
+        set_text(self.query_one("#cutlist-status", Static), self.view.status)
 
     def _draw_options(self) -> None:
         index = self._slot()
@@ -208,7 +256,7 @@ class CutlistScreen(Screen[None]):
 
     def _after(self, message: str) -> None:
         self.action_redraw()
-        self.query_one("#cutlist-status", Static).update(message)
+        set_text(self.query_one("#cutlist-status", Static), message)
 
     # `_draw_slots` refills the slot table, which moves its cursor, which
     # raises RowHighlighted. If that handler refilled the slot table again the

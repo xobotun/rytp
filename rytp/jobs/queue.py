@@ -41,6 +41,10 @@ class Job:
     not_before: str | None
     last_error: str | None
     note: str | None = None
+    #: Advisory, worker-written while the job runs (contracts §5). Distinct
+    #: from ``note``: it is lossy, may be stale, and is cleared the moment
+    #: the job leaves ``running``, whichever state it lands in.
+    progress: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -56,6 +60,7 @@ class Job:
             not_before=row["not_before"],
             last_error=row["last_error"],
             note=row["note"],
+            progress=row["progress"],
             payload=json.loads(row["payload_json"] or "{}"),
         )
 
@@ -155,7 +160,7 @@ def claim(db: Database, pool: str, *, now: datetime | None = None) -> Job | None
             """
             UPDATE jobs
             SET state = 'running', started_at = ?, finished_at = NULL,
-                attempts = attempts + 1, last_error = NULL
+                attempts = attempts + 1, last_error = NULL, progress = NULL
             WHERE id = ? AND state = 'pending'
             """,
             (stamp, candidate["id"]),
@@ -183,7 +188,7 @@ def finish(
     """
     db.conn.execute(
         "UPDATE jobs SET state = 'done', finished_at = ?, last_error = NULL, "
-        "note = ? WHERE id = ?",
+        "note = ?, progress = NULL WHERE id = ?",
         (_now(now), (note or None) and note[: C.JOB_NOTE_MAX_CHARS], job_id),
     )
 
@@ -191,8 +196,8 @@ def finish(
 def block(db: Database, job_id: int, *, reason: str, now: datetime | None = None) -> None:
     """Park a job whose prerequisites are not there. Reconcile reopens it."""
     db.conn.execute(
-        "UPDATE jobs SET state = 'blocked', finished_at = ?, last_error = ? "
-        "WHERE id = ?",
+        "UPDATE jobs SET state = 'blocked', finished_at = ?, last_error = ?, "
+        "progress = NULL WHERE id = ?",
         (_now(now), reason, job_id),
     )
 
@@ -214,7 +219,7 @@ def defer(
     # network, so it must keep counting against the daily cap.
     db.conn.execute(
         "UPDATE jobs SET state = 'pending', not_before = ?, last_error = ?, "
-        "attempts = MAX(attempts - ?, 0) WHERE id = ?",
+        "attempts = MAX(attempts - ?, 0), progress = NULL WHERE id = ?",
         (not_before, error, 1 if refund_attempt else 0, job_id),
     )
 
@@ -222,8 +227,25 @@ def defer(
 def fail(db: Database, job_id: int, *, error: str, now: datetime | None = None) -> None:
     """Terminal failure. Only ``rytp jobs retry`` brings it back."""
     db.conn.execute(
-        "UPDATE jobs SET state = 'failed', finished_at = ?, last_error = ? WHERE id = ?",
+        "UPDATE jobs SET state = 'failed', finished_at = ?, last_error = ?, "
+        "progress = NULL WHERE id = ?",
         (_now(now), error[: C.JOB_ERROR_MAX_CHARS], job_id),
+    )
+
+
+def set_progress(db: Database, job_id: int, text: str | None) -> None:
+    """Write the worker's advisory ``jobs.progress`` line (contracts §5).
+
+    Deliberately a bare autocommitting statement, never wrapped in
+    :meth:`Database.transaction`: callers must invoke this outside a
+    handler's own transaction, or the write joins it and is invisible until
+    that transaction commits — which for a multi-minute handler defeats the
+    entire point (plan Task 8a). Not gated on ``state = 'running'``: the
+    worker is the only caller and it already knows the job is running.
+    """
+    db.conn.execute(
+        "UPDATE jobs SET progress = ? WHERE id = ?",
+        ((text or None) and text[: C.JOB_NOTE_MAX_CHARS], job_id),
     )
 
 
@@ -234,7 +256,7 @@ def reclaim_running(db: Database, *, now: datetime | None = None) -> int:
     stops them stranding. The spent attempt is deliberately not refunded.
     """
     cur = db.conn.execute(
-        "UPDATE jobs SET state = 'pending', started_at = NULL, "
+        "UPDATE jobs SET state = 'pending', started_at = NULL, progress = NULL, "
         "last_error = 'reclaimed from a worker that did not finish' "
         "WHERE state = 'running'"
     )
@@ -358,8 +380,8 @@ def retry(
         params.append(kind)
     cur = db.conn.execute(
         "UPDATE jobs SET state = 'pending', attempts = 0, not_before = NULL, "
-        "last_error = NULL, note = NULL, started_at = NULL, finished_at = NULL "
-        f"WHERE {' AND '.join(where)}",
+        "last_error = NULL, note = NULL, progress = NULL, started_at = NULL, "
+        f"finished_at = NULL WHERE {' AND '.join(where)}",
         params,
     )
     return int(cur.rowcount)

@@ -213,9 +213,40 @@ def list_videos(
         params.append(f"%{search}%")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.append(clamp_limit(limit))
+    # The extra columns below back `videos list --long` (BUGS.md entry 25).
+    # They are scalar subqueries, not a LEFT JOIN onto `assets`/`words`,
+    # because either of those would multiply a video's row per asset or per
+    # word and break the `ORDER BY v.id DESC LIMIT ?` the default listing
+    # relies on. Folding them into this one statement (rather than a query
+    # per video) is the shape the entry asks for at ~1.6K videos.
     return db.conn.execute(
         f"""
-        SELECT v.*, c.title AS channel_title
+        SELECT v.*, c.title AS channel_title,
+            (SELECT COUNT(*) FROM assets a
+              WHERE a.video_id = v.id AND a.role = 'audio') AS n_audio,
+            (SELECT COUNT(*) FROM assets a
+              WHERE a.video_id = v.id AND a.role = 'captions') AS n_captions,
+            (SELECT COUNT(*) FROM assets a
+              WHERE a.video_id = v.id AND a.role = 'video') AS n_video_assets,
+            (SELECT CASE
+                WHEN EXISTS (SELECT 1 FROM words w
+                              WHERE w.video_id = v.id AND w.source = 'aligned')
+                    THEN 'aligned'
+                WHEN EXISTS (SELECT 1 FROM words w
+                              WHERE w.video_id = v.id AND w.source = 'timed')
+                    THEN 'timed'
+                WHEN EXISTS (SELECT 1 FROM words w
+                              WHERE w.video_id = v.id AND w.source = 'caption')
+                    THEN 'caption'
+                ELSE NULL
+             END) AS best_tier,
+            (SELECT GROUP_CONCAT(engine, ', ') FROM
+                (SELECT DISTINCT engine FROM words w
+                  WHERE w.video_id = v.id ORDER BY engine)) AS engines,
+            (SELECT GROUP_CONCAT(align_scale, ', ') FROM
+                (SELECT DISTINCT align_scale FROM words w
+                  WHERE w.video_id = v.id AND align_scale IS NOT NULL
+                  ORDER BY align_scale)) AS align_scales
         FROM videos v
         LEFT JOIN channels c ON c.id = v.channel_id
         {where}

@@ -51,7 +51,7 @@ def test_video_renditions_accumulate_but_one_per_format(db: Database, tmp_path: 
                  path=str(touch(tmp_path / "v360b.mp4")), height=360)
     rows = assets_for(db, vid, "video")
     assert sorted(r["format_id"] for r in rows) == ["360", "720"]
-    assert {r["path"].rsplit("/", 1)[-1] for r in rows} == {"v360b.mp4", "v720.mp4"}
+    assert {Path(r["path"]).name for r in rows} == {"v360b.mp4", "v720.mp4"}
 
 
 def test_asset_for_returns_the_newest_rendition(db: Database, tmp_path: Path) -> None:

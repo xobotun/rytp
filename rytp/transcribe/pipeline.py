@@ -15,6 +15,7 @@ ordinals those labels were attached to no longer mean the same thing. Design
 """
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,13 +55,94 @@ class TranscribeOutcome:
     #: Speaker labels destroyed along with the old transcript, if any.
     speakers_lost: int
     median_align_score: float | None
+    #: `words.align_scale` this run actually wrote for the words that carry a
+    #: score (plan §1a) — the most common non-null scale, so the report can
+    #: name what `median_align_score` is a median *of*. ``None`` when no word
+    #: got a score at all (no aligner, no refine; or a scoreless aligner with
+    #: refine off).
+    align_scale: str | None
+    #: The aligner's chosen device (plan §1b), or ``None`` when no aligner ran
+    #: this call — there is nothing to report a device for.
+    align_device: str | None
+    #: Advisory findings drained from the aligner's `notes` channel
+    #: (contracts §6) across every chunk. Never a failure.
+    align_notes: tuple[str, ...] = ()
 
 
 _WORD_COLUMNS = (
     "video_id, ord, start_ms, end_ms, text, normalized_text, stem, "
-    "confidence, align_score, source, engine, video_speaker_id"
+    "confidence, align_score, align_scale, source, engine, video_speaker_id"
 )
-_INSERT_WORD = f"INSERT INTO words ({_WORD_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+_INSERT_WORD = (
+    f"INSERT INTO words ({_WORD_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _validate_scale(scale: str | None) -> str | None:
+    """Python-side enforcement of contracts §3: SQLite cannot `CHECK` a column
+    added by `ALTER TABLE`, so every writer of `align_scale` validates here."""
+    if scale is not None and scale not in C.ALIGN_SCALES:
+        raise RytpError(f"invalid align_scale {scale!r}; expected one of {C.ALIGN_SCALES}")
+    return scale
+
+
+def resolve_word_scale(
+    pre_score: float | None, *, refine: bool, aligner_scale: str | None
+) -> str | None:
+    """`words.align_scale` for one word, following plan §1a's table exactly.
+
+    ``pre_score`` is the word's `Span.score` as it stood right after
+    transcription/alignment, before :func:`refine_boundaries` moved boundaries
+    and before :func:`_score_boundaries` filled any still-``None`` score with
+    the measured energy quality. ``aligner_scale`` is the aligner engine's own
+    `score_scale`, or ``None`` when no aligner ran at all.
+
+    An aligner that reported a score keeps its own scale regardless of
+    ``refine``: refinement moves boundaries, it does not re-measure alignment
+    (plan §1a). A ``None`` score — whether because no aligner ran, or because
+    one ran and reported nothing (MFA) — is filled by the energy measure when
+    ``refine`` is on, so that value's honest scale is ``energy``, not the
+    aligner's own (an aligner that reports nothing didn't produce the number
+    on the row; the energy refiner did). With no refine, an aligner that
+    reported nothing stays ``none`` — a real aligner ran and had nothing to
+    say — and no aligner at all stays unscored, ``None``.
+    """
+    if pre_score is not None:
+        # The aligner (or, before an aligner-only design, nothing else)
+        # supplied a real number: its own scale, kept regardless of refine.
+        assert aligner_scale is not None  # a score with no aligner never reaches here
+        return aligner_scale
+    if refine:
+        return C.ALIGN_SCALE_ENERGY
+    return C.ALIGN_SCALE_NONE if aligner_scale is not None else None
+
+
+def _summarize_scores(
+    spans: Sequence[Span], scales: Sequence[str | None]
+) -> tuple[str | None, float | None]:
+    """The scale and median to report for a run (plan §1a, for the CLI table).
+
+    Keyed off words that actually carry a score — `align_scale = 'none'`
+    words never do (a real aligner ran and had nothing to say), so a run
+    where every word is `none` reports ``(None, None)`` exactly like a run
+    with no score at all, rather than a "median none score" heading over a
+    blank cell. Almost always uniform otherwise; wav2vec2's rare interpolated
+    word (no CTC frames of its own) can mix `logprob` with `energy` in one
+    run when `--refine` is on, so the majority scale is picked rather than
+    purity assumed, and the median is taken only over words at *that* scale —
+    never blended across scales, which would be entry 13's defect again in
+    miniature.
+    """
+    scored = [
+        (scale, span.score)
+        for span, scale in zip(spans, scales, strict=True)
+        if scale is not None and span.score is not None
+    ]
+    if not scored:
+        return None, None
+    reported = Counter(scale for scale, _score in scored).most_common(1)[0][0]
+    scores = [score for scale, score in scored if scale == reported]
+    return reported, float(median(scores))
 
 
 def tier_for(aligner: str | None) -> str:
@@ -81,6 +163,18 @@ def tier_for(aligner: str | None) -> str:
     reads ``words.engine``.
     """
     return "aligned" if aligner else "timed"
+
+
+def _drain_notes(engine: Any) -> list[str]:
+    """Read and clear an engine's advisory notes channel (contracts §6).
+
+    ``getattr`` with a default: an engine that never has anything to report
+    simply never defines ``notes``, and this must not require that it does.
+    """
+    notes = list(getattr(engine, "notes", ()))
+    if notes and hasattr(engine, "notes"):
+        engine.notes.clear()
+    return notes
 
 
 def engine_tag(transcriber: str, aligner: str | None, refined: bool) -> str:
@@ -123,6 +217,7 @@ def transcribe_video(
 
     words: list[RawWord] = []
     spans: list[Span] = []
+    align_notes: list[str] = []
     for chunk in chunks:
         produced = [
             word
@@ -146,6 +241,7 @@ def transcribe_video(
                 wav_path,
                 transcriber=transcriber,
                 aligner=aligner,
+                notes=align_notes,
             )
         )
     # One row per token, before refinement so an invented interior boundary
@@ -155,6 +251,12 @@ def transcribe_video(
         raise RytpError(
             f"transcriber {transcriber!r} produced no words for video {video_id}"
         )
+
+    # Snapshot each span's score before refinement touches anything, so the
+    # per-word scale (plan §1a) can tell "the aligner supplied this" from
+    # "the energy refiner filled this in" after `_score_boundaries` runs.
+    pre_refine_scores = [span.score for span in spans]
+    aligner_scale = aligner_engine.score_scale if aligner_engine is not None else None
 
     if refine:
         spans = refine_boundaries(
@@ -167,10 +269,15 @@ def transcribe_video(
     else:
         spans = enforce_monotonic(spans, total_ms=total_ms)
 
+    scales = [
+        _validate_scale(resolve_word_scale(pre, refine=refine, aligner_scale=aligner_scale))
+        for pre in pre_refine_scores
+    ]
+
     tag = engine_tag(transcriber, aligner, refine)
     tier = tier_for(aligner)
-    removed = replace_words(db, video_id, words, spans, tag, source=tier)
-    scores = [span.score for span in spans if span.score is not None]
+    removed = replace_words(db, video_id, words, spans, tag, source=tier, align_scales=scales)
+    reported_scale, reported_median = _summarize_scores(spans, scales)
     return TranscribeOutcome(
         video_id=video_id,
         n_words=len(words),
@@ -178,7 +285,10 @@ def transcribe_video(
         engine=tag,
         source=tier,
         speakers_lost=removed.video_speakers,
-        median_align_score=float(median(scores)) if scores else None,
+        median_align_score=reported_median,
+        align_scale=reported_scale,
+        align_device=aligner_engine.device if aligner_engine is not None else None,
+        align_notes=tuple(align_notes),
     )
 
 
@@ -190,6 +300,7 @@ def _chunk_spans(
     *,
     transcriber: str,
     aligner: str | None,
+    notes: list[str] | None = None,
 ) -> list[Span]:
     if aligner_engine is not None:
         spans = list(
@@ -200,6 +311,8 @@ def _chunk_spans(
                 end_ms=chunk.end_ms,
             )
         )
+        if notes is not None:
+            notes.extend(_drain_notes(aligner_engine))
         if len(spans) != len(words):
             raise AlignmentMismatchError(
                 f"aligner {aligner!r} returned {len(spans)} spans for {len(words)} "
@@ -209,6 +322,15 @@ def _chunk_spans(
     # No aligner: the transcriber's own timings have to be complete. Contracts
     # §4 lets a transcriber emit text with no timings at all, and Whisper-class
     # engines routinely omit an end, so both halves are checked.
+    #
+    # The span's score starts out `None` here, deliberately not
+    # `word.confidence`: `confidence` already has its own `words` column, and
+    # a transcriber's per-word confidence is not an alignment score — folding
+    # it into `align_score` would be a fifth, unlabelled scale on top of the
+    # four plan §1a names. Leaving it `None` lets the boundary-quality energy
+    # measure fill it when `--refine` is on (row 3 of the table) and leaves it
+    # unscored when refine is off (row 4), which is exactly the distinction
+    # BUGS.md entry 13 asked for.
     own_spans: list[Span] = []
     for word in words:
         start, end = word.start_ms, word.end_ms
@@ -217,7 +339,7 @@ def _chunk_spans(
                 f"transcriber {transcriber!r} does not time every word "
                 f"(first untimed: {word.text!r}); pass an aligner"
             )
-        own_spans.append(Span(start_ms=start, end_ms=end, score=word.confidence))
+        own_spans.append(Span(start_ms=start, end_ms=end, score=None))
     return own_spans
 
 
@@ -391,14 +513,23 @@ def replace_words(
     engine: str,
     *,
     source: str,
+    align_scales: Sequence[str | None] | None = None,
 ) -> TranscriptRemoval:
     """Swap in a fresh transcript for one video, in one transaction.
 
-    ``source`` is the tier from :func:`tier_for`. Returns what the replacement
-    destroyed, so a caller can warn about speaker labels it cannot rebuild.
+    ``source`` is the tier from :func:`tier_for`. ``align_scales`` is one
+    `words.align_scale` value per word (plan §1a); omitted or ``None``
+    entries write ``NULL``, which is correct for a word with no score at all.
+    Returns what the replacement destroyed, so a caller can warn about
+    speaker labels it cannot rebuild.
     """
+    scales = list(align_scales) if align_scales is not None else [None] * len(words)
+    if len(scales) != len(words):
+        raise RytpError(
+            f"{len(scales)} align_scales for {len(words)} words: must match 1:1"
+        )
     rows = []
-    for ordinal, (word, span) in enumerate(zip(words, spans, strict=True)):
+    for ordinal, (word, span, scale) in enumerate(zip(words, spans, scales, strict=True)):
         normalized = normalize_text(word.text)
         rows.append(
             (
@@ -411,6 +542,7 @@ def replace_words(
                 stem_text(normalized),
                 word.confidence,
                 span.score,
+                _validate_scale(scale),
                 source,
                 engine,
                 None,
@@ -477,6 +609,7 @@ def realign_video(
         buckets[_chunk_for(chunks, int(row[1]))].append(index)
 
     by_index: dict[int, Span] = {}
+    align_notes: list[str] = []
     for chunk in chunks:
         indexes = buckets[chunk.ord]
         if not indexes:
@@ -489,6 +622,7 @@ def realign_video(
                 end_ms=chunk.end_ms,
             )
         )
+        align_notes.extend(_drain_notes(engine))
         if len(spans) != len(indexes):
             raise AlignmentMismatchError(
                 f"aligner {aligner!r} returned {len(spans)} spans for {len(indexes)} "
@@ -498,6 +632,11 @@ def realign_video(
             by_index[index] = span
 
     ordered = [by_index[index] for index in range(len(rows))]
+    # Snapshot before refinement, same reasoning as `transcribe_video`: this
+    # is a real aligner every time (the command requires `--aligner`), so its
+    # `score_scale` applies to every word whose score it actually supplied.
+    pre_refine_scores = [span.score for span in ordered]
+    aligner_scale = engine.score_scale
     if refine:
         ordered = refine_boundaries(
             samples,
@@ -509,6 +648,11 @@ def realign_video(
     else:
         ordered = enforce_monotonic(ordered, total_ms=total_ms)
 
+    scales = [
+        _validate_scale(resolve_word_scale(pre, refine=refine, aligner_scale=aligner_scale))
+        for pre in pre_refine_scores
+    ]
+
     base = str(rows[0][5]).split("+")[0]
     tag = engine_tag(base, aligner, refine)
     with db.transaction():
@@ -516,14 +660,23 @@ def realign_video(
         # Speaker labels are kept: the text and the ordinals did not change.
         db.conn.execute("DELETE FROM utterances WHERE video_id = ?", (video_id,))
         db.conn.executemany(
-            "UPDATE words SET start_ms = ?, end_ms = ?, align_score = ?, engine = ?, "
-            "source = 'aligned' WHERE video_id = ? AND ord = ?",
+            "UPDATE words SET start_ms = ?, end_ms = ?, align_score = ?, "
+            "align_scale = ?, engine = ?, source = 'aligned' "
+            "WHERE video_id = ? AND ord = ?",
             [
-                (span.start_ms, span.end_ms, span.score, tag, video_id, int(rows[index][0]))
-                for index, span in enumerate(ordered)
+                (
+                    span.start_ms,
+                    span.end_ms,
+                    span.score,
+                    scale,
+                    tag,
+                    video_id,
+                    int(rows[index][0]),
+                )
+                for index, (span, scale) in enumerate(zip(ordered, scales, strict=True))
             ],
         )
-    scores = [span.score for span in ordered if span.score is not None]
+    reported_scale, reported_median = _summarize_scores(ordered, scales)
     return TranscribeOutcome(
         video_id=video_id,
         n_words=len(ordered),
@@ -531,5 +684,8 @@ def realign_video(
         engine=tag,
         source="aligned",
         speakers_lost=0,
-        median_align_score=float(median(scores)) if scores else None,
+        median_align_score=reported_median,
+        align_scale=reported_scale,
+        align_device=engine.device,
+        align_notes=tuple(align_notes),
     )

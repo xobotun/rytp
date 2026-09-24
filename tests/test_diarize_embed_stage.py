@@ -215,3 +215,22 @@ def test_the_redimnet_adapter_sends_the_request_the_child_expects(
     request = seen["request"]
     assert request["windows"] == [[0, 1_000]]
     assert request["model"] == C.REDIMNET_DEFAULT_MODEL
+
+
+def test_the_redimnet_adapter_defaults_to_auto_device_and_reports_the_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BUGS.md entry 34: redimnet never moved its model or its tensors.
+    from rytp.diarize import embed as embed_module
+    from rytp.diarize.embed import ReDimNetEmbedder
+
+    def fake_run_child(**kwargs: object) -> dict[str, object]:
+        request = kwargs["request"]
+        assert request["device"] == C.ENGINE_DEFAULT_DEVICE  # type: ignore[index]
+        return {"vector": [1.0, 0.0, 0.0], "device": "cuda"}
+
+    monkeypatch.setattr(embed_module, "run_child", fake_run_child)
+    engine = ReDimNetEmbedder(interpreter="/opt/redimnet/python")
+    assert engine.device == C.ENGINE_DEFAULT_DEVICE
+    engine.embed(tmp_path / "a.wav", [(0, 1_000)])
+    assert engine.device == "cuda"

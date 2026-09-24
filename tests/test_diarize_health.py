@@ -113,6 +113,31 @@ def test_everything_usable_is_the_only_way_to_pass(db: Database) -> None:
     assert result.remedy is None
 
 
+def test_the_cuda_note_is_appended_when_the_configured_engine_works(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BUGS.md entry 33, for the diarize side: pairs "it can run" with the
+    # CUDA fact from the same probe entry 7 already pays for.
+    from rytp.diarize import health
+
+    monkeypatch.setattr(health, "_states", lambda _db: {"none": "ready"})
+    monkeypatch.setattr(
+        health, "_cuda_note", lambda _db, wanted: "; torch 2.4.0+cpu has no CUDA (device=cpu)"
+    )
+    result = check_diarizers(db)
+    assert result.ok is True
+    assert "no CUDA" in result.detail
+
+
+def test_the_cuda_note_is_empty_for_an_unregistered_or_no_dependency_engine(
+    db: Database,
+) -> None:
+    from rytp.diarize import health
+
+    assert health._cuda_note(db, "none") == ""
+    assert health._cuda_note(db, "no-such-diarizer") == ""
+
+
 def test_a_configured_engine_that_is_not_registered_at_all_is_a_failure(
     db: Database,
 ) -> None:

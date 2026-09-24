@@ -20,7 +20,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from rytp.models import DiarSegment, RytpError
+from rytp.models import DiarSegment, RytpError, UnknownEngineError
 from rytp.transcribe.registry import check_available, interpreter_for
 
 if TYPE_CHECKING:
@@ -64,20 +64,29 @@ def register_diarizer(cls: type[Diarizer]) -> type[Diarizer]:
 
 
 def resolve_diarizer(name: str) -> type[Diarizer]:
-    """Look up a diarizer class. Raises ``ValueError`` naming the alternatives."""
+    """Look up a diarizer class. Raises :class:`~rytp.models.UnknownEngineError`.
+
+    Both a ``ValueError`` (contracts §6's existing wording) and a
+    ``RytpError`` (so the CLI funnel prints one line and exits 1 instead of
+    a traceback — BUGS.md entry 16, confirmed for
+    ``speakers diarize 1 --diarizer pyannot``).
+    """
     try:
         return DIARIZERS[name]
     except KeyError:
         available = ", ".join(sorted(DIARIZERS)) or "(none registered)"
-        raise ValueError(f"unknown diarizer {name!r}; available: {available}") from None
+        raise UnknownEngineError(
+            f"unknown diarizer {name!r}; available: {available}"
+        ) from None
 
 
 def load_diarizer(db: Database, name: str, **kwargs: Any) -> Diarizer:
     """Resolve, gate, and construct a diarizer."""
     cls = resolve_diarizer(name)
-    check_available(cast("EngineClass", cls))
-    if getattr(cls, "out_of_process", False):
-        kwargs.setdefault("interpreter", interpreter_for(db, name))
+    interpreter = interpreter_for(db, name) if getattr(cls, "out_of_process", False) else None
+    check_available(cast("EngineClass", cls), interpreter=interpreter)
+    if interpreter is not None:
+        kwargs.setdefault("interpreter", interpreter)
     return cls(**kwargs)
 
 

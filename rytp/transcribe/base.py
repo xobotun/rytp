@@ -38,6 +38,17 @@ class Transcriber(Protocol):
     name: str
     requires_hf_token: bool
     out_of_process: bool
+    #: Contracts §6: declared on all three engine protocols. A transcriber has
+    #: no `words.align_score` to report, so this stays a fixed, honest
+    #: placeholder rather than reusing "unknown" (which contracts §6 reserves
+    #: for an engine that predates the attribute entirely).
+    score_scale: str
+    #: "auto" | "cuda" | "cpu" | "n/a"; contracts §6, plan §1b.
+    device: str
+    #: Advisory, non-fatal findings from the last call; contracts §6's engine
+    #: notes channel. Read with ``getattr(engine, "notes", [])`` — an engine
+    #: that never has anything to report simply never defines it.
+    notes: list[str]
 
     def transcribe(
         self,
@@ -55,6 +66,15 @@ class Aligner(Protocol):
     name: str
     requires_hf_token: bool
     out_of_process: bool
+    #: Which row of the "Score precedence and scale" table (contracts §3) this
+    #: aligner's `Span.score` belongs to — "energy" | "logprob" | "none" |
+    #: "unknown". Fixed per engine class, not computed per call.
+    score_scale: str
+    #: "auto" | "cuda" | "cpu" | "n/a"; contracts §6, plan §1b.
+    device: str
+    #: Advisory, non-fatal findings from the last call; contracts §6's engine
+    #: notes channel.
+    notes: list[str]
 
     def align(
         self, audio: Path, words: Sequence[str], *, start_ms: int, end_ms: int

@@ -295,6 +295,22 @@ def test_ingest_of_an_unknown_video_raises(db: Database) -> None:
         _ingest(db, video=str(4242))
 
 
+def test_ingest_of_an_unregistered_url_names_videos_add(db: Database) -> None:
+    """BUGS.md entry 1: the owner's first command was a URL that had never
+    been catalogued, and "no video matches" alone gave no next step."""
+    url = "https://example.invalid/watch/VIDEO_B"
+    with pytest.raises(NotFoundError, match=re.escape(f"rytp videos add {url}")):
+        _ingest(db, video=url)
+
+
+def test_ingest_of_an_unknown_id_gives_the_plain_message(db: Database) -> None:
+    """A bare id or external id is not a URL, so there is nothing to hint at
+    registering — the plain "no video matches" answer stays plain."""
+    with pytest.raises(NotFoundError) as excinfo:
+        _ingest(db, video=str(4242))
+    assert "videos add" not in str(excinfo.value)
+
+
 def test_ingest_passes_priority_through(db: Database) -> None:
     _ingest(db, video=str(make_video(db)), priority=7)
     assert {j.priority for j in Q.list_jobs(db)} == {7}
@@ -357,6 +373,13 @@ def test_fetch_video_runs_the_whole_chain_inline(
     assert asset_for(db, vid, "captions") is not None
     assert E.wav_path(vid).exists()
     assert result.message and "audio.m4a" in result.message
+
+
+def test_fetch_video_of_an_unregistered_url_names_videos_add(db: Database) -> None:
+    """BUGS.md entry 1: `fetch-video <url>` behaves the same as `ingest <url>`."""
+    url = "https://example.invalid/watch/VIDEO_B"
+    with pytest.raises(NotFoundError, match=re.escape(f"rytp videos add {url}")):
+        resolve("fetch-video").handler(db, video=url)
 
 
 def test_fetch_video_can_skip_captions(

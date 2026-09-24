@@ -127,6 +127,13 @@ CREATE TABLE words (
     stem             TEXT NOT NULL,
     confidence       REAL,
     align_score      REAL,
+    -- The scale that produced align_score: 'energy' | 'logprob' | 'none' |
+    -- 'unknown'. Never a CHECK — SQLite cannot add a CHECK by ALTER TABLE,
+    -- so the permitted values are enforced in Python. See "Score precedence
+    -- and scale" below for what each value means and when it is written.
+    -- Gained by migration 13 (rytp/db/schema.py); this DDL block is the
+    -- target state, not what every live database currently has.
+    align_scale      TEXT,
     source           TEXT NOT NULL CHECK (source IN ('caption','timed','aligned')),
     engine           TEXT NOT NULL,
     video_speaker_id INTEGER REFERENCES video_speakers(id) ON DELETE SET NULL,
@@ -140,6 +147,7 @@ CREATE INDEX words_normalized ON words(normalized_text);
 -- a token and filters afterwards, so its cost scales with the whole corpus
 -- rather than with the alignable part of it.
 CREATE INDEX words_alignable ON words(normalized_text) WHERE source = 'aligned';
+CREATE INDEX words_timed     ON words(normalized_text) WHERE source = 'timed';
 CREATE INDEX words_stem       ON words(stem);
 CREATE INDEX words_speaker    ON words(video_speaker_id);
 
@@ -200,6 +208,10 @@ CREATE TABLE jobs (
     not_before   TEXT,
     last_error   TEXT,
     note         TEXT,          -- non-fatal finding returned by the handler
+    -- Advisory, worker-written; see "Job handlers" below. Gained by
+    -- migration 14 (rytp/db/schema.py); this DDL block is the target
+    -- state, not what every live database currently has.
+    progress     TEXT,
     payload_json TEXT NOT NULL DEFAULT '{}',
     created_at   TEXT NOT NULL,
     started_at   TEXT,
@@ -242,6 +254,8 @@ CREATE TABLE settings (
 
 `words.end_ms` is null exactly for caption-sourced rows.
 
+**This DDL block is the target state, not what every live database currently has.** `words.align_scale` and `jobs.progress` are gained by migrations 13 and 14 respectively (`rytp/db/schema.py`); a database migrated from an earlier version reaches this shape only after those migrations run. Nothing before this batch wrote either column.
+
 ### Choosing a transcriber
 
 `settings.default_transcriber` defaults to `gigaam`, the Russian-specific engine, because the corpus is Russian and published benchmarks put it at roughly half Whisper's word error rate there. That default is a starting point, not a verdict — the one published test on *noisy YouTube* audio reversed the ranking against a Russian-finetuned Whisper, and this corpus is exactly noisy YouTube audio. `transcribe.compare` exists to revisit it against real material.
@@ -259,16 +273,56 @@ Two rules follow from the default being a real choice rather than an accident:
 | `source` | Timings from | Searchable | Cuttable |
 |---|---|---|---|
 | `caption` | Downloaded auto-captions: word starts only, 40 ms grid, no ends | yes | **no** |
-| `timed` | A transcriber's own word timestamps, energy-refined | yes | **no** |
+| `timed` | A transcriber's own word timestamps, energy-refined | yes | **no by default** — `--allow-timed` overrides |
 | `aligned` | Forced alignment, energy-refined | yes | **yes** |
 
-**Cuttable is `source = 'aligned'` and nothing else may be cut.**
+`aligned` is the only tier cuttable **by default**. `assemble plan --allow-timed`
+is an explicit, per-invocation override that admits `timed` words as well, with
+no threshold and no quality logic — it is a gate being opened, not a bar being
+lowered. Every fragment records which tier it was cut from, always, not only
+when the flag is used, so a degraded cut is visible in the render's source
+list rather than only at plan time.
+
+A numeric threshold was considered and rejected: a threshold cannot be written
+against a scale that changes per engine (see "Score precedence and scale"
+below), so `--allow-timed` gates by tier alone. The flag is not spelled
+`--force`: `assemble plan` already has a `--force` meaning "replace an existing
+cut list", and one name cannot carry two meanings.
 
 The `timed` tier exists because a transcriber's own word timestamps are not good enough to cut on — measured on the owner's real data, 78.7% of Whisper's word gaps are exactly zero, because it assigns `word[i].end == word[i+1].start` and absorbs every pause into an adjacent word. Energy refinement relocates a boundary within a window; it cannot place one that was never there.
 
-But such a transcript is still far better *text* than captions, so it is worth having and worth searching. Marking it `timed` rather than `aligned` states the truth: you can find the words, you cannot yet cut them. Running the `align` job upgrades those rows in place from `timed` to `aligned`.
+But such a transcript is still far better *text* than captions, so it is worth having and worth searching. Marking it `timed` rather than `aligned` states the truth: you can find the words, you cannot cut them by default. Running the `align` job upgrades those rows in place from `timed` to `aligned`.
 
 The alternative — writing these rows as `aligned` and hoping — is what the design was built to avoid, and nothing downstream could have detected it: `words.engine` records the difference but no consumer reads it, and `align_score` is null without an aligner.
+
+### Score precedence and scale
+
+`words.align_score` has, at various points, held at least three incommensurable
+things: a bounded 0–1 energy measure, an unbounded log-probability, and nothing.
+`words.align_scale` names which one produced the value in `align_score`, so a
+consumer never has to guess. The table is normative — every writer of
+`align_score` follows it exactly, and no other combination is valid:
+
+| What ran | `align_score` | `align_scale` |
+|---|---|---|
+| An aligner that reports a score (wav2vec2) | the aligner's number | `logprob` |
+| An aligner that reports none (MFA), refine off | `NULL` | `none` |
+| No aligner, `--refine` on (energy boundary scoring) | the 0–1 energy measure | `energy` |
+| No aligner, no refine | `NULL` | `NULL` |
+| Rows written before this batch | whatever is there | backfilled `unknown` / `energy` |
+
+An aligner that reports a score **and** was refined keeps the aligner's score
+and scale: refinement moves boundaries, it does not re-measure alignment.
+Where both exist, a report may show either, but `align_scale` always names the
+one actually stored.
+
+**No scale is ever converted into another.** Normalising would be lossy and
+would bake in a conversion nobody can justify. A consumer that needs to compare
+scores compares within one scale, never across.
+
+MFA reporting no score at all is valid, not a gap to be worked around: §6
+already makes `Span.score` optional, and `align_scale = 'none'` is the value
+that says a real aligner ran and had nothing to report.
 
 ## 4. Core types
 
@@ -377,13 +431,36 @@ class Command:
                                       # the surface they launch
 
 COMMANDS: dict[str, Command] = {}
+GROUP_SUMMARIES: dict[str, str] = {}     # group name -> a short phrase saying
+                                          # what the group is about
 def register(cmd: Command) -> Command: ...
 def resolve(name: str) -> Command: ...
 ```
 
+`GROUP_SUMMARIES` holds one short phrase per non-empty `Command.group`, read by
+both surfaces — the CLI's group help and the TUI palette's group heading. It
+says what the group is *about* ("videos" -> "the local video catalog"), never
+the list of commands in it: the command list under a group is generated from
+`COMMANDS`, not written out a second time in the summary. A group with an entry
+in `COMMANDS` but no entry in `GROUP_SUMMARIES` is an error the consistency
+suite catches, so a new group cannot ship undescribed.
+
 Handlers take keyword arguments matching `Param.name`, receive an open `Database` as the first positional argument, and return a `CommandResult`. Handlers never print and never call `sys.exit`; they raise, and the surface formats the error.
 
 `Param.type` is a scalar type only. A flag that takes several values is a comma-separated string parsed by the handler.
+
+### `assemble.plan`'s `--allow-timed`
+
+`assemble.plan` carries a boolean `Param` named `allow_timed`
+(`--allow-timed`), default `False`. It is documented here because "Three
+transcript tiers" (§3) and this section both bear on it: it is an **override,
+not a gate** — no threshold, no quality logic, and it never changes what
+`--min-align` means (§3, "Score precedence and scale"; a per-scale floor is
+implemented by Part 5, not by this flag). It is not spelled `--force`:
+`assemble.plan` already has a `--force` meaning "replace an existing cut list",
+and one name may not carry two meanings. Every fragment `assemble.plan` writes
+records its source tier regardless of whether the flag was used, so a degraded
+cut stays visible in the render's source list.
 
 ### Speaker filters — two flags, two identifier spaces
 
@@ -484,6 +561,18 @@ A handler may **return a short note** — a non-fatal finding worth surfacing, s
 
 This exists because the worker is the bulk path. A handler that can only raise or stay silent has nowhere to put "this succeeded, and there is something you should know" — so an advisory would reach a user running one video by hand and vanish for the same operation across sixteen hundred, which is exactly backwards. Notes are informational: they never affect job state, and a job carrying one is `done`, not `failed`.
 
+**`jobs.progress` is not `jobs.note`, and the two must not be conflated.**
+`jobs.progress` is written by the worker *while a job runs*, one seam
+(`rytp/progress.py`) that every long-running handler reports through. It is
+advisory and lossy: it may be stale, it is cleared the moment the job leaves
+`running` (whichever state it lands in), and it never affects job state or
+retry behaviour — it is a "here is roughly where the work is" line for
+`jobs.list` to show a job that has been running for minutes, nothing more.
+`jobs.note`, by contrast, is a handler's **return value**: it is written once,
+after the handler finishes, and it survives completion — it is the channel for
+"this succeeded, and there is something you should know", not "this is still
+in progress".
+
 Each part registers its own kinds:
 
 | Kind | Owner | Handler |
@@ -503,6 +592,9 @@ class Transcriber(Protocol):
     name: str
     requires_hf_token: bool
     out_of_process: bool
+    score_scale: str          # see "Score precedence and scale" in §3
+    device: str               # "auto" | "cuda" | "cpu" | "n/a"; see below
+    notes: list[str]          # see "The engine notes channel" below
     def transcribe(self, audio: Path, *, language: str | None = None,
                    start_ms: int = 0, end_ms: int | None = None) -> Iterable[RawWord]: ...
 
@@ -510,6 +602,9 @@ class Aligner(Protocol):
     name: str
     requires_hf_token: bool
     out_of_process: bool
+    score_scale: str
+    device: str
+    notes: list[str]
     def align(self, audio: Path, words: Sequence[str], *,
               start_ms: int, end_ms: int) -> list[Span]: ...
 
@@ -517,10 +612,50 @@ class Diarizer(Protocol):
     name: str
     requires_hf_token: bool
     out_of_process: bool
+    score_scale: str
+    device: str
+    notes: list[str]
     def diarize(self, audio: Path) -> Iterable[DiarSegment]: ...
 ```
 
-Registries live in `rytp/transcribe/registry.py` (`TRANSCRIBERS`, `ALIGNERS`) and `rytp/diarize/base.py` (`DIARIZERS`), with `register_transcriber` / `register_aligner` / `register_diarizer` decorators and `resolve_*` lookups raising `ValueError` naming the available options.
+Registries live in `rytp/transcribe/registry.py` (`TRANSCRIBERS`, `ALIGNERS`) and `rytp/diarize/base.py` (`DIARIZERS`), with `register_transcriber` / `register_aligner` / `register_diarizer` decorators.
+
+`resolve_transcriber`, `resolve_aligner` and `resolve_diarizer` raise
+`UnknownEngineError(RytpError, ValueError)` — defined in `rytp/models.py` —
+naming the requested name and the available options. The dual inheritance is
+deliberate, not decorative: `ValueError` keeps this section's wording literally
+true, and `RytpError` is what the CLI funnel (§8) catches to print one line and
+exit 1 instead of a traceback. A caller may catch either base and get the same
+exception.
+
+**`score_scale`** is a class-level declaration naming which row of the "Score
+precedence and scale" table (§3) an engine's reported score belongs to —
+`"energy"`, `"logprob"`, `"none"`, or `"unknown"` for an engine that predates
+this attribute. It is fixed per engine class, not computed per call: wav2vec2
+always reports `logprob`, MFA always reports `none`.
+
+**`device`** is a class-level default and an instance-level fact: engines are
+constructed with `device: str = "auto" | "cuda" | "cpu"`, and after
+resolving `"auto"` the engine's `device` attribute holds the concrete
+device actually used (`"cuda"` or `"cpu"`), or `"n/a"` for an engine with no
+GPU path (MFA). Callers surface this attribute rather than re-deriving it, so
+the same fact reaches a foreground command's result message and a queued
+job's note.
+
+**The engine notes channel.** `notes: list[str]` is an instance attribute, not
+a return value: an engine appends short, non-fatal findings to it during a
+call (a word that received no frames and had to be interpolated, for example),
+and the pipeline drains `getattr(engine, "notes", [])` afterwards, clearing it
+between calls. This is deliberately not a widening of `Transcriber.transcribe`,
+`Aligner.align` or `Diarizer.diarize`'s return types — every caller and every
+fake would change for a channel that exists only for the advisory case. It is
+the same reasoning that gives job handlers a return note (§5): an operation
+that can only raise or stay silent has nowhere to put "this succeeded, and
+there is something you should know". An engine that never has anything to
+report simply never defines `notes`, which is why callers read it with
+`getattr` and a default rather than assuming it exists. A note appended here is
+always advisory — it is drained into `jobs.note` (§5), never treated as a
+failure and never affecting whether the call succeeded.
 
 ## 7. Filesystem layout
 

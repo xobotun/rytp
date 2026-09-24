@@ -10,6 +10,7 @@ an aligner and boundary refinement before cutting anything.
 """
 from __future__ import annotations
 
+import os
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
@@ -54,6 +55,12 @@ class FasterWhisperTranscriber:
     required_module = "faster_whisper"
     extra = "whisper"
 
+    #: Class-level default (plan §1b, contracts §6). Unlike the other four
+    #: engines (entry 34), whisper already selects a device — ctranslate2's
+    #: own ``"auto"`` resolves to CUDA when available — so this adapter only
+    #: needed to *report* the resolved choice, not add placement.
+    device = "auto"
+
     def __init__(
         self,
         model: str = C.WHISPER_DEFAULT_MODEL,
@@ -61,12 +68,19 @@ class FasterWhisperTranscriber:
         compute_type: str = "default",
     ) -> None:
         self._model_name = model
-        self._device = device
         self._compute_type = compute_type
         self._model: Any = None
+        #: Requested device, then — once the model has loaded — the
+        #: concrete device ctranslate2 actually resolved ``"auto"`` to.
+        #: Callers read this rather than re-deriving it (BUGS.md entry 34).
+        self.device = device
 
     def _load(self) -> Any:
         if self._model is None:
+            # BUGS.md entry 11: silence huggingface_hub's per-process
+            # symlink warning before it can print it; `doctor`'s hf-cache
+            # check says the same thing once, with the disk cost.
+            os.environ.setdefault(C.HF_SYMLINK_WARNING_ENV, "1")
             try:
                 from faster_whisper import WhisperModel
             except ImportError as exc:
@@ -74,8 +88,14 @@ class FasterWhisperTranscriber:
                     "faster-whisper is not installed: pip install rytp[whisper]"
                 ) from exc
             self._model = WhisperModel(
-                self._model_name, device=self._device, compute_type=self._compute_type
+                self._model_name, device=self.device, compute_type=self._compute_type
             )
+            # ctranslate2 resolves "auto" internally; the constructed model
+            # exposes the concrete choice it made, and that — not the
+            # request — is the fact worth surfacing.
+            resolved = getattr(self._model.model, "device", None)
+            if resolved:
+                self.device = str(resolved)
         return self._model
 
     def transcribe(

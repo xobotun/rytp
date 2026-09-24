@@ -26,9 +26,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from rytp import constants as C
-from rytp.models import RytpError
+from rytp.models import RytpError, UnknownEngineError
 from rytp.transcribe.registry import check_available, interpreter_for
-from rytp.transcribe.subproc import run_child
+from rytp.transcribe.subproc import resolve_device, run_child
 
 if TYPE_CHECKING:
     from rytp.db import Database
@@ -78,20 +78,28 @@ def register_embedder(cls: type[SpeakerEmbedder]) -> type[SpeakerEmbedder]:
 
 
 def resolve_embedder(name: str) -> type[SpeakerEmbedder]:
-    """Look up an embedder class. Raises ``ValueError`` naming the alternatives."""
+    """Look up an embedder class. Raises :class:`~rytp.models.UnknownEngineError`.
+
+    Same fix as ``resolve_transcriber``/``resolve_aligner``/``resolve_diarizer``
+    (BUGS.md entry 16): the message was already right, only a bare
+    ``ValueError`` escaped the CLI's ``RytpError`` funnel as a traceback.
+    """
     try:
         return EMBEDDERS[name]
     except KeyError:
         available = ", ".join(sorted(EMBEDDERS)) or "(none registered)"
-        raise ValueError(f"unknown embedder {name!r}; available: {available}") from None
+        raise UnknownEngineError(
+            f"unknown embedder {name!r}; available: {available}"
+        ) from None
 
 
 def load_embedder(db: Database, name: str, **kwargs: Any) -> SpeakerEmbedder:
     """Resolve, gate, and construct an embedder."""
     cls = resolve_embedder(name)
-    check_available(cls)  # type: ignore[arg-type]
-    if getattr(cls, "out_of_process", False):
-        kwargs.setdefault("interpreter", interpreter_for(db, name))
+    interpreter = interpreter_for(db, name) if getattr(cls, "out_of_process", False) else None
+    check_available(cls, interpreter=interpreter)  # type: ignore[arg-type]
+    if interpreter is not None:
+        kwargs.setdefault("interpreter", interpreter)
     return cls(**kwargs)
 
 
@@ -238,10 +246,21 @@ class ReDimNetEmbedder:
     required_module = "torch"
     extra = "redimnet"
     dim = 192
+    #: Class-level default (plan §1b, contracts §6); see
+    #: :class:`~rytp.transcribe.engines.gigaam.GigaAMTranscriber`.
+    device = C.ENGINE_DEFAULT_DEVICE
 
-    def __init__(self, interpreter: str, model: str = C.REDIMNET_DEFAULT_MODEL) -> None:
+    def __init__(
+        self,
+        interpreter: str,
+        model: str = C.REDIMNET_DEFAULT_MODEL,
+        device: str = C.ENGINE_DEFAULT_DEVICE,
+    ) -> None:
         self._interpreter = interpreter
         self._model = model
+        #: Requested device, then the concrete device the last call used
+        #: (BUGS.md entry 34).
+        self.device = device
 
     def embed(self, audio: Path, windows: Sequence[tuple[int, int]]) -> Sequence[float]:
         result = run_child(
@@ -251,8 +270,10 @@ class ReDimNetEmbedder:
                 "audio": str(audio),
                 "model": self._model,
                 "windows": [[int(start), int(end)] for start, end in windows],
+                "device": self.device,
             },
         )
+        self.device = str(result.get("device") or self.device)
         return [float(value) for value in result["vector"]]
 
 
@@ -264,12 +285,14 @@ def child_main(request: dict[str, Any]) -> dict[str, Any]:
     import torch
     import torchaudio
 
+    device = resolve_device(str(request.get("device") or C.ENGINE_DEFAULT_DEVICE))
     windows = [(int(start), int(end)) for start, end in request["windows"]]
     with tempfile.TemporaryDirectory(prefix="rytp-embed-") as tmp:
         clip = concat_wav_windows(Path(request["audio"]), Path(tmp) / "clip.wav", windows)
         waveform, _rate = torchaudio.load(str(clip))
-        model = redimnet.ReDimNet.from_pretrained(request["model"])
+        waveform = waveform.to(device)
+        model = redimnet.ReDimNet.from_pretrained(request["model"]).to(device)
         model.eval()
         with torch.no_grad():
             vector = model(waveform).squeeze().tolist()
-    return {"vector": [float(value) for value in vector]}
+    return {"vector": [float(value) for value in vector], "device": device}

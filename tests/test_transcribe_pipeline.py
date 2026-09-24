@@ -6,11 +6,14 @@ from pathlib import Path
 
 import pytest
 
+from rytp import constants as C
 from rytp.db import Database
-from rytp.models import RytpError
+from rytp.models import RytpError, Span
 from rytp.transcribe.pipeline import (
     AlignmentMismatchError,
     engine_tag,
+    realign_video,
+    resolve_word_scale,
     speaker_loss_warning,
     tier_for,
     transcribe_video,
@@ -184,6 +187,169 @@ def test_a_scoreless_aligner_gets_a_measured_boundary_quality(
         ).fetchall()
     ]
     assert all(score is not None and 0.0 <= score <= 1.0 for score in scores)
+
+
+def _triples(db: Database, video_id: int) -> set[tuple[str, float | None, str | None]]:
+    rows = db.conn.execute(
+        "SELECT source, align_score, align_scale FROM words WHERE video_id = ?", (video_id,)
+    ).fetchall()
+    return {(row[0], row[1], row[2]) for row in rows}
+
+
+def test_resolve_word_scale_follows_plan_1a_row_by_row() -> None:
+    # An aligner that reports a score keeps its own scale, refined or not.
+    assert resolve_word_scale(0.8, refine=True, aligner_scale=C.ALIGN_SCALE_LOGPROB) == (
+        C.ALIGN_SCALE_LOGPROB
+    )
+    assert resolve_word_scale(0.8, refine=False, aligner_scale=C.ALIGN_SCALE_LOGPROB) == (
+        C.ALIGN_SCALE_LOGPROB
+    )
+    # An aligner that reports none, refine off: `none` — a real aligner ran
+    # and had nothing to say.
+    assert resolve_word_scale(None, refine=False, aligner_scale=C.ALIGN_SCALE_NONE) == (
+        C.ALIGN_SCALE_NONE
+    )
+    # No aligner, refine on: the energy measure filled it in.
+    assert resolve_word_scale(None, refine=True, aligner_scale=None) == C.ALIGN_SCALE_ENERGY
+    # No aligner, no refine: unscored.
+    assert resolve_word_scale(None, refine=False, aligner_scale=None) is None
+
+
+def test_no_aligner_with_refine_writes_the_energy_scale(
+    db: Database, tmp_path: Path
+) -> None:
+    # Plan §1a row 3: "No aligner, --refine on" -> the 0-1 energy measure,
+    # scale `energy`. BUGS.md entry 13's exact defect, now labelled. Each
+    # word's own measured boundary quality differs, so only the source and
+    # the scale are uniform — never the exact score.
+    video_id = _make_video(db)
+    with registered(FakeTranscriber):
+        outcome = transcribe_video(
+            db, video_id, wav_path=_make_wav(tmp_path), transcriber="fake", refine=True
+        )
+    assert outcome.align_scale == C.ALIGN_SCALE_ENERGY
+    triples = _triples(db, video_id)
+    assert {(source, scale) for source, _score, scale in triples} == {
+        ("timed", C.ALIGN_SCALE_ENERGY)
+    }
+    assert all(score is not None and 0.0 <= score <= 1.0 for _source, score, _scale in triples)
+
+
+def test_no_aligner_no_refine_writes_no_score_and_no_scale(
+    db: Database, tmp_path: Path
+) -> None:
+    # Plan §1a row 4: "No aligner, no refine" -> NULL / NULL.
+    video_id = _make_video(db)
+    with registered(FakeTranscriber):
+        outcome = transcribe_video(
+            db, video_id, wav_path=_make_wav(tmp_path), transcriber="fake", refine=False
+        )
+    assert outcome.align_scale is None
+    assert outcome.median_align_score is None
+    assert _triples(db, video_id) == {("timed", None, None)}
+
+
+def test_an_aligner_with_a_score_keeps_its_scale_even_when_refined(
+    db: Database, tmp_path: Path
+) -> None:
+    # Plan §1a: "An aligner that reports a score AND was refined keeps the
+    # aligner's score and scale" — the both-ran case. Refine defaults to True.
+    video_id = _make_video(db)
+    with registered(FakeTranscriber, FakeAligner):
+        outcome = transcribe_video(
+            db,
+            video_id,
+            wav_path=_make_wav(tmp_path),
+            transcriber="fake",
+            aligner="fake-aligner",
+        )
+    assert outcome.align_scale == C.ALIGN_SCALE_LOGPROB
+    assert outcome.median_align_score == pytest.approx(0.8)
+    # FakeAligner always scores exactly 0.8 — an ordinary equality, not an
+    # approximation, and so hashable enough to compare as a set.
+    assert _triples(db, video_id) == {("aligned", 0.8, C.ALIGN_SCALE_LOGPROB)}
+
+
+def test_a_scoreless_aligner_with_no_refine_writes_the_none_scale(
+    db: Database, tmp_path: Path
+) -> None:
+    # Plan §1a row 2: "An aligner that reports none (MFA), refine off" ->
+    # NULL / `none` — a real aligner ran and had nothing to say. The stored
+    # row names `none`, but the run *reported* no score at all, so the
+    # outcome's summary (and, per `commands/transcribe.py`, the report's
+    # heading) is the same as the no-score case: nothing to name.
+    video_id = _make_video(db)
+    with registered(FakeTranscriber, ScorelessAligner):
+        outcome = transcribe_video(
+            db,
+            video_id,
+            wav_path=_make_wav(tmp_path),
+            transcriber="fake",
+            aligner="fake-scoreless-aligner",
+            refine=False,
+        )
+    assert outcome.align_scale is None
+    assert outcome.median_align_score is None
+    assert _triples(db, video_id) == {("aligned", None, C.ALIGN_SCALE_NONE)}
+
+
+def test_a_scoreless_aligner_with_refine_writes_the_energy_scale(
+    db: Database, tmp_path: Path
+) -> None:
+    # Not a literal §1a row, but its stated principle applied: the number on
+    # the row came from the energy refiner, not the aligner, so the scale
+    # names the energy refiner, and it clears entry 26/28's energy floor.
+    video_id = _make_video(db)
+    with registered(FakeTranscriber, ScorelessAligner):
+        outcome = transcribe_video(
+            db,
+            video_id,
+            wav_path=_make_wav(tmp_path),
+            transcriber="fake",
+            aligner="fake-scoreless-aligner",
+            refine=True,
+        )
+    assert outcome.align_scale == C.ALIGN_SCALE_ENERGY
+    triples = _triples(db, video_id)
+    assert {(source, scale) for source, _score, scale in triples} == {
+        ("aligned", C.ALIGN_SCALE_ENERGY)
+    }
+    assert all(score is not None and 0.0 <= score <= 1.0 for _source, score, _scale in triples)
+
+
+def test_realign_video_writes_the_aligners_scale_too(db: Database, tmp_path: Path) -> None:
+    video_id = _make_video(db)
+    wav = _make_wav(tmp_path)
+    with registered(FakeTranscriber):
+        transcribe_video(db, video_id, wav_path=wav, transcriber="fake", refine=False)
+    with registered(FakeAligner):
+        outcome = realign_video(db, video_id, wav_path=wav, aligner="fake-aligner")
+    assert outcome.align_scale == C.ALIGN_SCALE_LOGPROB
+    assert outcome.align_device == "cpu"
+    assert outcome.median_align_score == pytest.approx(0.8)
+    assert _triples(db, video_id) == {("aligned", 0.8, C.ALIGN_SCALE_LOGPROB)}
+
+
+def test_an_invalid_scale_is_never_written(db: Database) -> None:
+    # Contracts §3: SQLite cannot `CHECK` a column added by `ALTER TABLE`, so
+    # every writer of `align_scale` validates in Python instead.
+    from rytp.models import RawWord
+    from rytp.transcribe.pipeline import replace_words
+
+    video_id = _make_video(db)
+    with pytest.raises(RytpError):
+        replace_words(
+            db,
+            video_id,
+            [RawWord(start_ms=0, end_ms=100, text="да")],
+            [Span(start_ms=0, end_ms=100, score=0.5)],
+            "fake",
+            source="timed",
+            align_scales=["not-a-real-scale"],
+        )
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM words WHERE video_id = ?", (video_id,)
+    ).fetchone()[0] == 0
 
 
 def test_promotion_deletes_caption_words_utterances_and_speaker_labels(

@@ -45,6 +45,7 @@ from rytp.models import InvalidInputError, NotFoundError, RytpError
 
 __all__ = [
     "COMMANDS",
+    "GROUP_SUMMARIES",
     "HEALTH_CHECKS",
     "PARAM_ALIASES",
     "PARAM_TYPES",
@@ -131,6 +132,30 @@ class Command:
 
 COMMANDS: dict[str, Command] = {}
 
+#: One short phrase per non-empty `Command.group`, read by both surfaces —
+#: the CLI's group help (`rytp.cli`) and the TUI palette's group heading —
+#: contracts §5 "GROUP_SUMMARIES". It says what the group is *about*
+#: ("videos" -> "the local video catalog"), never the list of commands in
+#: it: the command list is generated from `COMMANDS`, not written out a
+#: second time here. `_validate` refuses to register a command whose group
+#: has no entry, so a new group cannot ship undescribed (BUGS.md entry 6).
+GROUP_SUMMARIES: dict[str, str] = {
+    "videos": "the local video catalog",
+    "channel": "the channels videos are catalogued from",
+    "index": "the search index built from transcripts",
+    "search": "finding and exporting what was said",
+    "transcript": "reading one video's transcript",
+    "assemble": "planning cuts across the corpus",
+    "transcribe": "turning audio into words and word boundaries",
+    "render": "cutting and rendering a planned video",
+    "speakers": "the speaker roster and per-video mapping",
+    "settings": "defaults and per-engine configuration",
+    "jobs": "the background job queue",
+    "queue": "pausing and resuming the worker",
+    "cache": "cached, regenerable derived files",
+    "assets": "downloaded and rendered files on disk",
+}
+
 
 def leaf_name(cmd: Command) -> str:
     """The last segment of the dotted name — what the CLI calls the subcommand."""
@@ -162,6 +187,12 @@ def _validate(cmd: Command) -> None:
         )
     if not cmd.summary.strip():
         raise ValueError(f"command {cmd.name!r} needs a summary: both surfaces show it")
+    if cmd.group and cmd.group not in GROUP_SUMMARIES:
+        raise ValueError(
+            f"command {cmd.name!r} is in group {cmd.group!r}, which has no entry in "
+            "GROUP_SUMMARIES; add one so the group is described, not just named "
+            "(contracts §5, BUGS.md entry 6)"
+        )
 
     seen: set[str] = set()
     positional_finished = False
@@ -391,21 +422,38 @@ def _resolve_roster_speaker(db: Database, wanted: str) -> tuple[int, str]:
     raise NotFoundError(f"no speaker matches {wanted!r}; {suggestion}")
 
 
+def _looks_like_a_url(ref: str) -> bool:
+    """Same test `videos add` uses to tell a URL from a bare id (catalog.py)."""
+    return "://" in ref
+
+
 def resolve_video_id(db: Database, ref: str) -> int:
-    """Find a video by row id or by external id.
+    """Find a video by row id, by external id, or by its catalogued URL.
 
     Public because `videos.remove` resolves the same way the speaker
     filter does, and two spellings of "which video?" would be one too
     many.
+
+    Raises:
+        NotFoundError: naming `videos add` when `ref` looks like a URL —
+            the owner's first command was `fetch-video <url>` on a URL
+            that had never been catalogued, and "no video matches" alone
+            does not say a video must be registered first, or how
+            (BUGS.md entries 1 and 2).
     """
     row = (
         db.conn.execute("SELECT id FROM videos WHERE id = ?", (int(ref),)).fetchone()
         if ref.isdigit()
         else db.conn.execute(
-            "SELECT id FROM videos WHERE external_id = ?", (ref,)
+            "SELECT id FROM videos WHERE external_id = ? OR url = ?", (ref, ref)
         ).fetchone()
     )
     if row is None:
+        if _looks_like_a_url(ref):
+            raise NotFoundError(
+                f"no video matches {ref!r}; register it first with: "
+                f"rytp videos add {ref}"
+            )
         raise NotFoundError(f"no video matches {ref!r}")
     return int(row["id"])
 
@@ -664,3 +712,4 @@ from rytp.commands import transcribe as _transcribe  # noqa: E402,F401
 from rytp.commands import render as _render  # noqa: E402,F401
 from rytp.commands import search as _search  # noqa: E402,F401
 from rytp.commands import speakers as _speakers  # noqa: E402,F401
+from rytp.commands import settings as _settings  # noqa: E402,F401

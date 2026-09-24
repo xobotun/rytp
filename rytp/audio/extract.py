@@ -18,7 +18,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-from rytp import config
+from rytp import config, progress
 from rytp import constants as C
 from rytp.acquire.policy import AcquireError, MissingAssetError
 from rytp.db import Database
@@ -89,6 +89,7 @@ def ensure_wav(db: Database, video_id: int, *, overwrite: bool = False) -> Path:
         "-f", "wav",
         str(partial),
     ]
+    progress.report("extract_wav", detail=f"video {video_id}: decoding to 16 kHz mono WAV")
     result = _run_ffmpeg(cmd)
     if result.returncode != 0 or not partial.exists():
         partial.unlink(missing_ok=True)
@@ -97,6 +98,7 @@ def ensure_wav(db: Database, video_id: int, *, overwrite: bool = False) -> Path:
             f"{result.stderr[-C.FFMPEG_ERROR_TAIL_CHARS:]}"
         )
     os.replace(partial, out)
+    progress.report("extract_wav", done=1, total=1, detail=f"video {video_id}")
     return out
 
 

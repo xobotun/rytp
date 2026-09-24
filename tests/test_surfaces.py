@@ -80,6 +80,10 @@ def test_part_one_registers_the_commands_it_owns() -> None:
         "speakers.suggest",
         "speakers.engines",
         "speakers.map",
+        "settings.list",
+        "settings.get",
+        "settings.set",
+        "settings.unset",
     }
 
 

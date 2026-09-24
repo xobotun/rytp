@@ -18,6 +18,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from rytp import config
 from rytp import constants as C
 from rytp.assemble.cutlist import (
@@ -28,6 +30,14 @@ from rytp.assemble.cutlist import (
     load_cutlist,
     write_cutlist,
 )
+from rytp.audio.energy import (
+    AudioFormatError,
+    find_energy_minimum,
+    index_to_ms,
+    read_wav_mono,
+    snap_to_zero_crossing,
+)
+from rytp.audio.extract import wav_path
 
 __all__ = ["CutlistSummary", "CutlistView", "available_cutlists"]
 
@@ -107,6 +117,10 @@ class CutlistView:
         self.name = self.cutlist.name or path.stem
         self.dirty = False
         self._undo: list[CutList] = []
+        # Loaded once per video and kept for the life of the screen: a snap
+        # can be pressed dozens of times in a row, and a one-hour WAV should
+        # not be re-read from disk on every keystroke.
+        self._audio: dict[int, tuple[np.ndarray, int]] = {}
         self.status = self._status()
 
     # -- reading -----------------------------------------------------
@@ -299,6 +313,71 @@ class CutlistView:
         )
         self.status = self._status(
             f"slot {slot_index} is now {_ms(start)} to {_ms(end)}"
+        )
+        return self.status
+
+    def _load_audio(self, video_id: int) -> tuple[np.ndarray, int] | None:
+        """This video's cached WAV, or ``None`` with nothing raised.
+
+        The screen has no database — it reads and writes the cut-list file
+        only (design §8) — so this goes straight to Part 2's cache path
+        rather than through a query. A cut list can legitimately name a video
+        whose WAV was later pruned, and a snap key that crashed on that would
+        be a worse tool than one that says so.
+        """
+        if video_id not in self._audio:
+            path = wav_path(video_id)
+            if not path.exists():
+                return None
+            try:
+                self._audio[video_id] = read_wav_mono(path)
+            except (AudioFormatError, OSError):
+                return None
+        return self._audio[video_id]
+
+    def snap(self, slot_index: int, *, edge: str) -> str:
+        """Move one boundary onto the nearest measured energy minimum and
+        zero crossing (BUGS.md entry 30).
+
+        What a 1 ms nudge is actually chasing is a clicking seam, and a click
+        comes from an amplitude discontinuity, not from timing precision.
+        `rytp/audio/energy.py` already measures exactly that during
+        alignment; this is the same machinery, aimed at one boundary on
+        request instead of every boundary at transcribe time.
+        """
+        slot = self.slot_at(slot_index)
+        if slot is None:
+            return f"no slot {slot_index}"
+        if slot.kind != "fragment" or slot.start_ms is None or slot.end_ms is None:
+            return f"slot {slot_index} is a gap: there is no boundary to snap"
+        if slot.video_id is None:
+            return f"slot {slot_index} has no source video to measure"
+        audio = self._load_audio(slot.video_id)
+        if audio is None:
+            return f"slot {slot_index}: no cached audio for video {slot.video_id} to measure"
+        samples, sr = audio
+        current = slot.start_ms if edge == "start" else slot.end_ms
+        total_ms = index_to_ms(samples.size, sr)
+        lo = max(0, current - C.BOUNDARY_SEARCH_MS)
+        hi = min(total_ms, current + C.BOUNDARY_SEARCH_MS)
+        minimum = find_energy_minimum(samples, sr, lo, hi, prefer_ms=current)
+        snapped = snap_to_zero_crossing(samples, sr, minimum)
+        start = snapped if edge == "start" else slot.start_ms
+        end = slot.end_ms if edge == "start" else snapped
+        if start < 0 or end - start < C.TUI_CUTLIST_NUDGE_MS:
+            return (
+                f"slot {slot_index}: no better boundary within reach — the measured "
+                f"minimum would leave it shorter than {C.TUI_CUTLIST_NUDGE_MS} ms"
+            )
+        delta = snapped - current
+        if delta == 0:
+            self.status = self._status(
+                f"slot {slot_index}'s {edge} is already at the measured boundary"
+            )
+            return self.status
+        self._replace_slot(slot_index, dataclasses.replace(slot, start_ms=start, end_ms=end))
+        self.status = self._status(
+            f"slot {slot_index}'s {edge} snapped {delta:+d} ms to {_ms(snapped)}"
         )
         return self.status
 

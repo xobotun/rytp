@@ -40,13 +40,24 @@ def _quoted(line: str) -> str:
     return line[first + 1 : last] if 0 <= first < last else ""
 
 
+#: Labels MFA can write into the ``words`` tier itself that are not words:
+#: silence and short-pause markers, and out-of-vocabulary speech ("spn" —
+#: "speech, non-word"). Audited for entry 36: MFA's mismatch check compares
+#: interval count to word count, so any of these sitting in the words tier
+#: would shift the count and either raise a spurious mismatch or, worse,
+#: silently pair the wrong span with the wrong word.
+_NON_WORD_LABELS = {"sil", "sp", "spn"}
+
+
 def parse_textgrid(text: str) -> list[tuple[float, float, str]]:
     """Intervals of the ``words`` tier of a long-form Praat TextGrid.
 
     MFA writes one interval per word plus empty intervals for the silences
-    between them; the empty ones are dropped. A tier's own ``xmin``/``xmax``
-    are always overwritten by its first interval's before any ``text`` line
-    appears, so no special case is needed for the header.
+    between them; the empty ones are dropped, and so are ``sil``/``sp``/
+    ``spn`` markers that MFA sometimes writes as labelled (non-empty)
+    intervals in the words tier rather than as empty ones. A tier's own
+    ``xmin``/``xmax`` are always overwritten by its first interval's before
+    any ``text`` line appears, so no special case is needed for the header.
     """
     intervals: list[tuple[float, float, str]] = []
     in_words = False
@@ -66,7 +77,9 @@ def parse_textgrid(text: str) -> list[tuple[float, float, str]]:
                 xmax = float(line.split("=", 1)[1])
             elif line.startswith("text ="):
                 label = _quoted(line).strip()
-                if xmin is not None and xmax is not None and label:
+                if xmin is not None and xmax is not None and label and (
+                    label not in _NON_WORD_LABELS
+                ):
                     intervals.append((xmin, xmax, label))
                 xmin = xmax = None
         except ValueError:
@@ -99,17 +112,37 @@ class MfaAligner:
     requires_hf_token = False
     out_of_process = True
     required_module = None
+    #: MFA is a conda-installed *binary*, not a `pip`-importable module, so
+    #: `required_module` can never name it (BUGS.md entry 7). Bare name,
+    #: platform suffix resolved by `rytp.transcribe.registry` the same way
+    #: :func:`mfa_binary` resolves it for a real run.
+    required_binary = "mfa"
     extra = "mfa"
+    #: MFA reports no per-word confidence at all (contracts §3's score table).
+    score_scale = C.ALIGN_SCALE_NONE
+    #: MFA has no GPU path; plan §1b's "an engine with no torch" case.
+    device = "n/a"
 
     def __init__(
         self,
         interpreter: str,
         acoustic_model: str = C.MFA_ACOUSTIC_MODEL,
         dictionary: str = C.MFA_DICTIONARY,
+        device: str = C.ENGINE_DEFAULT_DEVICE,
     ) -> None:
         self._interpreter = interpreter
         self._acoustic_model = acoustic_model
         self._dictionary = dictionary
+        # Accepted and ignored: plan §1b has every adapter take the parameter
+        # uniformly (a caller may pass device= without special-casing MFA),
+        # but MFA never runs on a GPU, so the instance attribute stays "n/a".
+        del device
+        #: MFA never has a non-fatal finding to report. Set per instance
+        #: (never a class-level default) so it satisfies the `Aligner`
+        #: protocol's `notes: list[str]` as a genuine, mutable instance
+        #: attribute, exactly like the other two engines'; it simply never
+        #: gets appended to.
+        self.notes: list[str] = []
 
     def align(
         self, audio: Path, words: Sequence[str], *, start_ms: int, end_ms: int

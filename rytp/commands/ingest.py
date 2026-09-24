@@ -329,8 +329,9 @@ register(
         group="",
         summary="Enqueue the acquisition chain for one video or a whole channel.",
         params=(
-            Param("video", str, "Catalog id or external id of one video. Empty uses "
-                  "the filters.", default="", positional=True),
+            Param("video", str, "Catalog id, external id, or catalogued URL of one "
+                  "video — a URL only resolves once it is registered with `videos "
+                  "add`. Empty uses the filters.", default="", positional=True),
             Param("channel_id", int, "Only videos of this channel. 0 means any.",
                   default=0, short="-c"),
             Param("pending", bool, "Only videos that have never been ingested.",
@@ -359,8 +360,9 @@ register(
         group="",
         summary="Download one video's assets and cache its WAV, right now.",
         params=(
-            Param("video", str, "Catalog id or external id of the video.",
-                  default=REQUIRED, positional=True),
+            Param("video", str, "Catalog id, external id, or catalogued URL of the "
+                  "video — a URL only resolves once it is registered with `videos "
+                  "add`.", default=REQUIRED, positional=True),
             Param("captions", bool, "Also fetch the caption track.", default=True),
         ),
         handler=fetch_video,

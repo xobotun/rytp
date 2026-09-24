@@ -9,6 +9,7 @@ enqueues the chain."
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import tomllib
 from collections import Counter
 from collections.abc import Sequence
@@ -37,6 +38,7 @@ __all__ = [
     "format_duration",
     "looks_local",
     "parse_tabs",
+    "render_cell",
     "resolve_channel",
     "truncate",
     "video_files",
@@ -257,6 +259,101 @@ def videos_add(
     )
 
 
+def render_cell(count: int) -> str:
+    """One vocabulary for every boolean-or-count cell (BUGS.md entry 25).
+
+    `0` is `C.CELL_CROSS`, `1` is `C.CELL_TICK`, and `2` or more is the number
+    itself — a single video rendition reads as a tick like anything else
+    satisfied, and only genuine plurality shows a digit. The same rule
+    renders an asset count and a stage flag (0 or 1) alike.
+    """
+    if count <= 0:
+        return C.CELL_CROSS
+    if count == 1:
+        return C.CELL_TICK
+    return str(count)
+
+
+def _stage_done(db: Database, video_id: int, kind_name: str) -> bool:
+    """Whether `kind_name`'s registered `readiness` predicate calls this video
+    done, i.e. `Readiness.SATISFIED`.
+
+    Calls the predicate that `jobs.reconcile` itself calls (contracts §5)
+    rather than growing a second, disagreeing definition of "done" — the
+    reason entry 25 gives for building this off `readiness` at all. Part 1
+    ships before `rytp.jobs` exists, so a missing registry answers "not
+    done" instead of raising, matching `_video_job_kinds` above.
+    """
+    try:
+        from rytp.jobs import JOB_KINDS, Readiness
+    except ImportError:
+        return False
+    kind = JOB_KINDS.get(kind_name)
+    if kind is None:
+        return False
+    return kind.readiness(db, video_id) == Readiness.SATISFIED
+
+
+_LONG_COLUMNS: tuple[str, ...] = (
+    "audio",
+    "captions",
+    "videos",
+    "transcribed",
+    "aligned",
+    "indexed",
+    "diarized",
+    "tier",
+    "engine",
+    "align scale",
+)
+
+
+def _long_cells(db: Database, row: sqlite3.Row) -> tuple[str, ...]:
+    """The ten `--long` columns for one video row (BUGS.md entry 25).
+
+    `audio`/`captions`/`videos` are asset presence, from the join in
+    `q.list_videos`: `audio` and `captions` are singleton roles
+    (`C.SINGLETON_ASSET_ROLES`) so their cell is always a tick or a cross,
+    never a count; `videos` (rendition assets) is the one role that can be
+    a genuine count.
+
+    `transcribed`, `indexed` and `diarized` are read straight from the
+    `transcribe` / `index` / `diarize` job kinds' `readiness` predicates via
+    `_stage_done` — no second opinion about what "done" means.
+
+    `aligned` is the one stage column **not** sourced from a predicate:
+    `align_readiness` is documented to never return `SATISFIED` (re-aligning
+    is always offered again, which is also why the kind is
+    `reopenable=False`), so "aligned" here means the tier column's own
+    `words.source = 'aligned'` case — a projection of `tier`, not a rerun of
+    the readiness logic.
+
+    `tier` is the **best** tier present for the video: a video can hold
+    caption-tier and timed-tier (or aligned-tier) words at once — captions
+    ingested, then a transcriber run — and this column always shows the
+    most-advanced one, because that is what answers "can I cut this yet".
+
+    `engine` is every distinct `words.engine` chain seen for the video
+    (`whisper+energy`, ...); `align scale` is every distinct non-null
+    `words.align_scale` — the tag that says which scale an alignment score
+    was written in (§1a), and so which videos still need re-aligning.
+    """
+    video_id = int(row["id"])
+    best_tier = row["best_tier"]
+    return (
+        render_cell(int(row["n_audio"])),
+        render_cell(int(row["n_captions"])),
+        render_cell(int(row["n_video_assets"])),
+        render_cell(1 if _stage_done(db, video_id, "transcribe") else 0),
+        render_cell(1 if best_tier == "aligned" else 0),
+        render_cell(1 if _stage_done(db, video_id, "index") else 0),
+        render_cell(1 if _stage_done(db, video_id, "diarize") else 0),
+        best_tier or C.NULL_CELL,
+        row["engines"] or C.NULL_CELL,
+        row["align_scales"] or C.NULL_CELL,
+    )
+
+
 def videos_list(
     db: Database,
     *,
@@ -265,8 +362,14 @@ def videos_list(
     source: str | None = None,
     search: str | None = None,
     limit: int = C.DEFAULT_LIST_LIMIT,
+    long: bool = False,
 ) -> CommandResult:
-    """List catalogued videos, newest first, narrowed by the given filters."""
+    """List catalogued videos, newest first, narrowed by the given filters.
+
+    `long=True` adds the asset and pipeline-stage columns (`_LONG_COLUMNS`,
+    BUGS.md entry 25) after today's columns, so a script parsing the default
+    listing is unaffected. See `_long_cells` for what each of those means.
+    """
     check_choice("kind", kind, C.VIDEO_KINDS)
     check_choice("source", source, C.VIDEO_SOURCES)
     channel_id = resolve_channel(db, channel) if channel else None
@@ -278,8 +381,13 @@ def videos_list(
         search=search,
         limit=limit,
     )
+    columns: tuple[str, ...] = (
+        "id", "source", "kind", "duration", "channel", "title", "external id"
+    )
+    if long:
+        columns += _LONG_COLUMNS
     return CommandResult(
-        columns=("id", "source", "kind", "duration", "channel", "title", "external id"),
+        columns=columns,
         rows=tuple(
             (
                 str(row["id"]),
@@ -289,6 +397,7 @@ def videos_list(
                 row["channel_title"] or C.NULL_CELL,
                 truncate(row["title"]),
                 row["external_id"] or C.NULL_CELL,
+                *(_long_cells(db, row) if long else ()),
             )
             for row in rows
         ),
@@ -612,6 +721,15 @@ register(
             Param("source", str, "Only this source.", default=None, choices=C.VIDEO_SOURCES),
             Param("search", str, "Substring of the title.", default=None),
             Param("limit", int, "Maximum rows.", default=C.DEFAULT_LIST_LIMIT, short="-n"),
+            Param(
+                "long",
+                bool,
+                "Add asset and pipeline-stage columns: audio/captions/videos"
+                " present, transcribed/aligned/indexed/diarized done, the best"
+                " transcript tier held (a video may hold more than one), the"
+                " engine chain and the align scale.",
+                default=False,
+            ),
         ),
         handler=videos_list,
     )

@@ -346,3 +346,106 @@ def test_the_threaded_worker_starts_works_and_stops(db: Database) -> None:
     assert report.done == 1
     assert Q.list_jobs(db)[0].state == "done"
     assert [t for t in threading.enumerate() if t.name.startswith("rytp-")] == []
+
+
+# ---------------------------------------------------------------------------
+# The progress seam (plan §1c, Task 8a; BUGS.md entries 3, 10, 22).
+# ---------------------------------------------------------------------------
+
+
+def test_a_handlers_progress_report_lands_on_the_running_job(db: Database) -> None:
+    seen: list[str | None] = []
+
+    def handler(db_, t, p):
+        from rytp import progress
+
+        progress.report("stage", done=1, total=2, detail="x")
+        row = db_.conn.execute(
+            "SELECT progress FROM jobs WHERE target_id = ?", (t,)
+        ).fetchone()
+        seen.append(row["progress"])
+
+    with temp_job_kind("t_prog", "cpu", handler):
+        Q.enqueue(db, "t_prog", make_video(db), now=NOW)
+        _tick(db, "cpu")
+    assert seen == ["stage 1/2 x"]
+
+
+def test_progress_is_cleared_once_the_job_leaves_running(db: Database) -> None:
+    def handler(db_, t, p):
+        from rytp import progress
+
+        progress.report("stage", done=1, total=2)
+
+    with temp_job_kind("t_prog_done", "cpu", handler):
+        Q.enqueue(db, "t_prog_done", make_video(db), now=NOW)
+        _tick(db, "cpu")
+    job = Q.list_jobs(db)[0]
+    assert job.state == "done"
+    assert job.progress is None
+
+
+def test_a_failed_jobs_progress_is_also_cleared(db: Database) -> None:
+    def gone(db_, t, p):
+        from rytp import progress
+
+        progress.report("stage", done=1, total=2)
+        raise VideoUnavailable("Private video")
+
+    with temp_job_kind("t_prog_fail", "network", gone):
+        Q.enqueue(db, "t_prog_fail", make_video(db), now=NOW)
+        _tick(db, "network")
+    job = Q.list_jobs(db)[0]
+    assert job.state == "failed"
+    assert job.progress is None
+
+
+def test_the_worker_throttles_progress_writes(db: Database) -> None:
+    seen: list[str | None] = []
+
+    def handler(db_, t, p):
+        from rytp import progress
+
+        progress.report("stage", done=1, total=10)
+        row = db_.conn.execute(
+            "SELECT progress FROM jobs WHERE target_id = ?", (t,)
+        ).fetchone()
+        seen.append(row["progress"])
+        # Fired immediately after: the throttle (2000 ms) has not elapsed and
+        # this is not the final call, so it must not overwrite the first.
+        progress.report("stage", done=2, total=10)
+        row = db_.conn.execute(
+            "SELECT progress FROM jobs WHERE target_id = ?", (t,)
+        ).fetchone()
+        seen.append(row["progress"])
+
+    with temp_job_kind("t_prog_throttle", "cpu", handler):
+        Q.enqueue(db, "t_prog_throttle", make_video(db), now=NOW)
+        _tick(db, "cpu")
+    assert seen == ["stage 1/10", "stage 1/10"]
+
+
+def test_a_final_progress_call_bypasses_the_throttle(db: Database) -> None:
+    seen: list[str | None] = []
+
+    def handler(db_, t, p):
+        from rytp import progress
+
+        progress.report("stage", done=1, total=2)
+        progress.report("stage", done=2, total=2)
+        row = db_.conn.execute(
+            "SELECT progress FROM jobs WHERE target_id = ?", (t,)
+        ).fetchone()
+        seen.append(row["progress"])
+
+    with temp_job_kind("t_prog_final", "cpu", handler):
+        Q.enqueue(db, "t_prog_final", make_video(db), now=NOW)
+        _tick(db, "cpu")
+    assert seen == ["stage 2/2"]
+
+
+def test_a_handler_that_reports_nothing_leaves_progress_untouched(db: Database) -> None:
+    with temp_job_kind("t_prog_quiet", "cpu", lambda db_, t, p: None):
+        Q.enqueue(db, "t_prog_quiet", make_video(db), now=NOW)
+        _tick(db, "cpu")
+    assert Q.list_jobs(db)[0].progress is None

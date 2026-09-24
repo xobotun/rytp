@@ -8,7 +8,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import ClassVar
 
+from rytp import constants as C
 from rytp.models import RawWord, Span
 from rytp.transcribe import registry
 
@@ -21,6 +23,10 @@ class FakeTranscriber:
     out_of_process = False
     required_module: str | None = None
     extra: str | None = None
+    #: A transcriber has no `words.align_score` to report (contracts §6).
+    score_scale = C.ALIGN_SCALE_NONE
+    device = "n/a"
+    notes: ClassVar[list[str]] = []
     script: tuple[tuple[int, int | None, str], ...] = (
         (0, 200, "один"),
         (200, 460, "два"),
@@ -91,6 +97,10 @@ class FakeAligner:
     out_of_process = False
     required_module: str | None = None
     extra: str | None = None
+    #: Mimics wav2vec2: a real, unbounded log-probability (plan §1a).
+    score_scale = C.ALIGN_SCALE_LOGPROB
+    device = "cpu"
+    notes: ClassVar[list[str]] = []
 
     def align(
         self, audio: Path, words: Sequence[str], *, start_ms: int, end_ms: int
@@ -171,6 +181,9 @@ class ScorelessAligner(FakeAligner):
     """An aligner that reports no per-word confidence — MFA behaves this way."""
 
     name = "fake-scoreless-aligner"
+    #: MFA-shaped: a real aligner that has nothing to report (contracts §3).
+    score_scale = C.ALIGN_SCALE_NONE
+    device = "n/a"
 
     def align(
         self, audio: Path, words: Sequence[str], *, start_ms: int, end_ms: int

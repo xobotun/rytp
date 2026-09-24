@@ -210,7 +210,7 @@ def test_a_render_row_opens_planned_and_closes_rendered(db: Database) -> None:
     RUN.finish_render(db, render_id, state="rendered", output_path=Path("/out/o.mp4"))
     row = RUN.get_render(db, render_id)
     assert row["state"] == "rendered"
-    assert row["output_path"] == "/out/o.mp4"
+    assert row["output_path"] == str(Path("/out/o.mp4"))
     assert row["finished_at"]
 
 

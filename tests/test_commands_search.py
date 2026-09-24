@@ -117,6 +117,22 @@ def test_index_build_says_so_when_there_is_nothing_to_do(db: Database) -> None:
     assert "nothing" in (result.message or "")
 
 
+def test_index_build_says_why_when_nothing_has_been_transcribed(db: Database) -> None:
+    """BUGS.md entry 4: say *why*, and what to do next."""
+    make_video(db)
+    result = resolve("index.build").handler(db)
+    assert "transcribed" in (result.message or "")
+    assert "transcribe run" in (result.message or "")
+
+
+def test_index_build_says_why_when_everything_is_already_indexed(db: Database) -> None:
+    video_id = corpus(db, "Добрый вечер")
+    result = resolve("index.build").handler(db)
+    assert "already indexed" in (result.message or "")
+    assert "1" in (result.message or "")
+    assert video_id  # the count, not the id, is what the message names
+
+
 def test_index_build_can_enqueue_instead_of_working(db: Database) -> None:
     """Part 2's ingest chain stops at extract_wav; this is what creates the
     index jobs once words exist."""
@@ -467,3 +483,46 @@ def test_transcript_build_tells_you_to_index_first(db: Database) -> None:
     add_words(db, video_id, "Добрый вечер")
     with pytest.raises(RytpError, match="index"):
         resolve("transcript.build").handler(db, video=str(video_id))
+
+
+def test_transcript_build_has_no_line_length_knob(db: Database) -> None:
+    """BUGS.md entry 15: `transcript build` writes a durable file, so a
+    terminal-width wrap does not belong on it — only `transcript show` gets
+    the knob."""
+    names = {param.name for param in resolve("transcript.build").params}
+    assert "line_length" not in names
+
+
+# --- transcript.show ---------------------------------------------------
+
+
+def test_transcript_show_defaults_to_the_configured_line_length(db: Database) -> None:
+    param = next(
+        p for p in resolve("transcript.show").params if p.name == "line_length"
+    )
+    assert param.default == C.TRANSCRIPT_DEFAULT_LINE_LENGTH
+
+
+def test_transcript_show_wraps_a_long_line_to_the_requested_width(db: Database) -> None:
+    video_id = corpus(db, "слово " * 30 + "конец")
+    wide = resolve("transcript.show").handler(db, video=str(video_id))
+    narrow = resolve("transcript.show").handler(
+        db, video=str(video_id), line_length=20
+    )
+    wide_text = wide.rows[0][4]
+    narrow_text = narrow.rows[0][4]
+    assert max(len(line) for line in narrow_text.splitlines()) <= 20
+    assert max(len(line) for line in wide_text.splitlines()) <= C.TRANSCRIPT_DEFAULT_LINE_LENGTH
+    assert narrow_text.replace("\n", " ") == wide_text.replace("\n", " ")
+
+
+def test_transcript_show_leaves_a_short_line_untouched(db: Database) -> None:
+    video_id = corpus(db, "Добрый вечер")
+    result = resolve("transcript.show").handler(db, video=str(video_id))
+    assert result.rows[0][4] == "Добрый вечер"
+
+
+def test_transcript_show_rejects_a_non_positive_line_length(db: Database) -> None:
+    video_id = corpus(db, "Добрый вечер")
+    with pytest.raises(RytpError):
+        resolve("transcript.show").handler(db, video=str(video_id), line_length=0)

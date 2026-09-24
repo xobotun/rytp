@@ -17,6 +17,7 @@ from rytp import constants as C
 from rytp.db import Database
 from rytp.tui.jobs_view import JobsView
 from rytp.tui.navigation import BACK_KEY
+from rytp.tui.text import plain_row, set_text
 
 __all__ = ["JobsScreen"]
 
@@ -98,15 +99,16 @@ class JobsScreen(Screen[None]):
 
     def _announce(self, message: str) -> None:
         self._draw()
-        self.query_one("#jobs-status", Static).update(message)
+        set_text(self.query_one("#jobs-status", Static), message)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         # Only the note pane: redrawing the table here would move its cursor
         # and raise this message again. Without it the note would change only
         # on the two-second timer, which is a long time to stare at a row.
         if event.data_table.id == "jobs-table":
-            self.query_one("#jobs-note", Static).update(
-                self.view.note_at(int(event.cursor_row))
+            set_text(
+                self.query_one("#jobs-note", Static),
+                self.view.note_at(int(event.cursor_row)),
             )
 
     def _draw(self) -> None:
@@ -116,8 +118,8 @@ class JobsScreen(Screen[None]):
         if self.view.columns:
             table.add_columns(*self.view.columns)
             for row in self.view.rows:
-                table.add_row(*row)
+                table.add_row(*plain_row(row))
         if self.view.rows:
             table.move_cursor(row=min(cursor, len(self.view.rows) - 1))
-        self.query_one("#jobs-note", Static).update(self.view.note_at(cursor))
-        self.query_one("#jobs-status", Static).update(self.view.status)
+        set_text(self.query_one("#jobs-note", Static), self.view.note_at(cursor))
+        set_text(self.query_one("#jobs-status", Static), self.view.status)

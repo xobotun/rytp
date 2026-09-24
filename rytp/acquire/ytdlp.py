@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from rytp import constants as C
+from rytp import progress
 from rytp.acquire.policy import (
     AcquireError,
     ErrorKind,
@@ -185,6 +186,32 @@ def probe_video(url: str, *, runner: YtDlpRunner | None = None) -> ChannelEntry:
     return entry
 
 
+def _report_ytdlp_progress(info: dict[str, Any]) -> None:
+    """A yt-dlp ``progress_hooks`` callback: forward bytes to the seam.
+
+    BUGS.md entry 3 — a download sat silently for minutes, indistinguishable
+    from a hang. yt-dlp already knows how far along it is; this is the one
+    place that call reaches :func:`rytp.progress.report`, so every caller of
+    :meth:`RealYtDlpRunner.download` and
+    :meth:`RealYtDlpRunner.download_captions` gets it for free.
+    """
+    status = info.get("status")
+    if status not in ("downloading", "finished"):
+        return
+    done = info.get("downloaded_bytes")
+    total = info.get("total_bytes") or info.get("total_bytes_estimate")
+    if status == "finished" and total is None:
+        total = done
+    filename = info.get("filename") or info.get("info_dict", {}).get("filename")
+    detail = Path(filename).name if filename else ""
+    progress.report(
+        "download",
+        done=int(done) if isinstance(done, int | float) else None,
+        total=int(total) if isinstance(total, int | float) else None,
+        detail=detail,
+    )
+
+
 class RealYtDlpRunner:
     """The only implementation that touches the network."""
 
@@ -204,6 +231,7 @@ class RealYtDlpRunner:
             "retries": C.YTDLP_RETRIES,
             "fragment_retries": C.YTDLP_RETRIES,
             "concurrent_fragment_downloads": 1,
+            "progress_hooks": [_report_ytdlp_progress],
         }
         base.update(opts)
         return yt_dlp.YoutubeDL(base)

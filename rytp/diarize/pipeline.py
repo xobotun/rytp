@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rytp import constants as C
+from rytp import progress
 from rytp.config import paths
 from rytp.db import Database
 from rytp.diarize import store
@@ -98,7 +99,11 @@ def diarize_video(
     if not words:
         raise DiarizeError(f"video {video_id} has no words to label; transcribe it first")
 
+    progress.report("diarize", detail=f"video {video_id}: {diarizer.name} segmenting")
     segments = _validated(list(diarizer.diarize(wav_path)))
+    progress.report(
+        "diarize", done=1, total=1, detail=f"video {video_id}: {len(segments)} segments"
+    )
     if not segments:
         raise DiarizeError(f"diarizer {diarizer.name!r} found no speech in {wav_path}")
 
@@ -226,10 +231,16 @@ def embed_video_speakers(
 
     segments = store.label_segments(db, video_id)
     totals = speech_ms_by_label(segments)
+    rows = store.label_rows(db, video_id)
 
+    # Reported before and after the transaction, not inside it: a progress
+    # write inside `db.transaction()` would join it and stay invisible on
+    # the shared connection until the whole pass commits, which defeats the
+    # point for the worker's database sink (plan Task 8a).
+    progress.report("embed", done=0, total=len(rows), detail=f"video {video_id}: {embedder.name}")
     embedded = skipped = 0
     with db.transaction():
-        for row in store.label_rows(db, video_id):
+        for row in rows:
             if totals.get(row.local_label, 0) < C.EMBED_MIN_SPEECH_MS:
                 store.set_embedding(db, row.video_speaker_id, None)
                 skipped += 1
@@ -240,6 +251,10 @@ def embed_video_speakers(
                 db, row.video_speaker_id, pack_embedding(l2_normalize(vector))
             )
             embedded += 1
+    progress.report(
+        "embed", done=len(rows), total=len(rows),
+        detail=f"video {video_id}: {embedded} embedded, {skipped} skipped",
+    )
 
     return EmbedOutcome(
         video_id=video_id,

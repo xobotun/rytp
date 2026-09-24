@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -361,6 +362,93 @@ def test_a_speaker_label_is_unique_and_a_video_label_is_unique_per_video(db: Dat
             " VALUES (?, 'S0', 'pyannote')",
             (video_id,),
         )
+
+
+def test_migrating_from_version_12_backfills_align_scale(data_dir: Path) -> None:
+    """Task 2b, migration 13. A database stopped at version 12 — the shape
+    every live database had before this batch — gains `align_scale` and its
+    two backfills exactly as contracts §3's score-precedence table requires:
+    a scored `timed` row (energy refinement) backfills `energy`; an
+    `aligned` row backfills `unknown` regardless of its score, because every
+    pre-batch `aligned` row came from the broken wav2vec2 aligner of entry 36
+    and a null-scored one is no more trustworthy than a scored one.
+    """
+    from rytp.config import ensure_dir, paths
+
+    ensure_dir(paths().root)
+    database = Database(paths().db)
+    try:
+        assert database.migrate_to(12) == 12
+
+        video_id = seed_video(database)
+        database.conn.execute(
+            "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text,"
+            " stem, confidence, align_score, source, engine)"
+            " VALUES (?, 0, 0, 100, 'да', 'да', 'да', NULL, 0.87, 'timed', 'whisper')",
+            (video_id,),
+        )
+        database.conn.execute(
+            "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text,"
+            " stem, confidence, align_score, source, engine)"
+            " VALUES (?, 1, 100, 200, 'нет', 'нет', 'нет', NULL, -3.2, 'aligned', 'wav2vec2')",
+            (video_id,),
+        )
+        database.conn.execute(
+            "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text,"
+            " stem, confidence, align_score, source, engine)"
+            " VALUES (?, 2, 200, NULL, 'слово', 'слово', 'слов', NULL, NULL,"
+            " 'caption', 'captions')",
+            (video_id,),
+        )
+
+        assert database.migrate() == 15
+
+        rows = {
+            row["ord"]: (row["source"], row["align_score"], row["align_scale"])
+            for row in database.conn.execute(
+                "SELECT ord, source, align_score, align_scale FROM words ORDER BY ord"
+            )
+        }
+        assert rows[0] == ("timed", 0.87, "energy")
+        assert rows[1] == ("aligned", -3.2, "unknown")
+        assert rows[2] == ("caption", None, None)
+
+        progress_cols = {
+            row["name"] for row in database.conn.execute("PRAGMA table_info(jobs)")
+        }
+        assert "progress" in progress_cols
+
+        sql = database.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'words_timed'"
+        ).fetchone()["sql"]
+        assert "WHERE source = 'timed'" in sql
+    finally:
+        database.close()
+
+
+def test_a_timed_row_with_no_score_backfills_no_scale(data_dir: Path) -> None:
+    """A `timed` row with no `align_score` never ran `--refine`, so it has
+    nothing to name a scale for and stays NULL, per contracts §3's table."""
+    from rytp.config import ensure_dir, paths
+
+    ensure_dir(paths().root)
+    database = Database(paths().db)
+    try:
+        database.migrate_to(12)
+        video_id = seed_video(database)
+        database.conn.execute(
+            "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text,"
+            " stem, align_score, source, engine)"
+            " VALUES (?, 0, 0, 100, 'да', 'да', 'да', NULL, 'timed', 'whisper')",
+            (video_id,),
+        )
+        database.migrate()
+        row = database.conn.execute(
+            "SELECT align_scale FROM words WHERE ord = 0"
+        ).fetchone()
+        assert row["align_scale"] is None
+    finally:
+        database.close()
 
 
 def test_unmapping_a_speaker_keeps_the_video_label(db: Database) -> None:

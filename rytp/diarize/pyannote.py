@@ -28,7 +28,7 @@ from typing import Any
 from rytp import constants as C
 from rytp.diarize.base import register_diarizer
 from rytp.models import DiarSegment
-from rytp.transcribe.subproc import run_child
+from rytp.transcribe.subproc import resolve_device, run_child
 
 
 def segments_from_tracks(
@@ -59,18 +59,24 @@ class PyannoteDiarizer:
     out_of_process = True
     required_module = "pyannote.audio"
     extra = "pyannote"
+    #: Class-level default (plan §1b, contracts §6); see :class:`GigaAMTranscriber`.
+    device = C.ENGINE_DEFAULT_DEVICE
 
     def __init__(
         self,
         interpreter: str,
         model: str = C.PYANNOTE_DIARIZATION_MODEL,
         hf_token: str | None = None,
+        device: str = C.ENGINE_DEFAULT_DEVICE,
     ) -> None:
         self._interpreter = interpreter
         self._model = model
         self._hf_token = (
             hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
         )
+        #: Requested device, then the concrete device the last call used
+        #: (BUGS.md entry 34) — see :class:`GigaAMTranscriber`.
+        self.device = device
 
     def diarize(self, audio: Path) -> Iterable[DiarSegment]:
         """Whole file in, labelled turns out.
@@ -86,8 +92,10 @@ class PyannoteDiarizer:
                 "audio": str(audio),
                 "model": self._model,
                 "hf_token": self._hf_token,
+                "device": self.device,
             },
         )
+        self.device = str(result.get("device") or self.device)
         return [
             DiarSegment(
                 start_ms=int(item["start_ms"]),
@@ -100,12 +108,15 @@ class PyannoteDiarizer:
 
 def child_main(request: dict[str, Any]) -> dict[str, Any]:
     """Runs inside pyannote's own interpreter. The only import of the library."""
+    import torch
     from pyannote.audio import Pipeline
 
+    device = resolve_device(str(request.get("device") or C.ENGINE_DEFAULT_DEVICE))
     pipeline = Pipeline.from_pretrained(request["model"], token=request["hf_token"])
+    pipeline.to(torch.device(device))
     annotation = pipeline(request["audio"])
     tracks = [
         (segment.start, segment.end, label)
         for segment, _track, label in annotation.itertracks(yield_label=True)
     ]
-    return {"segments": segments_from_tracks(tracks)}
+    return {"segments": segments_from_tracks(tracks), "device": device}

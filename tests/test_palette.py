@@ -110,9 +110,71 @@ def test_parse_accepts_quoted_values() -> None:
     assert values["channel"] == "Channel One"
 
 
+def test_parse_accepts_single_quoted_values() -> None:
+    values = parse_arguments(SYNC, "'Channel One'")
+    assert values["channel"] == "Channel One"
+
+
+def test_parse_accepts_a_quoted_cyrillic_filename_with_spaces() -> None:
+    values = parse_arguments(ADD, '"видео «файл» с пробелами.mp4" kind=short')
+    assert values["target"] == "видео «файл» с пробелами.mp4"
+    assert values["kind"] == "short"
+
+
+def test_parse_preserves_an_unquoted_windows_path() -> None:
+    """Entry 21: plain POSIX-mode `shlex` treats backslash as an escape
+    character and would mangle this into
+    `D:Workrytpsample_inputsfile.mp4` — silently, with no error."""
+    windows_path = r"D:\Work\rytp\sample_inputs\file.mp4"
+    values = parse_arguments(ADD, windows_path)
+    assert values["target"] == windows_path
+
+
+def test_parse_preserves_an_unquoted_windows_path_alongside_a_named_value() -> None:
+    windows_path = r"D:\Video\Ролики\клип.mp4"
+    values = parse_arguments(ADD, f"{windows_path} kind=short")
+    assert values["target"] == windows_path
+    assert values["kind"] == "short"
+
+
 def test_parse_rejects_a_missing_required_parameter() -> None:
     with pytest.raises(InvalidInputError, match="target"):
         parse_arguments(ADD, "kind=short")
+
+
+def test_parse_strips_quotes_from_a_named_values_right_hand_side() -> None:
+    """The tokenizer strips a quote pair as it merges `name=` with its
+    value into one token, so no separate stripping step is needed here."""
+    assert parse_arguments(ADD, 'x speaker="Ведущий"')["speaker"] == "Ведущий"
+    assert parse_arguments(ADD, "x speaker='Ведущий'")["speaker"] == "Ведущий"
+
+
+def test_parse_strips_quotes_from_a_dashed_flags_equals_value() -> None:
+    """Proves the choices check sees the stripped value, not `'short'`."""
+    assert parse_arguments(ADD, "x --kind='short'")["kind"] == "short"
+
+
+def test_parse_accepts_a_named_value_containing_spaces_when_quoted() -> None:
+    """The regression `posix=False` introduced: a quote starting *after*
+    `name=` is only ever entered from POSIX mode's mid-token quote state,
+    which plain non-POSIX `shlex.split` does not have — `name="value with
+    spaces"` broke there even though it worked before entry 21 was fixed."""
+    assert parse_arguments(ADD, 'x speaker="Ведущий Один"')["speaker"] == "Ведущий Один"
+    assert parse_arguments(ADD, "x speaker='Ведущий Один'")["speaker"] == "Ведущий Один"
+
+
+def test_parse_preserves_literal_quote_characters_inside_a_value() -> None:
+    """A value that is itself quoted must not be double-stripped: only the
+    outer, syntactic quote pair goes away."""
+    values = parse_arguments(ADD, """x speaker='He said "hi"'""")
+    assert values["speaker"] == 'He said "hi"'
+
+
+def test_parse_rejects_an_unbalanced_quote_without_a_traceback() -> None:
+    """`shlex` raises a bare `ValueError` on an unclosed quote; that must
+    not escape as a traceback (the class of defect in BUGS.md entry 16)."""
+    with pytest.raises(InvalidInputError):
+        parse_arguments(ADD, 'x speaker="unclosed')
 
 
 def test_the_global_speaker_alias_is_accepted_when_typing_arguments() -> None:
@@ -145,6 +207,45 @@ def test_a_url_with_a_query_string_is_still_a_positional_value() -> None:
     """`?v=…` must not be mistaken for a `name=value` argument."""
     values = parse_arguments(ADD, "https://example.invalid/watch?v=VIDEO_A")
     assert values["target"] == "https://example.invalid/watch?v=VIDEO_A"
+
+
+def test_parse_accepts_a_dashed_boolean_flag() -> None:
+    """Entry 24: `--force` is accepted as a synonym for `force=true`."""
+    values = parse_arguments(ADD, "x --force")
+    assert values["force"] is True
+
+
+def test_parse_accepts_a_negated_dashed_boolean_flag() -> None:
+    values = parse_arguments(ADD, "x --no-force")
+    assert values["force"] is False
+
+
+def test_parse_accepts_a_dashed_flag_with_equals() -> None:
+    values = parse_arguments(ADD, "x --kind=short")
+    assert values["kind"] == "short"
+
+
+def test_parse_accepts_a_dashed_flag_with_a_separate_value() -> None:
+    values = parse_arguments(ADD, "x --kind short")
+    assert values["kind"] == "short"
+
+
+def test_parse_accepts_a_dashed_flag_with_a_quoted_separate_value() -> None:
+    values = parse_arguments(SYNC, '--channel "Channel One"')
+    assert values["channel"] == "Channel One"
+
+
+def test_a_dashed_flag_synonym_matches_the_named_form_exactly() -> None:
+    """The example from the plan: `fetch-video 1 --captions` is
+    `fetch-video 1 captions=true`."""
+    named = parse_arguments(ADD, "x force=true")
+    dashed = parse_arguments(ADD, "x --force")
+    assert dashed == named
+
+
+def test_parse_rejects_an_unknown_dashed_flag() -> None:
+    with pytest.raises(InvalidInputError, match="videos add"):
+        parse_arguments(ADD, "x --bogus")
 
 
 def test_cli_invocation_is_copy_pasteable() -> None:

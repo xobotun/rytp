@@ -7,9 +7,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from rytp import constants as C
 from rytp.cli import build_app
 from rytp.commands import catalog
 from rytp.db import Database
+from rytp.db.queries import insert_asset
 from rytp.models import ChannelEntry, InvalidInputError, NotFoundError, RytpError
 
 runner = CliRunner()
@@ -210,6 +212,212 @@ def test_videos_list_filters(db: Database, fake_probe: list[str], tmp_path: Path
 def test_videos_list_rejects_an_unknown_source(db: Database) -> None:
     with pytest.raises(InvalidInputError, match="source"):
         catalog.videos_list(db, source="vimeo")
+
+
+# -- `videos list --long` (BUGS.md entry 25) ---------------------------
+
+
+def _add_local_video(db: Database, tmp_path: Path, name: str = "clip.mp4") -> int:
+    result = catalog.videos_add(db, target=str(make_file(tmp_path, name)))
+    return int(result.rows[0][0])
+
+
+def _insert_word(
+    db: Database,
+    video_id: int,
+    *,
+    ord_: int,
+    source: str,
+    engine: str,
+    end_ms: int | None = 1000,
+    align_scale: str | None = None,
+) -> None:
+    db.conn.execute(
+        "INSERT INTO words (video_id, ord, start_ms, end_ms, text, "
+        "normalized_text, stem, source, engine, align_scale) "
+        "VALUES (?, ?, 0, ?, 'a', 'a', 'a', ?, ?, ?)",
+        (video_id, ord_, end_ms, source, engine, align_scale),
+    )
+
+
+@pytest.mark.parametrize(
+    "count, expected",
+    [(0, C.CELL_CROSS), (1, C.CELL_TICK), (2, "2"), (5, "5")],
+)
+def test_render_cell_ticks_crosses_and_counts(count: int, expected: str) -> None:
+    """`0` a cross, `1` a tick, `2` and above the number: one rule for every
+    column, asset counts and stage flags alike (entry 25, decided)."""
+    assert catalog.render_cell(count) == expected
+
+
+def test_videos_list_default_still_prints_exactly_what_it_prints_today(
+    db: Database, tmp_path: Path
+) -> None:
+    """`--long` is additive; a script parsing the default listing must see
+    no change in shape."""
+    video_id = _add_local_video(db, tmp_path)
+    insert_asset(db, video_id=video_id, role="audio", path=str(tmp_path / "a.wav"))
+    _insert_word(db, video_id, ord_=0, source="timed", engine="whisper")
+    result = catalog.videos_list(db)
+    assert result.columns == (
+        "id",
+        "source",
+        "kind",
+        "duration",
+        "channel",
+        "title",
+        "external id",
+    )
+
+
+def test_videos_list_long_adds_asset_and_stage_columns(
+    db: Database, tmp_path: Path
+) -> None:
+    video_id = _add_local_video(db, tmp_path)
+    insert_asset(db, video_id=video_id, role="audio", path=str(tmp_path / "a.wav"))
+    insert_asset(db, video_id=video_id, role="captions", path=str(tmp_path / "c.json3"))
+    insert_asset(
+        db, video_id=video_id, role="video", format_id="720p", path=str(tmp_path / "v1.mp4")
+    )
+    result = catalog.videos_list(db, long=True)
+    assert result.columns == (
+        "id",
+        "source",
+        "kind",
+        "duration",
+        "channel",
+        "title",
+        "external id",
+        "audio",
+        "captions",
+        "videos",
+        "transcribed",
+        "aligned",
+        "indexed",
+        "diarized",
+        "tier",
+        "engine",
+        "align scale",
+    )
+    row = result.rows[0]
+    idx = {name: i for i, name in enumerate(result.columns)}
+    assert row[idx["audio"]] == C.CELL_TICK
+    assert row[idx["captions"]] == C.CELL_TICK
+    assert row[idx["videos"]] == C.CELL_TICK  # exactly one rendition: a tick
+    assert row[idx["transcribed"]] == C.CELL_CROSS
+    assert row[idx["aligned"]] == C.CELL_CROSS
+    assert row[idx["indexed"]] == C.CELL_CROSS
+    assert row[idx["diarized"]] == C.CELL_CROSS
+    assert row[idx["tier"]] == C.NULL_CELL
+    assert row[idx["engine"]] == C.NULL_CELL
+    assert row[idx["align scale"]] == C.NULL_CELL
+
+
+def test_videos_list_long_two_renditions_is_a_count_not_a_tick(
+    db: Database, tmp_path: Path
+) -> None:
+    """`videos` is the one asset role allowed more than one; `audio` never
+    is (`C.SINGLETON_ASSET_ROLES`)."""
+    video_id = _add_local_video(db, tmp_path)
+    insert_asset(db, video_id=video_id, role="audio", path=str(tmp_path / "a.wav"))
+    insert_asset(
+        db, video_id=video_id, role="video", format_id="480p", path=str(tmp_path / "v1.mp4")
+    )
+    insert_asset(
+        db, video_id=video_id, role="video", format_id="720p", path=str(tmp_path / "v2.mp4")
+    )
+    row = catalog.videos_list(db, long=True).rows[0]
+    columns = catalog.videos_list(db, long=True).columns
+    idx = {name: i for i, name in enumerate(columns)}
+    assert row[idx["videos"]] == "2"
+    assert row[idx["audio"]] == C.CELL_TICK
+
+
+def test_videos_list_long_shows_the_best_tier_a_video_holds(
+    db: Database, tmp_path: Path
+) -> None:
+    """A video can hold caption-tier and a later transcriber's tier at once
+    (captions ingested, then a transcriber run); the column shows the best
+    one present, because that answers "can I cut this yet"."""
+    video_id = _add_local_video(db, tmp_path)
+    _insert_word(db, video_id, ord_=0, source="caption", engine="ytdlp-captions")
+    columns = catalog.videos_list(db, long=True).columns
+    idx = {name: i for i, name in enumerate(columns)}
+    row = catalog.videos_list(db, long=True).rows[0]
+    assert row[idx["tier"]] == "caption"
+    assert row[idx["aligned"]] == C.CELL_CROSS
+
+    _insert_word(db, video_id, ord_=1, source="timed", engine="whisper")
+    row = catalog.videos_list(db, long=True).rows[0]
+    assert row[idx["tier"]] == "timed"
+    assert row[idx["transcribed"]] == C.CELL_TICK
+    assert row[idx["aligned"]] == C.CELL_CROSS
+
+    _insert_word(
+        db, video_id, ord_=2, source="aligned", engine="whisper+wav2vec2",
+        align_scale="logprob",
+    )
+    row = catalog.videos_list(db, long=True).rows[0]
+    assert row[idx["tier"]] == "aligned"
+    assert row[idx["aligned"]] == C.CELL_TICK
+    assert row[idx["engine"]] == "whisper, whisper+wav2vec2, ytdlp-captions"
+    assert row[idx["align scale"]] == "logprob"
+
+
+def test_videos_list_long_aligned_is_a_tier_projection_not_a_readiness_call(
+    db: Database, tmp_path: Path
+) -> None:
+    """`align_readiness` is documented to never return `SATISFIED` — the
+    `align` job kind is `reopenable=False` and re-aligning is always offered
+    again — so the `aligned` cell is sourced from `words.source = 'aligned'`
+    (the same fact the `tier` column reports), not from that predicate."""
+    from rytp.jobs import Readiness
+    from rytp.transcribe.readiness import align_readiness
+
+    video_id = _add_local_video(db, tmp_path)
+    _insert_word(
+        db, video_id, ord_=0, source="aligned", engine="whisper+wav2vec2",
+        align_scale="unknown",
+    )
+    assert align_readiness(db, video_id) != Readiness.SATISFIED
+    row = catalog.videos_list(db, long=True).rows[0]
+    columns = catalog.videos_list(db, long=True).columns
+    idx = {name: i for i, name in enumerate(columns)}
+    assert row[idx["aligned"]] == C.CELL_TICK
+
+
+def test_videos_list_long_stage_columns_agree_with_the_readiness_predicates(
+    db: Database, tmp_path: Path
+) -> None:
+    """Assert against the registered predicates themselves, not a duplicated
+    rule — the whole point of entry 25 is one definition of "done"."""
+    from rytp.index.utterances import index_video
+    from rytp.jobs import JOB_KINDS, Readiness
+
+    video_id = _add_local_video(db, tmp_path)
+    _insert_word(db, video_id, ord_=0, source="timed", engine="whisper")
+    index_video(db, video_id)
+    db.conn.execute(
+        "INSERT INTO video_speakers (video_id, local_label, engine)"
+        " VALUES (?, 'SPEAKER_00', 'fake')",
+        (video_id,),
+    )
+
+    result = catalog.videos_list(db, long=True)
+    idx = {name: i for i, name in enumerate(result.columns)}
+    row = result.rows[0]
+
+    for column, kind_name in (
+        ("transcribed", "transcribe"),
+        ("indexed", "index"),
+        ("diarized", "diarize"),
+    ):
+        expected = (
+            C.CELL_TICK
+            if JOB_KINDS[kind_name].readiness(db, video_id) == Readiness.SATISFIED
+            else C.CELL_CROSS
+        )
+        assert row[idx[column]] == expected, column
 
 
 def test_format_duration_handles_none_and_hours() -> None:

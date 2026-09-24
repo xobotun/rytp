@@ -76,6 +76,27 @@ def test_gigaam_refuses_a_window_longer_than_its_per_call_cap(tmp_path: Path) ->
     assert "plan_chunks" in str(excinfo.value)
 
 
+def test_gigaam_defaults_to_auto_device_and_sends_it_to_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rytp.transcribe import engines as engines_module
+
+    seen: dict[str, object] = {}
+
+    def fake_run_child(**kwargs: object) -> dict[str, object]:
+        seen.update(kwargs)
+        return {"words": [], "device": "cuda"}
+
+    monkeypatch.setattr(engines_module.gigaam, "run_child", fake_run_child)
+    engine = GigaAMTranscriber(interpreter="/no/such/python")
+    assert engine.device == C.ENGINE_DEFAULT_DEVICE
+    list(engine.transcribe(tmp_path / "a.wav"))
+    assert seen["request"]["device"] == C.ENGINE_DEFAULT_DEVICE
+    # BUGS.md entry 34: the engine reports the concrete device the child
+    # actually used, not the request it sent.
+    assert engine.device == "cuda"
+
+
 def test_whisper_is_in_process_and_names_its_extra() -> None:
     assert FasterWhisperTranscriber.out_of_process is False
     assert FasterWhisperTranscriber.extra == "whisper"

@@ -42,6 +42,7 @@ DELETION_OWNERS: dict[str, str] = {
     "assemble": "assemble.remove",
     "render": "render.remove",
     "speakers": "speakers.remove",
+    "settings": "settings.unset",
 }
 
 #: Removals that delete files, and therefore must offer --dry-run and demand

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from rytp.commands import Command, CommandResult, Param
+from rytp.commands import Command, CommandResult, Param, leaf_name
 from rytp.db import Database, schema
 from rytp.models import NotFoundError
 from tests.test_config import child_env
@@ -213,6 +213,27 @@ def test_render_result_handles_each_shape() -> None:
     assert rendered.splitlines() == ["a    bb", "---  --", "1    2", "333  4"]
 
 
+def test_render_result_wraps_a_multiline_cell_under_its_own_column() -> None:
+    """BUGS.md entry 15: `transcript show --line-length` embeds newlines in
+    a cell. The column width and continuation lines must follow the
+    wrapped shape, not the raw string length — "whatever the table
+    decides" is exactly what the flag exists to stop."""
+    from rytp.cli import render_result
+
+    rendered = render_result(
+        CommandResult(
+            columns=("id", "text"),
+            rows=(("1", "line one\nline two"),),
+        )
+    )
+    assert rendered.splitlines() == [
+        "id  text",
+        "--  --------",
+        "1   line one",
+        "    line two",
+    ]
+
+
 def test_the_database_is_created_and_migrated_on_first_use(app, data_dir: Path) -> None:
     assert not (data_dir / "rytp.db").exists()
     assert runner.invoke(app, ["doctor"]).exit_code == 0
@@ -251,6 +272,77 @@ def test_importing_the_cli_creates_no_directories(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_a_group_heading_names_what_it_is_about_and_lists_its_commands(
+    data_dir: Path,
+) -> None:
+    """BUGS.md entry 6: "Commands in the videos group." said nothing. The
+    heading must say what the group is *about* and list its commands, so the
+    shape of the surface reads from `--help` alone."""
+    from rytp.cli import build_app
+
+    app = build_app(SAMPLE, group_summaries={"videos": "the local video catalog"})
+    result = runner.invoke(app, ["videos", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "the local video catalog" in result.stdout
+
+    # The listing itself is asserted against `_group_help` rather than the
+    # rendered page: rich wraps the panel at terminal width, so a joined
+    # string can be split across lines, and bare leaf names are too short
+    # to substring-match usefully ("add" matches half the page).
+    from rytp.cli import _group_help
+
+    help_text = _group_help(
+        "videos", [SAMPLE[name] for name in sorted(SAMPLE)
+                   if SAMPLE[name].group == "videos"],
+        {"videos": "the local video catalog"},
+    )
+    assert help_text.startswith("the local video catalog — ")
+    listing = help_text.split(" — ", 1)[1]
+    assert listing == ", ".join(
+        leaf_name(SAMPLE[name]) for name in sorted(SAMPLE)
+        if SAMPLE[name].group == "videos"
+    )
+    assert "videos " not in listing
+
+
+def test_a_group_with_no_summary_falls_back_to_the_bare_listing(
+    data_dir: Path,
+) -> None:
+    """The CLI itself never refuses to run over a missing entry — that is
+    `_validate`'s job at registration time; here it degrades gracefully."""
+    from rytp.cli import build_app
+
+    app = build_app(SAMPLE, group_summaries={})
+    result = runner.invoke(app, ["videos", "--help"])
+    assert result.exit_code == 0, result.output
+
+    # Asserted on the function, not the rendered page: leaf names alone are
+    # too short to substring-match ("add" matches half the help text).
+    from rytp.cli import _group_help
+
+    cmds = [SAMPLE[n] for n in sorted(SAMPLE) if SAMPLE[n].group == "videos"]
+    help_text = _group_help("videos", cmds, {})
+    assert " — " not in help_text            # no summary, so no dash
+    assert help_text == ", ".join(leaf_name(c) for c in cmds)
+
+
+def test_the_real_registry_describes_every_group_it_uses(data_dir: Path) -> None:
+    """No group ships with a blank heading (contracts §5, BUGS.md entry 6)."""
+    from rytp.cli import build_app
+    from rytp.commands import COMMANDS
+
+    app = build_app()
+    for cmd in COMMANDS.values():
+        if not cmd.group:
+            continue
+        result = runner.invoke(app, [cmd.group, "--help"])
+        assert result.exit_code == 0, result.output
+        assert " — " in result.stdout.replace("\n", " "), (
+            f"group {cmd.group!r} has no ' — ' separator between its "
+            "description and its command list"
+        )
+
+
 def test_bare_python_m_rytp_prints_help_and_exits_zero(tmp_path: Path) -> None:
     """Click exits 2 for a group with no arguments; `python -m rytp` must not."""
     proc = subprocess.run(
@@ -259,6 +351,9 @@ def test_bare_python_m_rytp_prints_help_and_exits_zero(tmp_path: Path) -> None:
         env=child_env(),
         capture_output=True,
         text=True,
+        # The CLI forces UTF-8 on its streams; decoding with the locale
+        # encoding fails on a cp1252 console and leaves stdout as None.
+        encoding="utf-8",
         check=False,
     )
     assert proc.returncode == 0, proc.stderr

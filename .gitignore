@@ -219,6 +219,7 @@ __marimo__/
 
 # rytp runtime data
 data/
+data_old/
 sample_inputs/
 yt-dlp.exe
 .rytp-manual/

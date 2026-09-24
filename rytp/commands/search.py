@@ -10,6 +10,7 @@ surface decides what it looks like.
 
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 
 from rytp import config
@@ -53,9 +54,28 @@ def index_build(db: Database, *, video: str | None = None, enqueue: bool = False
     derived from database state (design §5) — so this is also the repair
     command after a transcript is replaced or a video is diarized.
     """
-    targets = [resolve_video_id(db, video)] if video else videos_needing_index(db)
-    if not targets:
-        return CommandResult(message="nothing to index")
+    if video:
+        targets = [resolve_video_id(db, video)]
+    else:
+        targets = videos_needing_index(db)
+        if not targets:
+            # BUGS.md entry 4: say *why* there is nothing, and what to do
+            # next, rather than stopping at "nothing to index". The two
+            # cases read very differently to the person running it.
+            transcribed = int(
+                db.conn.execute(
+                    "SELECT COUNT(DISTINCT video_id) FROM words"
+                ).fetchone()[0]
+            )
+            if not transcribed:
+                return CommandResult(
+                    message="nothing to index: no video has been transcribed yet; "
+                    "run `rytp transcribe run <video>` first"
+                )
+            return CommandResult(
+                message=f"nothing to index: all {transcribed} transcribed video(s) "
+                "are already indexed"
+            )
     if enqueue:
         for target in targets:
             queue.enqueue(db, "index", target)
@@ -194,12 +214,20 @@ def index_drop(db: Database, *, video: str) -> CommandResult:
 
 
 def transcript_build(db: Database, *, video: str) -> CommandResult:
-    """Write `data/transcripts/{video_id}.md`."""
+    """Write `data/transcripts/{video_id}.md`.
+
+    No `--line-length`: unlike `transcript show`, this writes a durable
+    file, and a hard wrap would bake one terminal's width into a stored
+    artefact (BUGS.md entry 15). `transcript show` has the knob because
+    what it renders is thrown away the moment the command exits.
+    """
     video_id = resolve_video_id(db, video)
     return CommandResult(message=f"wrote {write_transcript(db, video_id)}")
 
 
-def transcript_show(db: Database, *, video: str) -> CommandResult:
+def transcript_show(
+    db: Database, *, video: str, line_length: int = C.TRANSCRIPT_DEFAULT_LINE_LENGTH
+) -> CommandResult:
     """The transcript as rows, without writing a file.
 
     `transcript.build` produces the durable markdown at
@@ -207,8 +235,15 @@ def transcript_show(db: Database, *, video: str) -> CommandResult:
     so the TUI can show a transcript and the CLI can read one without
     leaving a file behind. Both render from these rows, which is what
     keeps the two surfaces saying the same thing (design §10).
+
+    `line_length` wraps each block's text to a chosen width instead of
+    whatever the table happens to do with a long line (BUGS.md entry 15).
+    It applies only here: `transcript.build` writes a regenerable file, not
+    a terminal-sized rendering, so it has no equivalent knob.
     """
     video_id = resolve_video_id(db, video)
+    if line_length < 1:
+        raise RytpError(f"line_length must be at least 1, got {line_length}")
     blocks = transcript_blocks(db, video_id)
     if not blocks:
         raise RytpError(
@@ -223,7 +258,7 @@ def transcript_show(db: Database, *, video: str) -> CommandResult:
                 timestamp(block.start_ms),
                 timestamp(block.end_ms),
                 block.speaker,
-                block.text,
+                textwrap.fill(block.text, width=line_length),
             )
             for block in blocks
         ),
@@ -402,7 +437,9 @@ register(
     Command(
         name="transcript.build",
         group="transcript",
-        summary="Write the regenerable markdown transcript for one video.",
+        summary="Write the regenerable markdown transcript for one video. No "
+        "--line-length: a hard wrap would bake a terminal's width into the "
+        "stored file — see `transcript show` for that.",
         params=(
             Param("video", str, "Video to write a transcript for.", positional=True),
         ),
@@ -417,6 +454,15 @@ register(
         summary="Read a video's transcript as a table, without writing a file.",
         params=(
             Param("video", str, "Video to read.", positional=True),
+            Param(
+                "line_length",
+                int,
+                "Wrap each line of text to this many characters. Only here, "
+                "not on `transcript build`: that command writes a durable "
+                "markdown file, where a hard wrap would bake a terminal's "
+                "width into a stored artefact.",
+                default=C.TRANSCRIPT_DEFAULT_LINE_LENGTH,
+            ),
         ),
         handler=transcript_show,
     )

@@ -16,6 +16,7 @@ from tests.fake_engines import (
     FakeAligner,
     FakeTranscriber,
     MissingModuleTranscriber,
+    ScorelessAligner,
     registered,
 )
 from tests.synth_audio import concat, silence, tone, write_wav
@@ -216,6 +217,82 @@ def test_fingerprint_handler_stores_the_row(db: Database, tmp_path: Path) -> Non
         "SELECT COUNT(*) FROM video_acoustics WHERE video_id = ?", (video_id,)
     ).fetchone()[0]
     assert stored == 1
+
+
+def test_the_score_heading_names_the_energy_scale_for_an_unaligned_run(
+    db: Database, tmp_path: Path
+) -> None:
+    # BUGS.md entry 13: "median align score 1.00" on a `timed` run read as a
+    # perfect alignment. The heading now says what actually produced it.
+    video_id = _make_video(db)
+    with registered(FakeTranscriber):
+        result = resolve("transcribe.run").handler(
+            db, video=str(video_id), transcriber="fake", refine=True, wav=_wav(tmp_path)
+        )
+    assert result.columns[-1] == "median energy score"
+    assert result.rows[0][3] == "timed"
+
+
+def test_the_score_heading_names_the_logprob_scale_for_an_aligned_run(
+    db: Database, tmp_path: Path
+) -> None:
+    video_id = _make_video(db)
+    with registered(FakeTranscriber, FakeAligner):
+        result = resolve("transcribe.run").handler(
+            db,
+            video=str(video_id),
+            transcriber="fake",
+            aligner="fake-aligner",
+            wav=_wav(tmp_path),
+        )
+    assert result.columns[-1] == "median logprob score"
+    # The two headings must never be printed under one name (plan §1a).
+    assert result.columns[-1] != "median energy score"
+
+
+def test_the_score_heading_and_cell_are_blank_with_no_aligner_and_no_refine(
+    db: Database, tmp_path: Path
+) -> None:
+    video_id = _make_video(db)
+    with registered(FakeTranscriber):
+        result = resolve("transcribe.run").handler(
+            db, video=str(video_id), transcriber="fake", refine=False, wav=_wav(tmp_path)
+        )
+    assert result.columns[-1] == "median align score"
+    assert result.rows[0][-1] == "-"
+
+
+def test_align_handler_reports_the_logprob_heading_and_the_aligner_device(
+    db: Database, tmp_path: Path
+) -> None:
+    video_id = _make_video(db)
+    wav = _wav(tmp_path)
+    with registered(FakeTranscriber, FakeAligner):
+        resolve("transcribe.run").handler(db, video=str(video_id), transcriber="fake", wav=wav)
+        result = resolve("transcribe.align").handler(
+            db, video=str(video_id), aligner="fake-aligner", wav=wav
+        )
+    assert result.columns[-1] == "median logprob score"
+    assert "aligner device: cpu" in (result.message or "")
+
+
+def test_a_scoreless_aligner_run_leaves_the_heading_generic(
+    db: Database, tmp_path: Path
+) -> None:
+    # ScorelessAligner never scores anything, and refine is off, so no word
+    # ever gets a score at all — the `none` row of plan §1a's table.
+    video_id = _make_video(db)
+    with registered(FakeTranscriber, ScorelessAligner):
+        result = resolve("transcribe.run").handler(
+            db,
+            video=str(video_id),
+            transcriber="fake",
+            aligner="fake-scoreless-aligner",
+            refine=False,
+            wav=_wav(tmp_path),
+        )
+    assert result.columns[-1] == "median align score"
+    assert result.rows[0][-1] == "-"
 
 
 def test_a_missing_wav_is_a_domain_error_not_a_traceback(db: Database) -> None:

@@ -10,6 +10,7 @@ import pytest
 
 from rytp.db import Database
 from rytp.diarize import base
+from rytp.models import RytpError
 from rytp.transcribe.base import EngineUnavailable
 from tests.fake_speaker_engines import (
     FakeDiarizer,
@@ -29,6 +30,15 @@ def test_resolve_unknown_diarizer_names_the_available_ones() -> None:
         base.resolve_diarizer("nope")
     assert "nope" in str(excinfo.value)
     assert "fake-diarizer" in str(excinfo.value)
+
+
+def test_resolve_unknown_diarizer_is_also_a_rytp_error() -> None:
+    # BUGS.md entry 16: `speakers diarize 1 --diarizer pyannot` printed a
+    # ~60-line traceback because a bare ValueError escaped the CLI's
+    # `except RytpError` funnel. The raised type has to satisfy both.
+    with registered(FakeDiarizer), pytest.raises(RytpError) as excinfo:
+        base.resolve_diarizer("nope")
+    assert isinstance(excinfo.value, ValueError)
 
 
 def test_gate_rejects_a_token_engine_before_construction(

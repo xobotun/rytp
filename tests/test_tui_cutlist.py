@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from rytp import config
 from rytp import constants as C
 from rytp.assemble.cutlist import (
     Alternative,
@@ -16,7 +17,9 @@ from rytp.assemble.cutlist import (
     load_cutlist,
     write_cutlist,
 )
+from rytp.audio.extract import wav_path
 from rytp.tui.cutlist_view import CutlistView, available_cutlists
+from tests.synth_audio import tone_gap_tone, write_wav
 
 CREATED = "2026-09-21T09:00:00+00:00"
 PARAMS = CutlistParams(
@@ -219,6 +222,96 @@ def test_a_gap_slot_has_no_boundary_to_nudge(written: Path) -> None:
     assert "gap" in view.nudge(1, edge="start", delta_ms=40).lower()
 
 
+def test_the_shift_step_is_the_coarse_constant(written: Path) -> None:
+    """BUGS.md entry 30: Shift is coarser, not finer — a wrong fragment is
+    usually wrong by a syllable, not by a millisecond."""
+    view = CutlistView(written)
+    view.nudge(0, edge="start", delta_ms=-C.TUI_CUTLIST_SHIFT_NUDGE_MS)
+    slot = view.slot_at(0)
+    assert slot is not None
+    assert slot.start_ms == 612_340 - C.TUI_CUTLIST_SHIFT_NUDGE_MS
+
+
+# --- the snap-to-clean-boundary key (BUGS.md entry 30) -------------------
+
+
+def wav_for(video_id: int, data_dir: object) -> tuple[int, int]:
+    """Write a synthesised WAV to the cache path `snap` reads, and return the
+    measured silence's `(gap_start_ms, gap_end_ms)` — the interval a snap is
+    required to land in."""
+    samples, gap_start, gap_end = tone_gap_tone(lead_ms=200, gap_ms=120, tail_ms=200)
+    path = wav_path(video_id)
+    config.ensure_dir(path.parent)
+    write_wav(path, samples)
+    return gap_start, gap_end
+
+
+def cutlist_with_boundary_near(video_id: int, end_ms: int) -> CutList:
+    return CutList(
+        schema_version=C.CUTLIST_SCHEMA_VERSION,
+        name="snap-demo",
+        target="слово",
+        created_at=CREATED,
+        params=PARAMS,
+        slots=(
+            Slot(
+                kind="fragment",
+                target_first=0,
+                target_last=0,
+                text="слово",
+                video_id=video_id,
+                first_word_ord=0,
+                last_word_ord=0,
+                start_ms=0,
+                end_ms=end_ms,
+            ),
+        ),
+    )
+
+
+def test_the_snap_key_moves_the_boundary_into_the_measured_silence(
+    data_dir: object, tmp_path: Path
+) -> None:
+    gap_start, gap_end = wav_for(101, data_dir)
+    path = write_cutlist(cutlist_with_boundary_near(101, 230), tmp_path / "snap.toml")
+    view = CutlistView(path)
+    message = view.snap(0, edge="end")
+    slot = view.slot_at(0)
+    assert slot is not None
+    assert gap_start <= slot.end_ms <= gap_end
+    assert "snapped" in message.lower()
+
+
+def test_snapping_twice_is_a_no_op_the_second_time(
+    data_dir: object, tmp_path: Path
+) -> None:
+    wav_for(102, data_dir)
+    path = write_cutlist(cutlist_with_boundary_near(102, 230), tmp_path / "snap2.toml")
+    view = CutlistView(path)
+    view.snap(0, edge="end")
+    moved = view.slot_at(0)
+    assert moved is not None
+    message = view.snap(0, edge="end")
+    assert "already" in message.lower()
+    assert view.slot_at(0) == moved
+
+
+def test_snapping_with_no_cached_audio_says_so_instead_of_crashing(
+    data_dir: object, tmp_path: Path
+) -> None:
+    path = write_cutlist(cutlist_with_boundary_near(999, 230), tmp_path / "snap3.toml")
+    view = CutlistView(path)
+    message = view.snap(0, edge="end")
+    assert "no cached audio" in message.lower()
+    slot = view.slot_at(0)
+    assert slot is not None and slot.end_ms == 230
+
+
+def test_snapping_a_gap_has_no_boundary_either(written: Path) -> None:
+    view = CutlistView(written)
+    assert "gap" in view.snap(1, edge="start").lower()
+
+
 def test_setting_a_pause_writes_the_key_the_renderer_reads(written: Path) -> None:
     """design §9's gap is "Configurable… Disableable if it doesn't sound
     right", and contracts §7's cut list carries `gap_before_ms` for exactly
@@ -336,7 +429,7 @@ from collections.abc import Awaitable, Callable  # noqa: E402
 from typing import Any  # noqa: E402
 
 from textual.app import App, ComposeResult  # noqa: E402
-from textual.widgets import DataTable, Static  # noqa: E402
+from textual.widgets import DataTable, Footer, Static  # noqa: E402
 
 from rytp.db import Database  # noqa: E402
 from rytp.tui.screens.cutlist import CutlistPickerScreen, CutlistScreen  # noqa: E402
@@ -420,6 +513,133 @@ def test_the_bracket_keys_move_the_boundaries(db: Database, written: Path) -> No
         assert slot is not None and slot.start_ms < 612_340
 
     drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_shift_bracket_moves_by_the_coarse_step(db: Database, written: Path) -> None:
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("shift+[")
+        await pilot.pause()
+        slot = screen.view.slot_at(0)
+        assert slot is not None
+        assert slot.start_ms == 612_340 - C.TUI_CUTLIST_SHIFT_NUDGE_MS
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_ctrl_shift_arrow_moves_the_end_by_the_coarse_step(
+    db: Database, written: Path
+) -> None:
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("ctrl+shift+right")
+        await pilot.pause()
+        slot = screen.view.slot_at(0)
+        assert slot is not None
+        assert slot.end_ms == 613_100 + C.TUI_CUTLIST_SHIFT_NUDGE_MS
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_snap_key_reaches_the_view(db: Database, written: Path) -> None:
+    """No cached audio for `written`'s video 3, so this exercises the no-op
+    path rather than a real snap — the screen-level contract is only that
+    `z` reaches `CutlistView.snap`, not the measurement itself (covered at
+    the view level with a synthesised waveform)."""
+
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("z")
+        await pilot.pause()
+        status = str(screen.query_one("#cutlist-status", Static).content)
+        assert "no cached audio" in status.lower()
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_help_key_opens_the_help_screen(db: Database, written: Path) -> None:
+    """`?` is this screen's shortcut to the same help screen F1 already
+    opens app-wide (`RytpApp.action_help`) — the smallest honest way to point
+    at the full binding list once the footer stops showing it.
+
+    Driven through the real `RytpApp`, not the bare `drive()` harness: `?`
+    resolves to `app.help`, and only the real app defines `action_help`."""
+    from rytp.tui.app import RytpApp
+    from rytp.tui.screens.help import HelpScreen
+
+    async def main() -> None:
+        app = RytpApp(db)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(CutlistScreen(db, written))
+            await pilot.pause()
+            await pilot.press("?")
+            await pilot.pause()
+            assert isinstance(app.screen, HelpScreen)
+
+    asyncio.run(main())
+
+
+def test_the_screens_own_footer_keys_fit_an_80_column_terminal(
+    db: Database, written: Path
+) -> None:
+    """BUGS.md entry 29: twelve keys used to run the footer off the end of
+    an 80-column line. Most are `show=False` now.
+
+    Measured against this screen's own `BINDINGS` in isolation, on a bare
+    harness with none of the app's own bindings — see
+    `test_this_screens_own_contribution_to_the_running_apps_footer` below for
+    why that isolation matters and what it does not cover.
+    """
+    from textual.widgets._footer import FooterKey
+
+    async def body(screen: Any, pilot: Any) -> None:
+        footer = screen.query_one(Footer)
+        keys = list(footer.query(FooterKey))
+        assert keys, "the footer should show at least the handful of constant keys"
+        total_width = sum(key.outer_size.width for key in keys)
+        assert total_width <= 80, f"footer is {total_width} columns wide, keys={keys}"
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_this_screens_own_contribution_to_the_running_apps_footer(
+    db: Database, written: Path
+) -> None:
+    """The bare-harness measurement above is honest about this screen's own
+    `BINDINGS`, but the real app's footer also always carries the F1-F8
+    navigation strip and the Ctrl+P command-palette key (`rytp/tui/app.py`,
+    `binding_rows()` in `rytp/tui/navigation.py`) — neither file is this
+    task's to touch, and measured against the real `RytpApp` that baseline
+    alone is already wider than 80 columns, before this screen renders
+    anything. BUGS.md entry 29 was scoped to *this* screen's twelve keys; the
+    app-level strip is a second, separate overflow that Task 13 cannot fix
+    from its own files — the QA batch plan hands it to Task 17 ("the footer
+    lesson").
+
+    What this task does control, and what this test pins, is that *this*
+    screen adds only a small, constant amount on top of whatever the app
+    already carries — not the twelve-plus keys' worth it used to.
+    """
+    from textual.widgets._footer import FooterKey
+
+    from rytp.tui.app import RytpApp
+
+    async def main() -> None:
+        app = RytpApp(db)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            baseline = sum(
+                key.outer_size.width
+                for key in app.screen.query_one(Footer).query(FooterKey)
+            )
+            app.push_screen(CutlistScreen(db, written))
+            await pilot.pause()
+            with_screen = sum(
+                key.outer_size.width
+                for key in app.screen.query_one(Footer).query(FooterKey)
+            )
+        added = with_screen - baseline
+        assert 0 < added <= 60, f"this screen added {added} footer columns"
+
+    asyncio.run(main())
 
 
 def test_undo_is_one_key(db: Database, written: Path) -> None:

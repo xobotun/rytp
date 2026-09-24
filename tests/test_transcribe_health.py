@@ -115,3 +115,79 @@ def test_probing_imports_no_engine_dependency(db: Database) -> None:
     for check in HEALTH_CHECKS.values():
         check.run(db)
     assert not {"torch", "transformers", "faster_whisper", "gigaam"} & set(sys.modules)
+
+
+# -- entries 7, 33: the probe replaces the module-blind "interpreter ok" ----
+
+
+def test_an_out_of_process_engine_with_a_missing_module_is_no_longer_falsely_ready(
+    db: Database,
+) -> None:
+    # BUGS.md entry 7, confirmed on the real machine: gigaam, wav2vec2 and
+    # pyannote all said "interpreter ok" and none of them could run.
+    health.register_transcribe_checks()
+    result = health.engine_check(db, GigaAMTranscriber)
+    assert result.ok is False
+    assert "interpreter ok" not in result.detail
+    assert result.remedy is not None
+
+
+def test_the_cuda_fact_is_paired_with_the_module_fact(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BUGS.md entry 33: doctor already found the 3080; this pairs that fact
+    # with the per-engine module check instead of leaving it silent.
+    def fake_cuda_fact(_db: Database, _cls: object) -> dict[str, object]:
+        return {
+            "module_ok": True,
+            "module_error": "",
+            "torch": "2.4.0+cpu",
+            "cuda_available": False,
+            "device": "cpu",
+        }
+
+    monkeypatch.setattr(health, "_cuda_fact", fake_cuda_fact)
+    monkeypatch.setattr(health, "availability", lambda db, cls: "ready")
+    result = health.engine_check(db, GigaAMTranscriber)
+    assert result.ok is True
+    assert "no CUDA" in result.detail
+    assert "cu124" in (result.remedy or "")
+
+
+def test_no_cuda_fact_is_added_when_torch_is_entirely_absent(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_cuda_fact(_db: Database, _cls: object) -> dict[str, object]:
+        return {
+            "module_ok": False,
+            "module_error": "ModuleNotFoundError: no module named 'gigaam'",
+            "torch": None,
+            "cuda_available": None,
+            "device": "cpu",
+        }
+
+    monkeypatch.setattr(health, "_cuda_fact", fake_cuda_fact)
+    result = health.engine_check(db, GigaAMTranscriber)
+    assert "CUDA" not in result.detail
+
+
+# -- entry 11: the Hugging Face symlink advisory ----------------------------
+
+
+def test_hf_cache_check_is_registered_and_advisory() -> None:
+    health.register_transcribe_checks()
+    assert "hf-cache" in HEALTH_CHECKS
+    assert HEALTH_CHECKS["hf-cache"].required is False
+
+
+def test_hf_cache_check_reports_the_symlink_fact_honestly(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(health, "_symlinks_supported", lambda: True)
+    assert health.hf_cache_check(db).ok is True
+
+    monkeypatch.setattr(health, "_symlinks_supported", lambda: False)
+    result = health.hf_cache_check(db)
+    assert result.ok is False
+    assert result.remedy is not None
+    assert "disk" in result.detail

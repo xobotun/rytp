@@ -20,6 +20,7 @@ from textual.widgets import DataTable, Footer, Header, Static
 from rytp.commands import resolve
 from rytp.index.utterances import indexed_videos
 from rytp.models import RytpError
+from rytp.tui.text import plain_row, set_text
 
 if TYPE_CHECKING:
     from rytp.db import Database
@@ -32,7 +33,7 @@ def _fill(table: DataTable, columns: tuple[str, ...], rows: list[tuple[str, ...]
     table.clear(columns=True)
     table.add_columns(*columns)
     for row in rows:
-        table.add_row(*row)
+        table.add_row(*plain_row(row))
 
 
 class TranscriptScreen(Screen[None]):
@@ -68,11 +69,11 @@ class TranscriptScreen(Screen[None]):
             # A TUI that raises on a normal mistake — an unindexed video —
             # is worse than one that says what to do about it.
             _fill(table, ("anchor",), [])
-            status.update(str(exc))
+            set_text(status, str(exc))
             return
         _fill(table, result.columns, list(result.rows))
         title = self._title()
-        status.update(f"{title} — {result.message}" if title else (result.message or ""))
+        set_text(status, f"{title} — {result.message}" if title else (result.message or ""))
 
     def _title(self) -> str:
         row = self._db.conn.execute(
@@ -109,10 +110,11 @@ class TranscriptVideosScreen(Screen[None]):
             ("id", "title", "blocks"),
             [(str(video_id), title, str(count)) for video_id, title, count in rows],
         )
-        self.query_one("#transcript-videos-status", Static).update(
+        set_text(
+            self.query_one("#transcript-videos-status", Static),
             f"{len(rows)} indexed video{'' if len(rows) == 1 else 's'}"
             if rows
-            else "nothing indexed yet — run `rytp index build`"
+            else "nothing indexed yet — run `rytp index build`",
         )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:

@@ -28,7 +28,7 @@ from rytp import constants as C
 from rytp.models import RawWord, RytpError
 from rytp.transcribe.base import slice_wav_window
 from rytp.transcribe.registry import register_transcriber
-from rytp.transcribe.subproc import run_child
+from rytp.transcribe.subproc import resolve_device, run_child
 
 
 def words_from_gigaam(result: dict[str, Any], offset_ms: int) -> list[dict[str, Any]]:
@@ -59,10 +59,24 @@ class GigaAMTranscriber:
     required_module = "gigaam"
     extra = "gigaam"
     max_window_ms = C.VAD_CHUNK_MAX_MS
+    #: Class-level default (plan §1b, contracts §6). An instance's own
+    #: ``device`` starts as whatever was requested and, after the first
+    #: call, holds the concrete device the child actually used.
+    device = C.ENGINE_DEFAULT_DEVICE
 
-    def __init__(self, interpreter: str, model: str = C.GIGAAM_DEFAULT_MODEL) -> None:
+    def __init__(
+        self,
+        interpreter: str,
+        model: str = C.GIGAAM_DEFAULT_MODEL,
+        device: str = C.ENGINE_DEFAULT_DEVICE,
+    ) -> None:
         self._interpreter = interpreter
         self._model = model
+        #: Requested device, then — once a call has returned — the concrete
+        #: device that call actually used. Callers read this rather than
+        #: re-deriving it, so a foreground result and a queued job's note
+        #: both say what ran (BUGS.md entry 34).
+        self.device = device
 
     def transcribe(
         self,
@@ -85,8 +99,10 @@ class GigaAMTranscriber:
                 "model": self._model,
                 "start_ms": start_ms,
                 "end_ms": end_ms,
+                "device": self.device,
             },
         )
+        self.device = str(result.get("device") or self.device)
         return [
             RawWord(
                 start_ms=int(word["start_ms"]),
@@ -99,17 +115,24 @@ class GigaAMTranscriber:
 
 
 def child_main(request: dict[str, Any]) -> dict[str, Any]:
-    """Runs inside gigaam's own interpreter. The only import of the library."""
+    """Runs inside gigaam's own interpreter. The only import of the library.
+
+    **Verify the ``device`` kwarg per installed version** (module docstring):
+    ``load_model``'s documented signature accepts it; if the installed
+    version spells device placement differently, this function — and only
+    this function — is what changes.
+    """
     import tempfile
 
     import gigaam
 
+    device = resolve_device(str(request.get("device") or C.ENGINE_DEFAULT_DEVICE))
     start_ms = int(request["start_ms"])
     end_ms = request["end_ms"]
     with tempfile.TemporaryDirectory(prefix="rytp-gigaam-") as tmp:
         window = slice_wav_window(
             Path(request["audio"]), Path(tmp) / "window.wav", start_ms, end_ms
         )
-        model = gigaam.load_model(request["model"])
+        model = gigaam.load_model(request["model"], device=device)
         result = model.transcribe(str(window))
-    return {"words": words_from_gigaam(dict(result), start_ms)}
+    return {"words": words_from_gigaam(dict(result), start_ms), "device": device}

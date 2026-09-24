@@ -50,6 +50,7 @@ CONTRACT_INDEXES = {
     "words_video_ord",
     "words_normalized",
     "words_alignable",
+    "words_timed",
     "words_stem",
     "words_speaker",
     "utterances_video",
@@ -92,6 +93,41 @@ def test_migrations_are_contiguous_and_nobody_renumbered(db: Database) -> None:
     versions = [version for version, _sql in MIGRATIONS]
     assert versions == list(range(1, len(versions) + 1)), versions
     assert db.schema_version() == versions[-1]
+
+
+def _columns(db: Database, table: str) -> set[str]:
+    return {row["name"] for row in db.conn.execute(f"PRAGMA table_info({table})")}
+
+
+def test_words_declares_align_scale(db: Database) -> None:
+    """Contracts §3 (amended): `words.align_scale`, gained by migration 13."""
+    assert "align_scale" in _columns(db, "words")
+
+
+def test_jobs_declares_progress(db: Database) -> None:
+    """Contracts §3 (amended): `jobs.progress`, gained by migration 14 —
+    distinct from `jobs.note` (contracts §5 "Job handlers")."""
+    assert "progress" in _columns(db, "jobs")
+
+
+def test_align_scales_constant_matches_the_contracts_comment(db: Database) -> None:
+    """contracts §3's `words` DDL block names the permitted `align_scale`
+    values in a comment: "The scale that produced align_score: 'energy' |
+    'logprob' | 'none' | 'unknown'." Parse the comment itself rather than
+    asserting a hardcoded set twice, so the two can only agree by actually
+    matching."""
+    from rytp import constants as C
+
+    contracts_path = (
+        repo_root() / "docs" / "superpowers" / "specs" / "2026-09-21-rytp-contracts.md"
+    )
+    text = contracts_path.read_text(encoding="utf-8")
+    match = re.search(
+        r"The scale that produced align_score:(.*?)\.", text, re.DOTALL
+    )
+    assert match, "contracts §3 no longer names the align_scale values in this comment"
+    named = set(re.findall(r"'(\w+)'", match.group(1)))
+    assert named == set(C.ALIGN_SCALES)
 
 
 def test_the_three_transcript_tiers_are_enforced_by_the_database(db: Database) -> None:

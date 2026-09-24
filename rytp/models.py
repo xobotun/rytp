@@ -30,6 +30,7 @@ __all__ = [
     "RawWord",
     "RytpError",
     "Span",
+    "UnknownEngineError",
     "normalize_text",
     "stem_text",
     "utc_now_iso",
@@ -51,6 +52,20 @@ class NotFoundError(RytpError):
 
 class InvalidInputError(RytpError):
     """Arguments were well-formed but wrong (bad enum value, empty id)."""
+
+
+class UnknownEngineError(RytpError, ValueError):
+    """``resolve_transcriber`` / ``resolve_aligner`` / ``resolve_diarizer`` found no such name.
+
+    Contracts §6, amendment 5 (`docs/superpowers/2026-09-25-contracts-amendments.md`):
+    the dual inheritance is deliberate, not decorative. ``ValueError`` keeps
+    contracts §6's "raises ``ValueError``" wording literally true and lets a
+    caller that already catches ``ValueError`` keep working unchanged.
+    ``RytpError`` is what the CLI funnel (§8) catches to print one line and
+    exit 1 instead of the ~60-line traceback a bare ``ValueError`` produced
+    (BUGS.md entry 16). A caller may catch either base and get the same
+    exception.
+    """
 
 
 @dataclass(frozen=True)

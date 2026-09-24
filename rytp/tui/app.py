@@ -31,6 +31,7 @@ from rytp.tui.palette import (
     palette_entries,
     parse_arguments,
 )
+from rytp.tui.text import plain_row, set_text
 
 __all__ = ["RytpApp", "run_tui"]
 
@@ -150,12 +151,12 @@ class RytpApp(App[None]):
         if result.columns:
             table.add_columns(*result.columns)
             for row in result.rows:
-                table.add_row(*row)
+                table.add_row(*plain_row(row))
         self.set_status(result.message or f"{len(result.rows)} rows")
 
     def set_status(self, text: str) -> None:
         self.status_text = text
-        self.query_one("#status", Static).update(text)
+        set_text(self.query_one("#status", Static), text)
 
     # -- events ------------------------------------------------------
 

@@ -6,7 +6,9 @@ by whatever the TUI grows into. ``cli_only`` commands are filtered out
 here, in one place, rather than in the Textual layer.
 
 Arguments are typed as ``name=value``, with leading bare words filling
-the positional parameters in order. That is enough for the catalog
+the positional parameters in order; ``--name``, ``--name=value`` and
+``--no-name`` are accepted as synonyms of the named form, for a user
+who spent the day in the CLI (entry 24). That is enough for the catalog
 commands and keeps the surface honest — there is exactly one definition
 of what a command takes, and the TUI reads it rather than restating it.
 """
@@ -113,11 +115,47 @@ def _convert(param: Param, raw: str) -> Any:
         ) from exc
 
 
+def _tokenize(cmd: Command, text: str) -> list[str]:
+    """Split a typed argument line the way a shell would, minus escaping.
+
+    Plain POSIX-mode ``shlex`` (its default ``escape``) would treat backslash as
+    an escape character, silently mangling an unquoted Windows path such as
+    ``D:\\Work\\file.mp4`` into ``D:Workfile.mp4`` (entry 21) — wrong rather
+    than refused, and on the target platform's most natural input. Plain
+    non-POSIX ``shlex`` (``posix=False``) avoids that, but its quoted state
+    is entered only from whitespace, never mid-token, so it cannot handle
+    ``name="value with spaces"`` — a form that worked before entry 21 was
+    ever a problem. Emptying ``escape`` on an otherwise-POSIX lexer keeps
+    both: POSIX mode enters quoted state mid-token (``name="a b"`` and
+    ``"a b"`` both parse to one token, quotes stripped), and no character
+    is treated as an escape, so backslashes survive untouched.
+    """
+    lexer = shlex.shlex(text, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError as exc:
+        # Unbalanced quote (`shlex` raises a bare `ValueError`) — funnel it
+        # through the same one-line error channel as every other rejected
+        # argument line, rather than letting it become a traceback (the
+        # class of defect in BUGS.md entry 16).
+        raise InvalidInputError(f"{cmd.name}: {exc}: {usage_line(cmd)}") from exc
+
+
 def parse_arguments(cmd: Command, text: str) -> dict[str, Any]:
     """Turn a typed argument line into the handler's keyword arguments.
 
-    Bare words fill positional parameters in order; ``name=value`` sets
-    a named one. Missing optional parameters take their declared default.
+    Bare words fill positional parameters in order; ``name=value`` sets a
+    named one. ``--name``, ``--name=value`` and ``--no-name`` are accepted
+    as synonyms for the CLI user who types the flag spelling instead
+    (entry 24) — ``--name`` on a boolean means ``true``, ``--no-name``
+    means ``false``, and ``--name`` on any other parameter takes the next
+    token as its value. Missing optional parameters take their declared
+    default.
+
+    See :func:`_tokenize` for how the line is split (entry 21).
     """
     by_name = {param.name: param for param in cmd.params}
     # `global_speaker=…` is `speaker=…` (contracts §5, PARAM_ALIASES).
@@ -131,7 +169,52 @@ def parse_arguments(cmd: Command, text: str) -> dict[str, Any]:
     values: dict[str, Any] = {}
     next_positional = 0
 
-    for token in shlex.split(text):
+    tokens = _tokenize(cmd, text)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+
+        if token.startswith("--") and len(token) > 2:
+            body = token[2:]
+            flag_name, flag_sep, flag_value = body.partition("=")
+            normalized = flag_name.replace("-", "_")
+            negate = False
+            lookup = normalized
+            if (
+                not flag_sep
+                and normalized.startswith("no_")
+                and normalized not in by_name
+                and normalized[3:] in by_name
+                and by_name[normalized[3:]].type is bool
+            ):
+                negate = True
+                lookup = normalized[3:]
+            param = by_name.get(lookup)
+            if param is None:
+                raise InvalidInputError(
+                    f"{cmd.name} has no parameter {flag_name!r}: {usage_line(cmd)}"
+                )
+            if negate:
+                raw = "false"
+            elif flag_sep:
+                raw = flag_value
+            elif param.type is bool:
+                raw = "true"
+            else:
+                if index >= len(tokens):
+                    raise InvalidInputError(
+                        f"--{flag_name} needs a value: {usage_line(cmd)}"
+                    )
+                raw = tokens[index]
+                index += 1
+            if param.choices is not None and raw not in param.choices:
+                raise InvalidInputError(
+                    f"{param.name} must be one of: {', '.join(param.choices)}"
+                )
+            values[param.name] = _convert(param, raw)
+            continue
+
         name, sep, raw = token.partition("=")
         # A token counts as `name=value` only when the left side looks
         # like a parameter name. URLs contain '=' too, and a query string

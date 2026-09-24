@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rytp import constants as C
+from rytp.models import UnknownEngineError
 from rytp.transcribe.base import Aligner, EngineUnavailable, Transcriber
 
 if TYPE_CHECKING:
@@ -51,21 +53,31 @@ def register_aligner(cls: type[Aligner]) -> type[Aligner]:
 
 
 def resolve_transcriber(name: str) -> type[Transcriber]:
-    """Look up a transcriber class. Raises ``ValueError`` naming the alternatives."""
+    """Look up a transcriber class.
+
+    Raises :class:`~rytp.models.UnknownEngineError`, which is both a
+    ``ValueError`` (contracts §6's wording) and a ``RytpError`` (so the CLI
+    funnel prints one line and exits 1 instead of a traceback — BUGS.md
+    entry 16).
+    """
     try:
         return TRANSCRIBERS[name]
     except KeyError:
         available = ", ".join(sorted(TRANSCRIBERS)) or "(none registered)"
-        raise ValueError(f"unknown transcriber {name!r}; available: {available}") from None
+        raise UnknownEngineError(
+            f"unknown transcriber {name!r}; available: {available}"
+        ) from None
 
 
 def resolve_aligner(name: str) -> type[Aligner]:
-    """Look up an aligner class. Raises ``ValueError`` naming the alternatives."""
+    """Look up an aligner class. Raises :class:`~rytp.models.UnknownEngineError`."""
     try:
         return ALIGNERS[name]
     except KeyError:
         available = ", ".join(sorted(ALIGNERS)) or "(none registered)"
-        raise ValueError(f"unknown aligner {name!r}; available: {available}") from None
+        raise UnknownEngineError(
+            f"unknown aligner {name!r}; available: {available}"
+        ) from None
 
 
 def _hf_token() -> str | None:
@@ -79,19 +91,91 @@ def _module_present(module: str) -> bool:
         return False
 
 
-def check_available(cls: EngineClass) -> None:
+def _binary_present(interpreter: str, name: str) -> bool:
+    """Whether the ``name`` executable can actually be found (BUGS.md entry 7).
+
+    Checked beside the configured interpreter first — the same place a real
+    run resolves it (``align/mfa.py``'s ``mfa_binary``) — then on ``PATH``.
+    Portable: ``shutil.which`` walks ``PATHEXT`` on Windows by itself, so only
+    the beside-interpreter guess needs the explicit ``.exe`` suffix.
+    """
+    exe_name = f"{name}.exe" if os.name == "nt" else name
+    beside = Path(interpreter).parent / exe_name
+    if beside.exists():
+        return True
+    return shutil.which(name) is not None
+
+
+#: Cached probe results, keyed by ``(interpreter, required_module)``, for the
+#: life of the process (BUGS.md entry 7: ``transcribe engines`` lists six
+#: engines and must not spawn six processes twice — nor, since `doctor` asks
+#: the same question again for the CUDA fact, twelve). Tests that fake
+#: :func:`rytp.transcribe.subproc.probe` must also clear this dict, or a
+#: faked result leaks into a later, unrelated test.
+_PROBE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def probe_engine(interpreter: str, module: str, required_module: str) -> dict[str, Any]:
+    """Cached wrapper around :func:`rytp.transcribe.subproc.probe`.
+
+    ``module`` is the engine adapter's own dotted path (may be ``""`` when
+    unknown to the caller); ``required_module`` is the third-party dependency
+    actually being asked about, and is what keys the cache — two engines that
+    both need ``torch`` under the same interpreter share one child process.
+    """
+    key = (interpreter, required_module)
+    cached = _PROBE_CACHE.get(key)
+    if cached is None:
+        from rytp.transcribe.subproc import probe
+
+        cached = probe(interpreter, module, required_module)
+        _PROBE_CACHE[key] = cached
+    return cached
+
+
+def check_available(cls: EngineClass, *, interpreter: str | None = None) -> None:
     """Raise :class:`EngineUnavailable` if this engine cannot run on this machine.
 
-    Checked against the class, never an instance. An out-of-process engine's
-    dependency lives in another interpreter, so ``find_spec`` here would be
-    meaningless and is skipped.
+    Checked against the class, never an instance. An in-process engine's
+    dependency is checked with ``find_spec`` in this interpreter. An
+    out-of-process engine's dependency lives in another interpreter, so
+    ``find_spec`` here would be meaningless (BUGS.md entry 7) — pass its
+    resolved ``interpreter`` (:func:`interpreter_for`) and the *actual* child
+    is probed instead. Every call site in this codebase passes one; a future
+    caller with no interpreter to hand gets today's weaker, module-blind
+    check rather than a crash — this keyword defaults to ``None`` rather
+    than being required, precisely so that stays true.
     """
     if getattr(cls, "requires_hf_token", False) and not _hf_token():
         raise EngineUnavailable(
             f"engine {cls.name!r} needs a Hugging Face token; set HF_TOKEN"
         )
     module = getattr(cls, "required_module", None)
-    if module and not getattr(cls, "out_of_process", False) and not _module_present(module):
+    if not module:
+        binary = getattr(cls, "required_binary", None)
+        if not binary or not getattr(cls, "out_of_process", False) or interpreter is None:
+            return
+        if not _binary_present(interpreter, binary):
+            extra = getattr(cls, "extra", None) or cls.name
+            raise EngineUnavailable(
+                f"engine {cls.name!r} needs the {binary!r} binary; it installs "
+                f"via conda, not pip — e.g. `conda install -c conda-forge "
+                f"montreal-forced-aligner` in the environment named by the "
+                f"{extra!r} interpreter setting"
+            )
+        return
+    if getattr(cls, "out_of_process", False):
+        if interpreter is None:
+            return
+        result = probe_engine(interpreter, "", module)
+        if not result.get("module_ok"):
+            extra = getattr(cls, "extra", None) or cls.name
+            reason = result.get("module_error") or f"{module!r} did not import"
+            raise EngineUnavailable(
+                f'install the {extra} extra: pip install -e ".[{extra}]" ({reason})'
+            )
+        return
+    if not _module_present(module):
         extra = getattr(cls, "extra", None) or cls.name
         raise EngineUnavailable(
             f"engine {cls.name!r} needs {module!r}: pip install rytp[{extra}]"
@@ -146,28 +230,59 @@ def interpreter_for(db: Database, name: str) -> str:
 def load_transcriber(db: Database, name: str, **kwargs: Any) -> Transcriber:
     """Resolve, gate, and construct a transcriber."""
     cls = resolve_transcriber(name)
-    check_available(cls)
-    if getattr(cls, "out_of_process", False):
-        kwargs.setdefault("interpreter", interpreter_for(db, name))
+    interpreter = interpreter_for(db, name) if getattr(cls, "out_of_process", False) else None
+    check_available(cls, interpreter=interpreter)
+    if interpreter is not None:
+        kwargs.setdefault("interpreter", interpreter)
     return cls(**kwargs)
 
 
 def load_aligner(db: Database, name: str, **kwargs: Any) -> Aligner:
     """Resolve, gate, and construct an aligner."""
     cls = resolve_aligner(name)
-    check_available(cls)
-    if getattr(cls, "out_of_process", False):
-        kwargs.setdefault("interpreter", interpreter_for(db, name))
+    interpreter = interpreter_for(db, name) if getattr(cls, "out_of_process", False) else None
+    check_available(cls, interpreter=interpreter)
+    if interpreter is not None:
+        kwargs.setdefault("interpreter", interpreter)
     return cls(**kwargs)
 
 
 def availability(db: Database, cls: EngineClass) -> str:
-    """One human-readable word on whether this engine could run right now."""
+    """One human-readable phrase on whether this engine could run right now.
+
+    BUGS.md entry 7: an out-of-process engine used to stop at "the
+    interpreter exists", which is a promise the column does not keep — five
+    out of five out-of-process engines said ``interpreter ok`` and none of
+    them could run. When the engine declares ``required_module``, the
+    configured interpreter is actually probed (:func:`probe_engine`) and the
+    answer means "this will actually run", not just "a python is there".
+    An engine with no ``required_module`` but a ``required_binary`` (MFA — a
+    conda binary, not a ``pip``-importable module) is checked with
+    :func:`_binary_present` instead, so it does not fall back to the weaker
+    ``"interpreter ok"`` either; only an engine with neither attribute does.
+    """
     if getattr(cls, "requires_hf_token", False) and not _hf_token():
         return "no HF_TOKEN"
     if getattr(cls, "out_of_process", False):
-        path = Path(interpreter_for(db, cls.name))
-        return "interpreter ok" if path.exists() else f"interpreter missing: {path}"
+        interpreter = interpreter_for(db, cls.name)
+        path = Path(interpreter)
+        if not path.exists():
+            return f"interpreter missing: {path}"
+        required = getattr(cls, "required_module", None)
+        if not required:
+            binary = getattr(cls, "required_binary", None)
+            if binary:
+                return (
+                    "ready"
+                    if _binary_present(interpreter, binary)
+                    else f"needs the {binary} binary (conda, not pip)"
+                )
+            return "interpreter ok"
+        result = probe_engine(interpreter, "", required)
+        if not result.get("module_ok"):
+            reason = result.get("module_error") or f"{required!r} did not import"
+            return f"needs {required} ({reason})"
+        return "ready"
     module = getattr(cls, "required_module", None)
     if not module:
         return "ready"

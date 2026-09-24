@@ -23,6 +23,7 @@ from textual.widgets import DataTable, Footer, Header, Input, Static
 from rytp import constants as C
 from rytp.commands import CommandResult, resolve
 from rytp.models import RytpError
+from rytp.tui.text import plain_row, set_text
 
 if TYPE_CHECKING:
     from rytp.db import Database
@@ -32,6 +33,16 @@ __all__ = ["SearchScreen", "SearchSession"]
 #: Column index of the anchor in a `search.words` result. The anchor is
 #: what `search.play` takes, which is what lets the two compose.
 _ANCHOR = 0
+
+#: BUGS.md entry 19: the tier vocabulary is load-bearing and nothing near the
+#: filter itself said what it meant. F1 carries the full glossary; this is the
+#: one-line version at the point of use. `assemble plan --allow-timed` (Task 6)
+#: is the named escape hatch, so a user deciding whether to reach for it needs
+#: to see it mentioned right here, not just in the help screen.
+CUTTABLE_HINT = (
+    "aligned tier only; timed and caption words cannot be cut — "
+    "assemble plan --allow-timed overrides, see F1"
+)
 
 
 @dataclass
@@ -116,7 +127,7 @@ class SearchSession:
         """One line: the error if there is one, else what the command said."""
         if self.error:
             return self.error
-        filters = " · cuttable only" if self.cuttable else ""
+        filters = f" · cuttable only — {CUTTABLE_HINT}" if self.cuttable else ""
         if self.speaker:
             filters += f" · speaker {self.speaker}"
         return (self.result.message or "") + filters
@@ -138,7 +149,12 @@ class SearchScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "app.pop_screen", "Back"),
         Binding("ctrl+p", "play", "Play hit"),
-        Binding("ctrl+t", "toggle_cuttable", "Cuttable only"),
+        Binding(
+            "ctrl+t",
+            "toggle_cuttable",
+            "Cuttable only",
+            tooltip=CUTTABLE_HINT,
+        ),
     ]
 
     def __init__(self, db: Database, speaker: str | None = None) -> None:
@@ -172,7 +188,7 @@ class SearchScreen(Screen[None]):
         """Play whichever hit the cursor is on (design §7: "Playback")."""
         row = self.query_one("#search-hits", DataTable).cursor_row
         message = self.session.play(row)
-        self.query_one("#search-status", Static).update(message)
+        set_text(self.query_one("#search-status", Static), message)
 
     def action_toggle_cuttable(self) -> None:
         self.session.toggle_cuttable()
@@ -186,5 +202,5 @@ class SearchScreen(Screen[None]):
         if self.session.columns:
             table.add_columns(*self.session.columns)
             for row in self.session.rows:
-                table.add_row(*row)
-        self.query_one("#search-status", Static).update(self.session.status)
+                table.add_row(*plain_row(row))
+        set_text(self.query_one("#search-status", Static), self.session.status)

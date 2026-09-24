@@ -19,6 +19,7 @@ from rytp.diarize.embed import (
     resolve_embedder,
     unpack_embedding,
 )
+from rytp.models import RytpError
 from tests.fake_speaker_engines import FakeEmbedder, registered
 
 # -- the codec -------------------------------------------------------------
@@ -124,6 +125,12 @@ def test_resolving_an_unknown_embedder_names_the_available_ones() -> None:
     with registered(FakeEmbedder), pytest.raises(ValueError) as excinfo:
         resolve_embedder("nope")
     assert "fake-embedder" in str(excinfo.value)
+
+
+def test_resolving_an_unknown_embedder_is_also_a_rytp_error() -> None:
+    with registered(FakeEmbedder), pytest.raises(RytpError) as excinfo:
+        resolve_embedder("nope")
+    assert isinstance(excinfo.value, ValueError)
 
 
 def test_the_registry_holds_classes_not_instances() -> None:

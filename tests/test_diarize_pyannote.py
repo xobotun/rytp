@@ -81,3 +81,21 @@ def test_the_adapter_reads_the_token_from_the_environment_by_default(
     monkeypatch.setattr(adapter, "run_child", fake_run_child)
     list(PyannoteDiarizer(interpreter="/opt/p/python").diarize(tmp_path / "a.wav"))
     assert seen["request"]["hf_token"] == "from-env"
+
+
+def test_device_defaults_to_auto_and_the_reported_choice_sticks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BUGS.md entry 34: pyannote never moved anything to a device at all.
+    from rytp.diarize import pyannote as adapter
+
+    def fake_run_child(**kwargs: object) -> dict[str, object]:
+        request = kwargs["request"]
+        assert request["device"] == C.ENGINE_DEFAULT_DEVICE  # type: ignore[index]
+        return {"segments": [], "device": "cuda"}
+
+    monkeypatch.setattr(adapter, "run_child", fake_run_child)
+    engine = PyannoteDiarizer(interpreter="/opt/p/python", hf_token="t")
+    assert engine.device == C.ENGINE_DEFAULT_DEVICE
+    list(engine.diarize(tmp_path / "a.wav"))
+    assert engine.device == "cuda"

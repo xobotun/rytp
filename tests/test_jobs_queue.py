@@ -324,3 +324,85 @@ def test_two_connections_cannot_claim_the_same_job(db: Database) -> None:
         other.close()
     assert first is not None
     assert second is None
+
+
+# ---------------------------------------------------------------------------
+# ``jobs.progress`` — advisory, worker-written, distinct from ``note``
+# (contracts §5, plan §1c, Task 8a).
+# ---------------------------------------------------------------------------
+
+
+def test_set_progress_writes_the_column(db: Database) -> None:
+    vid = make_video(db)
+    job_id = Q.enqueue(db, "download", vid, now=NOW)
+    Q.claim(db, "network", now=NOW)
+    Q.set_progress(db, job_id, "download 12/38 clip.mp4")
+    assert Q.list_jobs(db)[0].progress == "download 12/38 clip.mp4"
+
+
+def test_claim_starts_a_job_with_no_stale_progress(db: Database) -> None:
+    vid = make_video(db)
+    job_id = Q.enqueue(db, "download", vid, now=NOW)
+    Q.claim(db, "network", now=NOW)
+    Q.set_progress(db, job_id, "download 12/38")
+    Q.defer(db, job_id, not_before=NOW.isoformat())  # back to pending
+    Q.claim(db, "network", now=NOW)                  # claimed again
+    assert Q.list_jobs(db)[0].progress is None
+
+
+def test_finish_clears_progress(db: Database) -> None:
+    vid = make_video(db)
+    job_id = Q.enqueue(db, "download", vid, now=NOW)
+    Q.claim(db, "network", now=NOW)
+    Q.set_progress(db, job_id, "download 12/38")
+    Q.finish(db, job_id, now=NOW)
+    assert Q.list_jobs(db)[0].progress is None
+
+
+def test_fail_clears_progress(db: Database) -> None:
+    vid = make_video(db)
+    job_id = Q.enqueue(db, "download", vid, now=NOW)
+    Q.claim(db, "network", now=NOW)
+    Q.set_progress(db, job_id, "download 12/38")
+    Q.fail(db, job_id, error="boom", now=NOW)
+    assert Q.list_jobs(db)[0].progress is None
+
+
+def test_block_clears_progress(db: Database, tmp_path: Path) -> None:
+    vid = make_video(db)
+    job_id = Q.enqueue(db, "download", vid, now=NOW)
+    Q.claim(db, "network", now=NOW)
+    Q.set_progress(db, job_id, "download 12/38")
+    Q.block(db, job_id, reason="prerequisites are not in place", now=NOW)
+    assert Q.list_jobs(db)[0].progress is None
+
+
+def test_defer_clears_progress(db: Database) -> None:
+    vid = make_video(db)
+    job_id = Q.enqueue(db, "download", vid, now=NOW)
+    Q.claim(db, "network", now=NOW)
+    Q.set_progress(db, job_id, "download 12/38")
+    Q.defer(db, job_id, not_before=NOW.isoformat(), error="429")
+    assert Q.list_jobs(db)[0].progress is None
+
+
+def test_reclaim_running_clears_progress(db: Database) -> None:
+    vid = make_video(db)
+    job_id = Q.enqueue(db, "download", vid, now=NOW)
+    Q.claim(db, "network", now=NOW)
+    Q.set_progress(db, job_id, "download 12/38")
+    Q.reclaim_running(db, now=NOW)
+    assert Q.list_jobs(db)[0].progress is None
+
+
+def test_progress_is_distinct_from_note(db: Database) -> None:
+    """A note survives ``finish``; progress never does — the two must not
+    be conflated (contracts §5)."""
+    vid = make_video(db)
+    job_id = Q.enqueue(db, "download", vid, now=NOW)
+    Q.claim(db, "network", now=NOW)
+    Q.set_progress(db, job_id, "download 12/38")
+    Q.finish(db, job_id, note="discarded 4 speaker labels", now=NOW)
+    job = Q.list_jobs(db)[0]
+    assert job.note == "discarded 4 speaker labels"
+    assert job.progress is None

@@ -245,6 +245,57 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX renders_cutlist ON renders(cutlist_name);
         """,
     ),
+    (
+        13,
+        """
+        -- The scale that produced `align_score` (contracts §3 "Score
+        -- precedence and scale"; plan §1a; BUGS.md entry 13; constants
+        -- rytp.constants.ALIGN_SCALES). Never a CHECK: SQLite cannot add
+        -- a CHECK by ALTER TABLE, so the permitted values
+        -- (energy | logprob | none | unknown) are enforced in Python.
+        ALTER TABLE words ADD COLUMN align_scale TEXT;
+
+        -- Backfill for rows written before this batch. `timed` rows with a
+        -- score came only from `--refine`'s energy boundary scoring, so
+        -- they are unambiguously `energy`.
+        UPDATE words SET align_scale = 'energy'
+            WHERE source = 'timed' AND align_score IS NOT NULL;
+
+        -- Deliberately has no `align_score IS NOT NULL` clause. MFA has
+        -- never run on this machine, so every pre-batch `aligned` row came
+        -- from the broken wav2vec2 aligner of entry 36, whatever its score
+        -- column holds, and may additionally have been sign-flipped by
+        -- entry 28's hack with no way to identify which rows. A null-scored
+        -- row is no more trustworthy than a scored one, so both are marked
+        -- `unknown` rather than repaired or guessed at.
+        UPDATE words SET align_scale = 'unknown' WHERE source = 'aligned';
+        """,
+    ),
+    (
+        14,
+        """
+        -- Advisory, worker-written progress (contracts §3, §5 "Job
+        -- handlers"; plan §1c; BUGS.md entries 3, 10). Distinct from
+        -- `jobs.note`: `progress` may be stale, is cleared when a job
+        -- leaves `running`, and never affects job state; `note` is the
+        -- handler's return value and survives completion.
+        ALTER TABLE jobs ADD COLUMN progress TEXT;
+        """,
+    ),
+    (
+        15,
+        """
+        -- A second partial index for the `timed` tier, used only by
+        -- `assemble plan --allow-timed` (BUGS.md entries 26/27/28, design
+        -- question D1). A second index rather than widening
+        -- `words_alignable`: dropping and recreating an existing index in
+        -- a migration would be a rewrite of something an earlier migration
+        -- created, and the assembler's default path must stay exactly as
+        -- narrow as it is today. `--allow-timed` reads this half of a
+        -- `UNION ALL` query so SQLite's planner can use it by name.
+        CREATE INDEX words_timed ON words(normalized_text) WHERE source = 'timed';
+        """,
+    ),
 ]
 
 #: The version a fully migrated database reports.

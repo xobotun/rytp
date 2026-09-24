@@ -28,6 +28,7 @@ from pathlib import Path
 
 from rytp import config
 from rytp import constants as C
+from rytp import progress as PR
 from rytp.acquire import policy as P
 from rytp.db import Database
 from rytp.db.queries import get_setting, set_setting
@@ -142,6 +143,36 @@ def _may_claim(db: Database, pool: str, policy: P.DownloadPolicy, now: datetime)
     return True
 
 
+class _DbProgressSink:
+    """The worker's sink: throttled writes to one job's ``jobs.progress``.
+
+    Installed only for the duration of one handler call (plan Task 8a,
+    contracts §5). Every write is a bare, autocommitting statement on the
+    shared connection — see :func:`rytp.jobs.queue.set_progress` — never
+    inside a transaction, so a handler that opens its own
+    :meth:`~rytp.db.Database.transaction` around the rest of its work does
+    not swallow the progress write until it commits.
+    """
+
+    def __init__(
+        self, db: Database, job_id: int, *, interval_ms: int = C.PROGRESS_DB_INTERVAL_MS
+    ) -> None:
+        self._db = db
+        self._job_id = job_id
+        self._interval_ms = interval_ms
+        self._last_ms = float("-inf")
+
+    def __call__(
+        self, stage: str, done: int | None, total: int | None, detail: str
+    ) -> None:
+        finished = done is not None and total is not None and done >= total
+        now = time.monotonic() * 1000
+        if now - self._last_ms < self._interval_ms and not finished:
+            return
+        self._last_ms = now
+        Q.set_progress(self._db, self._job_id, PR.format_line(stage, done, total, detail))
+
+
 def _handle_failure(
     db: Database,
     job: Q.Job,
@@ -216,7 +247,8 @@ def run_pool_once(
         return True
 
     try:
-        note = spec.handler(db, job.target_id, job.payload)
+        with PR.install(_DbProgressSink(db, job.id)):
+            note = spec.handler(db, job.target_id, job.payload)
     except Exception as exc:
         _handle_failure(db, job, exc, policy=policy, report=report, now=now_fn())
     else:

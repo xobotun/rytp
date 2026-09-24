@@ -1075,10 +1075,121 @@ TUI_QUEUE_REFRESH_S: float = 2.0
 TUI_QUEUE_ROW_LIMIT: int = 200
 
 #: Milliseconds one keystroke moves a cut-list boundary. design §8 prefers
-#: hand-edited timings "over clever heuristics", and 40 ms is one caption
-#: grid step and about one video frame at 25 fps — small enough to be a
-#: nudge, large enough to hear.
-TUI_CUTLIST_NUDGE_MS: int = 40
+#: hand-edited timings "over clever heuristics". Was 40 ms; QA batch
+#: 2026-09-25 (BUGS.md entry 30) lowered it to 10, because 40 ms is a good
+#: fraction of a phoneme at conversational speed and was too coarse for
+#: word-edge nudging. TUI_CUTLIST_SHIFT_NUDGE_MS below is the new
+#: larger step (bound to Shift+arrow); TUI_CUTLIST_COARSE_NUDGE_MS is
+#: unchanged — it means gaps, not word edges.
+TUI_CUTLIST_NUDGE_MS: int = 10
 
 #: A coarse nudge, for when the boundary is plainly in the wrong place.
 TUI_CUTLIST_COARSE_NUDGE_MS: int = 250
+
+# ---------------------------------------------------------------------------
+# --- 2026-09-25 QA fix batch ---
+# ---------------------------------------------------------------------------
+# `docs/superpowers/plans/2026-09-25-qa-fix-batch.md` §1a-§1c and Task 2a/2b.
+# Foundation constants for entries 3, 7, 10, 11, 13, 15, 25, 26, 28, 30, 33,
+# 34 of `BUGS.md`. Task 2a is the sole owner of this file for the batch;
+# Task 2b's migrations 13-15 and the contracts amendment
+# (`docs/superpowers/2026-09-25-contracts-amendments.md`) cite these by name.
+
+# --- Score scale (plan §1a, BUGS.md entry 13) ---
+
+#: `words.align_scale` values. An aligner that reports a score writes the
+#: scale that produced it; `words.align_score` is never converted between
+#: scales — normalising would be lossy and would bake in a conversion
+#: nobody can justify (entry 13's recorded decision).
+ALIGN_SCALE_ENERGY: Final = "energy"
+ALIGN_SCALE_LOGPROB: Final = "logprob"
+ALIGN_SCALE_NONE: Final = "none"
+ALIGN_SCALE_UNKNOWN: Final = "unknown"
+
+#: All permitted `words.align_scale` values, for validation.
+ALIGN_SCALES: Final = (
+    ALIGN_SCALE_ENERGY,
+    ALIGN_SCALE_LOGPROB,
+    ALIGN_SCALE_NONE,
+    ALIGN_SCALE_UNKNOWN,
+)
+
+#: Per-scale floor for `assemble plan`'s eligibility filter (entries 26, 28).
+#: A `None` value means no threshold applies for that scale (MFA writes no
+#: score under `none`, and `unknown` is excluded outright by
+#: ASSEMBLE_EXCLUDE_UNKNOWN_SCALE below rather than floored). The `logprob`
+#: entry is a first guess in the spirit of Part 7's unvalidated thresholds:
+#: `exp(-5)` is about 0.7% probability, which admits essentially everything
+#: while still excluding a catastrophic mismatch — it exists so the filter
+#: is meaningful, not so it is tight.
+ASSEMBLE_MIN_ALIGN_BY_SCALE: Final = {
+    ALIGN_SCALE_ENERGY: 0.0,
+    ALIGN_SCALE_LOGPROB: -5.0,
+    ALIGN_SCALE_NONE: None,
+    ALIGN_SCALE_UNKNOWN: None,
+}
+
+#: `align_scale = 'unknown'` rows are excluded from `assemble plan` by
+#: default (entry 26): they are the pre-batch wav2vec2 output that entry 36
+#: proved fabricated equally-spaced boundaries, and entry 28's sign-flip
+#: hack may additionally have reversed some of their ordering with no way
+#: to tell which. `transcribe align` re-running is what clears the flag.
+ASSEMBLE_EXCLUDE_UNKNOWN_SCALE: Final = True
+
+# --- Device selection (plan §1b, BUGS.md entry 34) ---
+
+#: `device` parameter accepted by every engine adapter. `"auto"` resolves in
+#: the child to `"cuda"` when available, else `"cpu"`; the child moves both
+#: the model and every input tensor there and reports the chosen device
+#: back so a foreground run's message and a queued run's job note both say
+#: what actually ran, rather than silently running 40x slower on the CPU.
+ENGINE_DEFAULT_DEVICE: Final = "auto"
+ENGINE_DEVICES: Final = ("auto", "cuda", "cpu")
+
+#: Timeout for the child-interpreter probe that answers "does the module
+#: import, is CUDA available, which device would be selected" (entries 7,
+#: 33). Generous: a probe that loads torch to answer this is not instant.
+ENGINE_PROBE_TIMEOUT_S: Final = 60
+
+# --- Hugging Face cache (BUGS.md entry 11) ---
+
+#: Environment variable set in every child and in-process engine's
+#: environment before an HF-backed model loads, so the "no symlinks
+#: support, enable Windows Developer Mode" warning prints once as a
+#: `doctor` advisory rather than per process from a dependency's own code.
+HF_SYMLINK_WARNING_ENV: Final = "HF_HUB_DISABLE_SYMLINKS_WARNING"
+
+# --- Progress (plan §1c, BUGS.md entries 3, 10) ---
+
+#: Throttle for the default tty progress sink, milliseconds. A download, a
+#: model fetch and a network call were all indistinguishable from a hang;
+#: this is how often the one `stderr` line is allowed to repaint.
+PROGRESS_TTY_INTERVAL_MS: Final = 250
+
+#: Throttle for the worker's `jobs.progress` write, milliseconds. Coarser
+#: than the tty interval: a queued job is read by polling `jobs.list`, not
+#: watched continuously.
+PROGRESS_DB_INTERVAL_MS: Final = 2_000
+
+# --- TUI cut-list editing (BUGS.md entry 30) ---
+
+#: Milliseconds one Shift+arrow keystroke moves a cut-list boundary — the
+#: new larger step now that TUI_CUTLIST_NUDGE_MS (plain arrow) is 10 ms.
+TUI_CUTLIST_SHIFT_NUDGE_MS: Final = 100
+
+# --- Transcript rendering (BUGS.md entry 15) ---
+
+#: Default wrap width, in characters, requested for `transcript show` /
+#: `transcript build`'s `--line-length` knob, so the transcript wraps to a
+#: chosen width instead of whatever the table or the markdown writer decides.
+TRANSCRIPT_DEFAULT_LINE_LENGTH: Final = 80
+
+# --- Surfaces (BUGS.md entry 25) ---
+
+#: Glyphs for a boolean cell in `videos list --long` (entry 25: one column
+#: per asset role and pipeline stage — audio, captions, videos, transcribed,
+#: aligned, indexed, diarized — each cell a tick meaning present/complete or
+#: a cross meaning not yet). Named here so any other boolean-cell table can
+#: reuse the same vocabulary rather than inlining its own glyph.
+CELL_TICK: Final = "✓"
+CELL_CROSS: Final = "✗"

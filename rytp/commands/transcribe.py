@@ -19,6 +19,7 @@ from rytp.transcribe import health  # noqa: F401 - importing registers the check
 from rytp.transcribe.captions import ingest_captions
 from rytp.transcribe.compare import comparison_rows, render_report, run_comparison
 from rytp.transcribe.pipeline import (
+    TranscribeOutcome,
     enqueue_index,
     invalidate_transcript,
     realign_video,
@@ -74,6 +75,24 @@ def _split(value: str | None) -> tuple[str, ...]:
 
 def _number(value: float | None) -> str:
     return "-" if value is None else f"{value:.2f}"
+
+
+def _score_heading(scale: str | None) -> str:
+    """Name what a run's score column actually measures (BUGS.md entry 13).
+
+    ``median align score`` printed the same heading over an energy measure,
+    a log-probability and nothing at all — the exact defect this batch fixes.
+    A run that produced no score at all (no aligner, no refine; or a
+    scoreless aligner with refine off) keeps the generic heading, which pairs
+    with the always-blank cell :func:`_number` prints for a ``None`` median.
+    """
+    if scale is None:
+        return "median align score"
+    return f"median {scale} score"
+
+
+def _device_note(outcome: TranscribeOutcome) -> str | None:
+    return None if outcome.align_device is None else f"aligner device: {outcome.align_device}"
 
 
 def _captions_handler(db: Database, *, video: str, path: Path | None = None) -> CommandResult:
@@ -165,8 +184,15 @@ def _run_handler(
     warning = speaker_loss_warning(video_id, outcome.speakers_lost)
     if warning:
         notes.append(warning)
+    device_note = _device_note(outcome)
+    if device_note:
+        notes.append(device_note)
+    notes.extend(outcome.align_notes)
     return CommandResult(
-        columns=("video", "words", "chunks", "tier", "engine", "median align score"),
+        columns=(
+            "video", "words", "chunks", "tier", "engine",
+            _score_heading(outcome.align_scale),
+        ),
         rows=(
             (
                 str(outcome.video_id),
@@ -202,8 +228,16 @@ def _align_handler(
         refine=refine,
     )
     enqueue_index(db, video_id)
+    notes = [f"video {video_id}: {outcome.n_words} words are now cuttable"]
+    device_note = _device_note(outcome)
+    if device_note:
+        notes.append(device_note)
+    notes.extend(outcome.align_notes)
     return CommandResult(
-        columns=("video", "words", "chunks", "tier", "engine", "median align score"),
+        columns=(
+            "video", "words", "chunks", "tier", "engine",
+            _score_heading(outcome.align_scale),
+        ),
         rows=(
             (
                 str(outcome.video_id),
@@ -214,7 +248,7 @@ def _align_handler(
                 _number(outcome.median_align_score),
             ),
         ),
-        message=f"video {video_id}: {outcome.n_words} words are now cuttable",
+        message=". ".join(notes),
     )
 
 

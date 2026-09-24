@@ -34,6 +34,10 @@ BANNED_SPELLINGS: dict[str, str] = {
     "global_speaker": "speaker",
     "limit_rows": "limit",
     "max_rows": "limit",
+    # Task 15 (BUGS.md entry 25): the owner's revision settled on `--long`
+    # for the detailed `videos list` view, precisely so `--short` stays free
+    # rather than silently meaning something already. Reserve it.
+    "short": "long",
 }
 
 #: Names whose type is fixed across the whole surface, because a flag that is
@@ -50,6 +54,7 @@ PINNED_TYPES: dict[str, type] = {
     "yes": bool,
     "force": bool,
     "enqueue": bool,
+    "long": bool,
 }
 
 

@@ -166,6 +166,42 @@ def test_list_videos_orders_newest_first_and_respects_the_limit(db: Database) ->
     assert [row["external_id"] for row in rows] == ["VIDEO_C", "VIDEO_B"]
 
 
+def test_list_videos_folds_asset_and_word_state_into_one_join(db: Database) -> None:
+    """BUGS.md entry 25: `videos list --long` needs asset counts, the best
+    tier, the engine chain and the align scales — folded into this one
+    statement rather than a query per video."""
+    video_id = add_video(db, "VIDEO_A")
+    q.insert_asset(db, video_id=video_id, role="audio", path="a.wav")
+    q.insert_asset(db, video_id=video_id, role="video", format_id="480p", path="v1.mp4")
+    q.insert_asset(db, video_id=video_id, role="video", format_id="720p", path="v2.mp4")
+    db.conn.execute(
+        "INSERT INTO words (video_id, ord, start_ms, end_ms, text, "
+        "normalized_text, stem, source, engine, align_scale) VALUES "
+        "(?, 0, 0, 1000, 'a', 'a', 'a', 'timed', 'whisper', NULL), "
+        "(?, 1, 0, 1000, 'b', 'b', 'b', 'aligned', 'whisper+wav2vec2', 'logprob')",
+        (video_id, video_id),
+    )
+    (row,) = q.list_videos(db, limit=C.DEFAULT_LIST_LIMIT)
+    assert row["n_audio"] == 1
+    assert row["n_captions"] == 0
+    assert row["n_video_assets"] == 2
+    assert row["best_tier"] == "aligned"
+    assert row["engines"] == "whisper, whisper+wav2vec2"
+    assert row["align_scales"] == "logprob"
+
+
+def test_list_videos_reports_no_tier_or_engine_for_an_untranscribed_video(
+    db: Database,
+) -> None:
+    video_id = add_video(db, "VIDEO_A")
+    (row,) = q.list_videos(db, limit=C.DEFAULT_LIST_LIMIT)
+    assert video_id == row["id"]
+    assert row["n_audio"] == 0
+    assert row["best_tier"] is None
+    assert row["engines"] is None
+    assert row["align_scales"] is None
+
+
 def test_clamp_limit_keeps_the_query_bounded() -> None:
     assert q.clamp_limit(0) == 1
     assert q.clamp_limit(-5) == 1

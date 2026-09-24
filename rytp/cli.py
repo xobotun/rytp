@@ -27,11 +27,13 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from rich.markup import escape
 
 from rytp import config
 from rytp import constants as C
 from rytp.commands import (
     COMMANDS,
+    GROUP_SUMMARIES,
     PARAM_ALIASES,
     REQUIRED,
     Command,
@@ -75,15 +77,22 @@ def render_result(result: CommandResult) -> str:
     Deliberately not a rich table: the output is asserted on in tests and
     piped into other tools, so column alignment by spaces beats box
     drawing that reflows with the terminal width.
+
+    A cell may carry embedded newlines — `transcript show --line-length`
+    wraps its text column this way (BUGS.md entry 15). A column's width is
+    the longest *single line* within it, not the raw string length, and a
+    wrapped cell prints as continuation lines under its own column instead
+    of spilling across the rest of the row.
     """
     lines: list[str] = []
     if result.message:
         lines.append(result.message)
     if result.columns:
         widths = [len(column) for column in result.columns]
-        for row in result.rows:
-            for index, cell in enumerate(row):
-                widths[index] = max(widths[index], len(cell))
+        split_rows = [[cell.split("\n") for cell in row] for row in result.rows]
+        for split_row in split_rows:
+            for index, cell_lines in enumerate(split_row):
+                widths[index] = max(widths[index], *(len(one) for one in cell_lines))
 
         def line(cells: tuple[str, ...]) -> str:
             return "  ".join(
@@ -92,7 +101,17 @@ def render_result(result: CommandResult) -> str:
 
         lines.append(line(result.columns))
         lines.append(line(tuple("-" * width for width in widths)))
-        lines.extend(line(row) for row in result.rows)
+        for split_row in split_rows:
+            depth = max(len(cell_lines) for cell_lines in split_row)
+            for row_line in range(depth):
+                lines.append(
+                    line(
+                        tuple(
+                            cell_lines[row_line] if row_line < len(cell_lines) else ""
+                            for cell_lines in split_row
+                        )
+                    )
+                )
     return "\n".join(lines)
 
 
@@ -195,9 +214,32 @@ def _root_callback(
         os.environ[C.DATA_ROOT_ENV_VAR] = str(data)
 
 
-def build_app(registry: Mapping[str, Command] | None = None) -> typer.Typer:
+def _group_help(group: str, cmds: list[Command], summaries: Mapping[str, str]) -> str:
+    """What the group is about, then the commands in it (BUGS.md entry 6).
+
+    "Commands in the X group." said nothing; the owner wanted two or three
+    words on what the group is *about*, plus the command list, so the shape
+    of the surface is visible from `rytp --help` alone. The list is always
+    generated from the registry, never written out a second time.
+    """
+    # Leaf names only: the group name is already the heading, so
+    # "speakers add, speakers diarize, …" just repeats it on every entry.
+    #
+    # Typer 0.27 renders help with `rich_markup_mode="rich"`, so the names
+    # can carry a style — but that also means any bracket in a summary
+    # would be read as markup, hence the escape on `about`.
+    listing = ", ".join(f"[cyan]{leaf_name(cmd)}[/cyan]" for cmd in cmds)
+    about = escape(summaries.get(group, ""))
+    return f"{about} — {listing}" if about else listing
+
+
+def build_app(
+    registry: Mapping[str, Command] | None = None,
+    group_summaries: Mapping[str, str] | None = None,
+) -> typer.Typer:
     """Build the Typer app for ``registry`` (the global one by default)."""
     commands = COMMANDS if registry is None else registry
+    summaries = GROUP_SUMMARIES if group_summaries is None else group_summaries
     app = typer.Typer(
         name="rytp",
         help="Index a video archive by speaker and word, then cut new video from it.",
@@ -206,20 +248,23 @@ def build_app(registry: Mapping[str, Command] | None = None) -> typer.Typer:
     )
     app.callback()(_root_callback)
 
-    groups: dict[str, typer.Typer] = {}
+    # Two passes: a group's help text names every command in it, so the
+    # full membership must be known before any Typer sub-app is built.
+    grouped: dict[str, list[Command]] = {}
     for cmd in sorted(commands.values(), key=lambda c: c.name):
-        callback = _make_callback(cmd)
         if not cmd.group:
-            app.command(leaf_name(cmd), help=cmd.summary)(callback)
+            app.command(leaf_name(cmd), help=cmd.summary)(_make_callback(cmd))
             continue
-        group = groups.get(cmd.group)
-        if group is None:
-            group = typer.Typer(
-                no_args_is_help=True, help=f"Commands in the {cmd.group} group."
-            )
-            groups[cmd.group] = group
-            app.add_typer(group, name=cmd.group)
-        group.command(leaf_name(cmd), help=cmd.summary)(callback)
+        grouped.setdefault(cmd.group, []).append(cmd)
+
+    for group_name in sorted(grouped):
+        cmds = grouped[group_name]
+        group = typer.Typer(
+            no_args_is_help=True, help=_group_help(group_name, cmds, summaries)
+        )
+        app.add_typer(group, name=group_name)
+        for cmd in cmds:
+            group.command(leaf_name(cmd), help=cmd.summary)(_make_callback(cmd))
 
     return app
 
