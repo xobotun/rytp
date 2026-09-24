@@ -32,9 +32,9 @@ Both failures have a named regression test in this plan (Task 4, Step 1). If eit
 - Domain errors subclass `RytpError`. The CLI prints one line to stderr and exits 1 — never a traceback for an expected failure. Handlers never print and never call `sys.exit`.
 - Every stage takes an already-open `Database`; nothing opens its own connection. Multi-statement writes use `db.transaction()`.
 - **The FTS tokenizer is `unicode61 remove_diacritics 0`, never `porter`** (contracts §3).
-- **Cuttable is defined as `source = 'aligned'`** and nothing else (contracts §3).
+- **`words.source` has three tiers** (contracts §3): `caption` (downloaded captions, starts only), `timed` (a transcriber's own word timestamps, energy-refined) and `aligned` (forced alignment). All three are searchable. **Cuttable is `source = 'aligned'` and nothing else.**
 - **One stored `words` row holds exactly one token** (contracts §4), guaranteed by Part 3's `split_token`.
-- **Two speaker flags, two identifier spaces** (contracts §5). `--speaker` is a named person from the `speakers` roster and never accepts a raw diarizer label; `--video-local-speaker` is a `video_speakers.local_label` and **requires `--video-id` alongside it**. One shared resolver in `rytp/commands/__init__.py` serves both; **no part rolls its own**.
+- **Two speaker flags, two identifier spaces** (contracts §5). `--speaker` is a named person from the `speakers` roster and never accepts a raw diarizer label; `--video-local-speaker` is a `video_speakers.local_label` and **requires `--video` alongside it**. One shared resolver in `rytp/commands/__init__.py` serves both; **no part rolls its own**.
 - **Supplying every `NOT NULL` column is the inserting part's job** (contracts §3) — `video_speakers.engine` included, in fixtures as much as in production.
 - **Cross-part invariant (contracts §4):** whenever a video's words are deleted or replaced, that video's `utterances` go with them in the same transaction. Part 3 already does this. Re-deriving them is this part's job, so `index_video` must be idempotent and cheap.
 - Tests: no network, ever, and **no test may spawn a media player**. Anything needing ffmpeg is marked `@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason=...)`.
@@ -51,7 +51,7 @@ Read these signatures; do not re-derive them.
 | Part 1 | `rytp.db.Database` | `.conn` (`row_factory = sqlite3.Row`, FK on, `isolation_level=None`), `.migrate()`, `.transaction()`, `.close()` |
 | Part 1 | `rytp.models` | `RytpError`, `NotFoundError`, `InvalidInputError`, `Fragment`, `normalize_text(text) -> str` (folds ё→е), `stem_text(normalized) -> str` (snowballstemmer Russian, one stem per token, **already implemented**), `utc_now_iso() -> str` |
 | Part 1 | `rytp.config` | `paths() -> Paths` with `.transcript(video_id)`, `.cache_wav(video_id)`, `.root`; `ensure_dir(path) -> Path` |
-| Part 1 | `rytp.commands` | `REQUIRED`, `Param`, `CommandResult`, `Command`, `register`, `resolve`, `COMMANDS`, and the one shared speaker resolver contracts §5 requires — this plan calls it `speaker_scope(db, *, speaker, video_local_speaker, video_id) -> frozenset[int] \| None` |
+| Part 1 | `rytp.commands` | `REQUIRED`, `Param`, `CommandResult`, `Command`, `register`, `resolve`, `COMMANDS`, `HealthCheck`, `HealthResult`, `register_check`, and contracts §5's pinned speaker resolver: `SpeakerFilter(video_speaker_ids: frozenset[int], description: str)` and `resolve_speaker_filter(db, *, speaker=None, video_local_speaker=None, video_id=None) -> SpeakerFilter \| None` |
 | Part 1 | schema | `words`, `utterances`, `utterances_fts` + the `utterances_ai` / `_ad` / `_au` triggers, `videos`, `speakers`, `video_speakers` — migrations 6, 7, 8. **Never write your own FTS DDL or triggers; Part 1 owns them and a second copy would conflict.** |
 | Part 1 | `rytp.constants` | `NULL_CELL`, `MS_PER_SECOND`, `DEFAULT_LIST_LIMIT`, `MAX_LIST_LIMIT` |
 | Part 2 | `rytp.jobs` | `Readiness` (`READY` / `BLOCKED` / `SATISFIED`), `JobKind(name, pool, readiness, handler, summary, target_kind="video", reopenable=True)`, `JOB_KINDS`, `JOB_HANDLERS`, `register_job_kind`, `resolve_job_kind` |
@@ -143,7 +143,7 @@ for table in ('words', 'utterances', 'video_speakers'):
 "
 ```
 
-**Step 2 writes the resolver's real spelling into the test.** This plan calls it `speaker_scope(db, *, speaker, video_local_speaker, video_id) -> frozenset[int] | None` — the set of `video_speakers.id` values a search may match, or `None` for no filter. If Part 1 spelled it differently, **change the call sites in Tasks 4, 5, 8 and 10 to match what exists; do not add your own resolver** (contracts §5: "One shared resolver in `rytp/commands/__init__.py` serves every command that filters by speaker; no part may roll its own").
+**The resolver's signature is pinned, and this plan uses it verbatim.** Contracts §5 fixes `resolve_speaker_filter(db, *, speaker=None, video_local_speaker=None, video_id=None) -> SpeakerFilter | None`, returning `SpeakerFilter(video_speaker_ids: frozenset[int], description: str)`. Three of its rules are load-bearing here: `None` means no filter was asked for; an **empty** `video_speaker_ids` means the filter resolved but matches nothing and must return no rows; and the expansion to `video_speakers.id` happens inside the resolver, which is exactly what `search` wants for `u.video_speaker_id IN (…)`. An earlier draft of this plan invented `speaker_scope` and two other parts invented two more shapes — naming the responsibility without naming the signature is how that happened, and the fix is to use the pinned one and add nothing.
 
 - [ ] **Step 2: Write the assumption tests**
 
@@ -159,6 +159,7 @@ one of them moves, exactly one test fails and names the thing that moved
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 
 import pytest
@@ -294,17 +295,19 @@ def test_the_registries_part_four_writes_into_exist() -> None:
     assert hasattr(commands, "HEALTH_CHECKS")
 
 
-def test_the_shared_speaker_resolver_exists() -> None:
-    """Contracts §5: one resolver in rytp/commands, no part rolls its own.
+def test_the_shared_speaker_resolver_has_the_pinned_signature() -> None:
+    """Contracts §5 fixes this exactly, because three parts each assumed a
+    different shape when only the responsibility was named."""
+    import inspect
 
-    If this fails because Part 1 named it differently, change Part 4's
-    call sites to the real name — do not add a second resolver.
-    """
     import rytp.commands as commands
 
-    assert hasattr(commands, "speaker_scope"), sorted(
-        name for name in dir(commands) if "speaker" in name.lower()
-    )
+    assert hasattr(commands, "SpeakerFilter")
+    assert hasattr(commands, "resolve_speaker_filter")
+    fields = {f.name for f in dataclasses.fields(commands.SpeakerFilter)}
+    assert fields == {"video_speaker_ids", "description"}
+    params = inspect.signature(commands.resolve_speaker_filter).parameters
+    assert set(params) >= {"db", "speaker", "video_local_speaker", "video_id"}
 ```
 
 - [ ] **Step 3: Run it**
@@ -1428,7 +1431,8 @@ Design §7: *"Human search ... goes through the utterance FTS index. Exact phras
 Three decisions worth stating before the code:
 
 - **A query is always a phrase, never a bag of words.** Tokens are normalized and wrapped in one FTS `"..."` phrase, scoped to a column with `column : "..."`. That is what makes `добрый вечер` mean *adjacent*, and it also means a token that happens to spell `OR` or `NEAR` is literal text rather than an operator. No `*` prefix wildcards: the old code used them to paper over a tokenizer that did no stemming, and the stem column replaces them.
-- **The tier is reported, because an inflection is not what the user typed.** `SearchResult.tier` is `MatchTier.EXACT`, `MatchTier.STEM`, or `None` when nothing matched.
+- **The match tier is reported, because an inflection is not what the user typed.** `SearchResult.tier` is `MatchTier.EXACT`, `MatchTier.STEM`, or `None` when nothing matched.
+- **The transcript tier is reported too, and it is not the same thing.** Contracts §3 has three: `caption`, `timed` and `aligned`. A `timed` hit is a real hit with real text that simply cannot be cut yet — the transcriber's own word timestamps are not good enough to cut on (78.7% of Whisper's word gaps measure exactly zero), and `rytp transcribe align` upgrades those rows in place. Showing `timed` rather than lumping it in with `caption` is the difference between "run align on this video" and "this video needs transcribing". So `SearchHit` carries `source`, and the result table shows it instead of a bare yes/no: `aligned` already means cuttable.
 - **Speaker filtering takes resolved ids, not a label.** Contracts §5 gives the two identifier spaces — a roster person and a raw diarizer label — one shared resolver in `rytp/commands/__init__.py`, and this module never sees a string. `search` takes `speaker_ids: frozenset[int] | None` of `video_speakers.id`; `None` is no filter, and an empty set is a filter nothing satisfies. Keeping resolution out of here is what stops `--speaker` meaning one thing in `search words` and another in `assemble`.
 - **FTS finds the utterance; a scan over its words finds the exact span inside it.** The hit's timestamps have to be the phrase's, not the sentence's, or playback and export would replay the whole paragraph. Contracts §4 puts exactly one token in a row, so that scan is a plain subsequence search over rows and a token position *is* a word ordinal.
 
@@ -1441,9 +1445,9 @@ Three decisions worth stating before the code:
 - Consumes: `rytp.db.Database`, `rytp.models.{InvalidInputError, NotFoundError, normalize_text, stem_text}`, `rytp.constants.{SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, CUTTABLE_SOURCE, CAPTION_WORD_FALLBACK_MS}`.
 - Produces:
   - `MatchTier` (`EXACT = "exact"`, `STEM = "stem"`)
-  - `SearchHit` frozen dataclass — `video_id, video_title, first_word_ord, last_word_ord, start_ms, end_ms, speaker, text, cuttable, tier, crosses_utterances`, plus an `anchor` property
+  - `SearchHit` frozen dataclass — `video_id, video_title, first_word_ord, last_word_ord, start_ms, end_ms, speaker, text, source, cuttable, tier, crosses_utterances`, plus an `anchor` property
   - `SearchResult` frozen dataclass — `tier: MatchTier | None`, `tokens: tuple[str, ...]`, `hits: tuple[SearchHit, ...]`
-  - `AnchorSpan` frozen dataclass — `video_id, first_word_ord, last_word_ord, start_ms, end_ms, text, cuttable`
+  - `AnchorSpan` frozen dataclass — `video_id, first_word_ord, last_word_ord, start_ms, end_ms, text, source, cuttable`
   - `anchor_for(video_id, first_word_ord, last_word_ord) -> str` — `"v12:340-341"`
   - `parse_anchor(anchor: str) -> tuple[int, int, int]`
   - `anchor_filename(anchor: str, suffix: str = ".wav") -> str` — Windows-safe
@@ -1520,6 +1524,7 @@ def add_words(
                 video_id,
                 ordinal,
                 clock,
+                # Contracts §3: only caption rows have a null end.
                 None if source == "caption" else clock + word_ms,
                 token,
                 normalized,
@@ -1729,15 +1734,29 @@ def test_cuttable_is_true_only_for_aligned_words(db: Database) -> None:
     """Contracts §3: cuttable is `source = 'aligned'` and nothing else."""
     corpus(db, "Добрый вечер", title="Aligned")
     corpus(db, "Добрый вечер", source="caption", title="Captioned")
+    corpus(db, "Добрый вечер", source="timed", title="Timed")
     hits = search(db, "добрый вечер").hits
-    assert sorted(hit.cuttable for hit in hits) == [False, True]
+    assert sorted(hit.cuttable for hit in hits) == [False, False, True]
 
 
-def test_cuttable_only_drops_the_caption_tier_hit(db: Database) -> None:
+def test_cuttable_only_keeps_aligned_and_drops_the_other_two_tiers(
+    db: Database,
+) -> None:
+    """Contracts §3: cuttable is `aligned` and nothing else. `timed` is the
+    easy one to get wrong — it has real end times, it just has no measured
+    boundary to cut on."""
     aligned = corpus(db, "Добрый вечер", title="Aligned")
     corpus(db, "Добрый вечер", source="caption", title="Captioned")
+    corpus(db, "Добрый вечер", source="timed", title="Timed")
     hits = search(db, "добрый вечер", cuttable_only=True).hits
     assert [hit.video_id for hit in hits] == [aligned]
+
+
+def test_a_hit_carries_its_transcript_tier(db: Database) -> None:
+    corpus(db, "Добрый вечер", source="timed")
+    hit = search(db, "добрый вечер").hits[0]
+    assert hit.source == "timed"
+    assert hit.cuttable is False
 
 
 def test_the_speaker_filter_restricts_to_the_resolved_ids(db: Database) -> None:
@@ -1836,9 +1855,17 @@ Expected: collection error — `ModuleNotFoundError: No module named 'rytp.index
 At the end of the Part 4 section of `rytp/constants.py`:
 
 ```python
-#: words.source that may be cut. Contracts §3: "Cuttable is defined as
-#: source = 'aligned'" and nothing else. Caption-tier words are
-#: searchable and never assembled from (design §8).
+#: words.source values, weakest first. Contracts §3: `caption` has word
+#: starts only, `timed` has a transcriber's own timestamps (energy
+#: refined, not good enough to cut on — 78.7% of Whisper's word gaps
+#: measure exactly zero), `aligned` has forced-alignment boundaries. All
+#: three are searchable; the order is what lets a run report the weakest
+#: tier it contains. If Part 3 already defines this, use theirs.
+WORD_SOURCE_RANK: Final = ("caption", "timed", "aligned")
+
+#: words.source that may be cut. Contracts §3: "Cuttable is `source =
+#: 'aligned'` and nothing else may be cut." `timed` and `caption` words
+#: are searchable and never assembled from (design §8).
 CUTTABLE_SOURCE: Final = "aligned"
 
 #: Rows a search returns when the caller does not say. Design §7 is a
@@ -1934,6 +1961,7 @@ class SearchHit:
     end_ms: int
     speaker: str | None
     text: str
+    source: str  # contracts §3: caption | timed | aligned
     cuttable: bool
     tier: MatchTier
     crosses_utterances: bool
@@ -1963,6 +1991,7 @@ class AnchorSpan:
     start_ms: int
     end_ms: int
     text: str
+    source: str
     cuttable: bool
 
 
@@ -2036,6 +2065,7 @@ class _WordRun:
     start_ms: int
     end_ms: int
     text: str
+    source: str
     cuttable: bool
     video_speaker_id: int | None
 
@@ -2047,15 +2077,32 @@ def _end_of(row: sqlite3.Row) -> int:
     return int(row["start_ms"]) + C.CAPTION_WORD_FALLBACK_MS
 
 
+def _tier_of(rows: Sequence[sqlite3.Row]) -> str:
+    """The weakest tier in a run — a run is only as cuttable as its worst row.
+
+    Contracts §3 ranks them `caption` < `timed` < `aligned`. A run should
+    be uniform in practice, since a tier is promoted for a whole video at
+    a time, but reporting the weakest is the answer that cannot mislead.
+    """
+    return min(
+        (str(row["source"]) for row in rows),
+        key=lambda source: C.WORD_SOURCE_RANK.index(source)
+        if source in C.WORD_SOURCE_RANK
+        else -1,
+    )
+
+
 def _run_of(rows: Sequence[sqlite3.Row]) -> _WordRun:
     first, last = rows[0], rows[-1]
+    source = _tier_of(rows)
     return _WordRun(
         first_word_ord=int(first["ord"]),
         last_word_ord=int(last["ord"]),
         start_ms=int(first["start_ms"]),
         end_ms=max(_end_of(last), int(first["start_ms"])),
         text=" ".join(str(row["text"]) for row in rows),
-        cuttable=all(str(row["source"]) == C.CUTTABLE_SOURCE for row in rows),
+        source=source,
+        cuttable=source == C.CUTTABLE_SOURCE,
         video_speaker_id=(
             None if first["video_speaker_id"] is None else int(first["video_speaker_id"])
         ),
@@ -2169,6 +2216,7 @@ def _hit_from_candidate(
         end_ms=run.end_ms,
         speaker=None if row["speaker"] is None else str(row["speaker"]),
         text=str(row["text"]),
+        source=run.source,
         cuttable=run.cuttable,
         tier=tier,
         crosses_utterances=False,
@@ -2236,6 +2284,7 @@ def span_for_anchor(db: Database, anchor: str) -> AnchorSpan:
         start_ms=run.start_ms,
         end_ms=run.end_ms,
         text=run.text,
+        source=run.source,
         cuttable=run.cuttable,
     )
 ```
@@ -2243,7 +2292,7 @@ def span_for_anchor(db: Database, anchor: str) -> AnchorSpan:
 - [ ] **Step 5: Run the tests and watch them pass**
 
 Run: `python -m pytest tests/test_index_search.py -v`
-Expected: PASS, 30 passed.
+Expected: PASS, 31 passed.
 
 - [ ] **Step 6: Lint and type-check**
 
@@ -2635,6 +2684,7 @@ def walk_matches(
                 end_ms=run.end_ms,
                 speaker=found_speaker,
                 text=text or run.text,
+                source=run.source,
                 cuttable=run.cuttable,
                 tier=tier,
                 crosses_utterances=crosses,
@@ -2683,7 +2733,7 @@ inflection while an exact occurrence existed.
 - [ ] **Step 6: Run the tests and watch them pass**
 
 Run: `python -m pytest tests/test_index_search.py -v`
-Expected: PASS, 43 passed.
+Expected: PASS, 44 passed.
 
 - [ ] **Step 7: Lint and type-check**
 
@@ -3378,8 +3428,13 @@ def test_the_rendered_document_has_a_title_a_header_and_the_blocks(
 
 
 def test_the_header_names_the_tier_so_cuttability_is_visible(db: Database) -> None:
-    video_id = corpus(db, "Добрый вечер", source="caption", title="Captioned")
-    assert "- source: caption" in render_transcript(db, video_id)
+    """Contracts §3's three tiers, each named as itself."""
+    captioned = corpus(db, "Добрый вечер", source="caption", title="Captioned")
+    timed = corpus(db, "Добрый вечер", source="timed", title="Timed")
+    aligned = corpus(db, "Добрый вечер", source="aligned", title="Aligned")
+    assert "- source: caption" in render_transcript(db, captioned)
+    assert "- source: timed" in render_transcript(db, timed)
+    assert "- source: aligned" in render_transcript(db, aligned)
 
 
 def test_a_mixed_tier_video_says_so(db: Database) -> None:
@@ -3524,7 +3579,7 @@ def render_transcript(db: Database, video_id: int) -> str:
     if not blocks:
         raise RytpError(
             f"video {video_id} has no utterances; run `rytp index build "
-            f"--video-id {video_id}` first"
+            f"--video {video}` first"
         )
     lines = [
         f"# {title}",
@@ -3645,7 +3700,7 @@ Six commands in three groups, plus two health checks:
 
 **`search.play` takes an anchor, not a query.** An anchor is exact and reproducible, and `search words` prints one per row, so the two commands compose: search, copy the anchor, play it. Guessing which hit the user meant from a re-run query would be neither.
 
-**Two speaker flags, and the resolver is Part 1's** (contracts §5). `--speaker` is a named person — matched against `speakers.label` and then its aliases, never against a raw `SPEAKER_00`, and a miss is an error naming the closest roster entries rather than an empty table. `--video-local-speaker` takes a diarizer label and **requires `--video-id`**: a bare `SPEAKER_00` would match the first-detected voice of every diarized video, which is not a person and not an answer, so the unscoped combination is rejected. Both resolve through the single `speaker_scope` in `rytp/commands/__init__.py`; Part 4 adds no resolution logic of its own, which is what keeps `--speaker` meaning the same thing here and in `rytp assemble`.
+**Two speaker flags, and the resolver is Part 1's** (contracts §5). `--speaker` is a named person — matched against `speakers.label` and then its aliases, never against a raw `SPEAKER_00`, and a miss is an error naming the closest roster entries rather than an empty table. `--video-local-speaker` takes a diarizer label and **requires `--video`**: a bare `SPEAKER_00` would match the first-detected voice of every diarized video, which is not a person and not an answer, so the unscoped combination is rejected. Both go through `resolve_speaker_filter`, whose signature contracts §5 pins; Part 4 adds no resolution logic of its own, which is what keeps `--speaker` meaning the same thing here and in `rytp assemble`. The `SpeakerFilter` it returns already carries `description`, so the result line names the filter without this module re-deriving the wording.
 
 **Filenames.** Exported clips are named from the anchor with `:` replaced (`v12_340-341.wav`), because Windows has no colon in a path component.
 
@@ -3660,7 +3715,7 @@ Six commands in three groups, plus two health checks:
 - Test: `tests/test_commands_search.py`
 
 **Interfaces:**
-- Consumes: `rytp.commands.{Command, CommandResult, Param, register, speaker_scope, HealthCheck, HealthResult, register_check}` — `speaker_scope(db, *, speaker, video_local_speaker, video_id) -> frozenset[int] | None` is Part 1's shared resolver (contracts §5); Task 1 Step 1 confirms its real spelling, `rytp.jobs.queue.enqueue`, `rytp.index.utterances.{index_video, videos_needing_index}`, `rytp.index.search.{MatchTier, anchor_filename, search, span_for_anchor}`, `rytp.index.export.{export_clip, play_clip, timestamp, write_transcript}`, `rytp.config.ensure_dir`, `rytp.models.NotFoundError`.
+- Consumes: `rytp.commands.{Command, CommandResult, Param, register, resolve_speaker_filter, HealthCheck, HealthResult, register_check}` — `resolve_speaker_filter` is Part 1's shared resolver with the signature contracts §5 pins, `rytp.jobs.queue.enqueue`, `rytp.index.utterances.{index_video, videos_needing_index}`, `rytp.index.search.{MatchTier, anchor_filename, search, span_for_anchor}`, `rytp.index.export.{export_clip, play_clip, timestamp, write_transcript}`, `rytp.config.ensure_dir`, `rytp.models.NotFoundError`.
 - Produces: the registered commands `index.build`, `index.drop`, `search.words`, `search.play`, `search.export`, `transcript.build`, and the registered health checks `ffplay` and `fts5`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -3756,7 +3811,7 @@ def test_every_handler_returns_a_command_result(db: Database) -> None:
     assert isinstance(resolve("search.words").handler(db, query="добрый вечер"), CommandResult)
     assert isinstance(resolve("index.build").handler(db), CommandResult)
     assert isinstance(
-        resolve("transcript.build").handler(db, video_id=video_id), CommandResult
+        resolve("transcript.build").handler(db, video=video_id), CommandResult
     )
 
 
@@ -3766,7 +3821,7 @@ def test_every_handler_returns_a_command_result(db: Database) -> None:
 def test_index_build_indexes_one_video(db: Database) -> None:
     video_id = make_video(db)
     add_words(db, video_id, "Добрый вечер")
-    result = resolve("index.build").handler(db, video_id=video_id)
+    result = resolve("index.build").handler(db, video=video_id)
     assert result.rows == ((str(video_id), "1"),)
     assert db.conn.execute("SELECT COUNT(*) FROM utterances").fetchone()[0] == 1
 
@@ -3803,7 +3858,7 @@ def test_index_build_can_enqueue_instead_of_working(db: Database) -> None:
 
 def test_index_build_rejects_an_unknown_video(db: Database) -> None:
     with pytest.raises(NotFoundError):
-        resolve("index.build").handler(db, video_id=404)
+        resolve("index.build").handler(db, video=404)
 
 
 # --- search.words ----------------------------------------------------
@@ -3812,7 +3867,7 @@ def test_index_build_rejects_an_unknown_video(db: Database) -> None:
 def test_search_words_prints_an_anchor_per_hit(db: Database) -> None:
     video_id = corpus(db, "Добрый вечер дорогие друзья")
     result = resolve("search.words").handler(db, query="дорогие друзья")
-    assert result.columns == ("anchor", "video", "time", "speaker", "cut", "text")
+    assert result.columns == ("anchor", "video", "time", "speaker", "tier", "text")
     assert result.rows[0][0] == f"v{video_id}:2-3"
     assert result.rows[0][2] == "00:00:00.600"
 
@@ -3841,10 +3896,38 @@ def test_search_words_reports_no_hits_without_raising(db: Database) -> None:
     assert "no hits" in (result.message or "")
 
 
-def test_search_words_shows_cuttability(db: Database) -> None:
-    corpus(db, "Добрый вечер", source="caption")
+def test_search_words_names_the_transcript_tier_of_each_hit(db: Database) -> None:
+    """Contracts §3 has three, and `timed` is not `caption`.
+
+    A `timed` hit is real text that cannot be cut *yet* — the fix is
+    `rytp transcribe align`. A caption hit needs transcribing. Printing
+    `no` for both would hide the difference that tells the user what to do.
+    """
+    corpus(db, "Добрый вечер", source="caption", title="Captioned")
+    corpus(db, "Добрый вечер", source="timed", title="Timed")
+    corpus(db, "Добрый вечер", source="aligned", title="Aligned")
+    rows = resolve("search.words").handler(db, query="добрый вечер").rows
+    assert sorted(row[4] for row in rows) == ["aligned", "caption", "timed"]
+
+
+def test_search_words_says_how_many_hits_are_not_cuttable_yet(db: Database) -> None:
+    corpus(db, "Добрый вечер", source="timed")
     result = resolve("search.words").handler(db, query="добрый вечер")
-    assert result.rows[0][4] == "no"
+    assert "not cuttable yet" in (result.message or "")
+
+
+def test_search_words_names_the_speaker_filter_it_applied(db: Database) -> None:
+    """`SpeakerFilter.description` exists so this module does not re-derive
+    the wording (contracts §5)."""
+    video_id = make_video(db)
+    host = make_speaker(db, video_id, "SPEAKER_00")
+    name_speaker(db, host, "Ведущий")
+    add_words(db, video_id, "Добрый вечер", speaker_id=host)
+    index_video(db, video_id)
+    result = resolve("search.words").handler(
+        db, query="добрый вечер", speaker="Ведущий"
+    )
+    assert "Ведущий" in (result.message or "")
 
 
 def test_search_words_passes_the_filters_through(db: Database) -> None:
@@ -3894,32 +3977,29 @@ def test_a_local_speaker_label_requires_a_video(db: Database) -> None:
             db, query="добрый вечер", video_local_speaker="SPEAKER_00"
         )
     scoped = resolve("search.words").handler(
-        db, query="добрый вечер", video_local_speaker="SPEAKER_00", video_id=video_id
+        db, query="добрый вечер", video_local_speaker="SPEAKER_00", video=video_id
     )
     assert len(scoped.rows) == 1
 
 
-def test_both_speaker_flags_reach_the_same_shared_resolver(db: Database) -> None:
-    """Part 4 adds no resolution logic; it calls rytp.commands.speaker_scope."""
-    from rytp import commands as commands_module
+def test_both_speaker_flags_reach_the_pinned_shared_resolver(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Part 4 adds no resolution logic; it calls the one contracts §5 pins,
+    with the keywords that signature fixes."""
+    import rytp.commands.search as search_module
+    from rytp.commands import resolve_speaker_filter
 
     calls: list[dict[str, object]] = []
-    real = commands_module.speaker_scope
 
-    def spy(db_, **kwargs: object) -> object:
+    def spy(db_: Database, **kwargs: object) -> object:
         calls.append(dict(kwargs))
-        return real(db_, **kwargs)  # type: ignore[arg-type]
+        return resolve_speaker_filter(db_, **kwargs)  # type: ignore[arg-type]
 
-    import rytp.commands.search as search_module
-
-    original = search_module.speaker_scope
-    search_module.speaker_scope = spy  # type: ignore[assignment]
-    try:
-        corpus(db, "Добрый вечер")
-        resolve("search.words").handler(db, query="добрый вечер")
-    finally:
-        search_module.speaker_scope = original  # type: ignore[assignment]
-    assert calls == [{"speaker": None, "video_local_speaker": None, "video_id": 0}]
+    monkeypatch.setattr(search_module, "resolve_speaker_filter", spy)
+    corpus(db, "Добрый вечер")
+    resolve("search.words").handler(db, query="добрый вечер")
+    assert calls == [{"speaker": None, "video_local_speaker": None, "video_id": None}]
 
 
 def test_search_words_truncates_a_long_sentence(db: Database) -> None:
@@ -3990,7 +4070,7 @@ def test_search_export_raises_when_there_is_nothing_to_export(
 
 def test_index_drop_removes_the_utterances_and_says_how_many(db: Database) -> None:
     video_id = corpus(db, "Добрый вечер")
-    result = resolve("index.drop").handler(db, video_id=video_id)
+    result = resolve("index.drop").handler(db, video=video_id)
     assert db.conn.execute("SELECT COUNT(*) FROM utterances").fetchone()[0] == 0
     assert "1" in (result.message or "")
     assert "index build" in (result.message or "")
@@ -4000,16 +4080,16 @@ def test_index_drop_makes_the_video_unsearchable_and_build_brings_it_back(
     db: Database,
 ) -> None:
     video_id = corpus(db, "Добрый вечер")
-    resolve("index.drop").handler(db, video_id=video_id)
+    resolve("index.drop").handler(db, video=video_id)
     assert resolve("search.words").handler(db, query="добрый вечер").rows == ()
-    resolve("index.build").handler(db, video_id=video_id)
+    resolve("index.build").handler(db, video=video_id)
     assert len(resolve("search.words").handler(db, query="добрый вечер").rows) == 1
 
 
 def test_index_drop_leaves_no_stale_fts_row(db: Database) -> None:
     """Through the surface, because this is the quietest way to break."""
     video_id = corpus(db, "Добрый вечер")
-    resolve("index.drop").handler(db, video_id=video_id)
+    resolve("index.drop").handler(db, video=video_id)
     assert db.conn.execute(
         "SELECT COUNT(*) FROM utterances_fts WHERE utterances_fts MATCH ?",
         ('normalized_text : "добрый вечер"',),
@@ -4023,12 +4103,12 @@ def test_index_drop_needs_no_confirmation_because_it_deletes_no_files() -> None:
     """Contracts §5: `--dry-run` and `--yes` are required only of commands
     that delete files. Utterances are derived rows."""
     names = {param.name for param in resolve("index.drop").params}
-    assert names == {"video_id"}
+    assert names == {"video"}
 
 
 def test_index_drop_rejects_an_unknown_video(db: Database) -> None:
     with pytest.raises(NotFoundError):
-        resolve("index.drop").handler(db, video_id=404)
+        resolve("index.drop").handler(db, video=404)
 
 
 # --- health checks (contracts §5) ------------------------------------
@@ -4102,7 +4182,7 @@ def test_transcript_build_writes_the_file_and_names_it(db: Database) -> None:
     from rytp.config import paths
 
     video_id = corpus(db, "Добрый вечер")
-    result = resolve("transcript.build").handler(db, video_id=video_id)
+    result = resolve("transcript.build").handler(db, video=video_id)
     path = paths().transcript(video_id)
     assert path.exists()
     assert str(path) in (result.message or "")
@@ -4112,7 +4192,7 @@ def test_transcript_build_tells_you_to_index_first(db: Database) -> None:
     video_id = make_video(db)
     add_words(db, video_id, "Добрый вечер")
     with pytest.raises(RytpError, match="index"):
-        resolve("transcript.build").handler(db, video_id=video_id)
+        resolve("transcript.build").handler(db, video=video_id)
 ```
 
 - [ ] **Step 2: Run the tests and watch them fail**
@@ -4159,7 +4239,7 @@ from rytp.commands import (
     Param,
     register,
     register_check,
-    speaker_scope,
+    resolve_speaker_filter,
 )
 from rytp.db import Database
 from rytp.index import export
@@ -4169,7 +4249,10 @@ from rytp.index.utterances import drop_utterances, index_video, videos_needing_i
 from rytp.jobs import queue
 from rytp.models import NotFoundError
 
-_SEARCH_COLUMNS = ("anchor", "video", "time", "speaker", "cut", "text")
+#: A `tier` column rather than a yes/no `cut`: contracts §3 has three
+#: transcript tiers and `aligned` already means cuttable, while `timed`
+#: and `caption` are two different reasons a hit cannot be cut yet.
+_SEARCH_COLUMNS = ("anchor", "video", "time", "speaker", "tier", "text")
 
 
 def _shorten(text: str) -> str:
@@ -4179,15 +4262,15 @@ def _shorten(text: str) -> str:
     return text[: C.SEARCH_TEXT_TRUNCATE_CHARS - 1].rstrip() + "…"
 
 
-def index_build(db: Database, *, video_id: int = 0, enqueue: bool = False) -> CommandResult:
+def index_build(db: Database, *, video: int = 0, enqueue: bool = False) -> CommandResult:
     """Rebuild utterances. One video, or every video that needs it.
 
     With no video, the targets come from `videos_needing_index`, which is
     derived from database state (design §5) — so this is also the repair
     command after a transcript is replaced or a video is diarized.
     """
-    if video_id:
-        targets = [video_id]
+    if video:
+        targets = [video]
     else:
         targets = videos_needing_index(db)
     if not targets:
@@ -4211,23 +4294,27 @@ def search_words(
     speaker: str | None = None,
     video_local_speaker: str | None = None,
     cuttable: bool = False,
-    video_id: int = 0,
+    video: int = 0,
     limit: int = C.SEARCH_DEFAULT_LIMIT,
 ) -> CommandResult:
     """Where a word or phrase was said."""
-    # Contracts §5: one shared resolver, two identifier spaces. It raises
-    # when a person cannot be found (naming near matches) and when
-    # --video-local-speaker arrives without a video, so this handler does
-    # no speaker logic at all.
-    speaker_ids = speaker_scope(
-        db, speaker=speaker, video_local_speaker=video_local_speaker, video_id=video_id
+    # Contracts §5: one shared resolver, two identifier spaces, one pinned
+    # signature. It raises when a person cannot be found (naming near
+    # matches) and when --video-local-speaker arrives without a video, so
+    # this handler does no speaker logic at all. `None` back means no
+    # filter was asked for; an empty id set means one was asked for and
+    # matched nothing, which `search` turns into no rows rather than all.
+    speaker_filter = resolve_speaker_filter(
+        db, speaker=speaker, video_local_speaker=video_local_speaker,
+        video_id=video or None,
     )
+    speaker_ids = None if speaker_filter is None else speaker_filter.video_speaker_ids
     result = search(
         db,
         query,
         speaker_ids=speaker_ids,
         cuttable_only=cuttable,
-        video_id=video_id,
+        video_id=video,
         limit=limit,
     )
     if not result.hits:
@@ -4238,7 +4325,7 @@ def search_words(
             hit.video_title,
             timestamp(hit.start_ms),
             hit.speaker or C.NULL_CELL,
-            "yes" if hit.cuttable else "no",
+            hit.source,
             _shorten(hit.text),
         )
         for hit in result.hits
@@ -4252,6 +4339,11 @@ def search_words(
     )
     crossed = sum(1 for hit in result.hits if hit.crosses_utterances)
     note = f"; {crossed} spanning an utterance boundary" if crossed else ""
+    uncuttable = sum(1 for hit in result.hits if not hit.cuttable)
+    if uncuttable:
+        note += f"; {uncuttable} not cuttable yet (tier is not `aligned`)"
+    if speaker_filter is not None:
+        note += f"; {speaker_filter.description}"
     return CommandResult(
         columns=_SEARCH_COLUMNS,
         rows=rows,
@@ -4274,20 +4366,21 @@ def search_export(
     speaker: str | None = None,
     video_local_speaker: str | None = None,
     cuttable: bool = False,
-    video_id: int = 0,
+    video: int = 0,
     limit: int = C.SEARCH_DEFAULT_LIMIT,
     pad_ms: int = C.CLIP_PAD_MS,
 ) -> CommandResult:
     """Write every hit of a query out as a WAV, one file per hit."""
-    speaker_ids = speaker_scope(
-        db, speaker=speaker, video_local_speaker=video_local_speaker, video_id=video_id
+    speaker_filter = resolve_speaker_filter(
+        db, speaker=speaker, video_local_speaker=video_local_speaker,
+        video_id=video or None,
     )
     result = search(
         db,
         query,
-        speaker_ids=speaker_ids,
+        speaker_ids=None if speaker_filter is None else speaker_filter.video_speaker_ids,
         cuttable_only=cuttable,
-        video_id=video_id,
+        video_id=video,
         limit=limit,
     )
     if not result.hits:
@@ -4305,20 +4398,20 @@ def search_export(
     )
 
 
-def index_drop(db: Database, *, video_id: int) -> CommandResult:
+def index_drop(db: Database, *, video: int) -> CommandResult:
     """Delete one video's utterances (contracts §5, Deletion)."""
-    dropped = drop_utterances(db, video_id)
+    dropped = drop_utterances(db, video)
     return CommandResult(
         message=(
-            f"dropped {dropped} utterance(s) from video {video_id}; "
-            f"rebuild with `rytp index build --video-id {video_id}`"
+            f"dropped {dropped} utterance(s) from video {video}; "
+            f"rebuild with `rytp index build --video {video}`"
         )
     )
 
 
-def transcript_build(db: Database, *, video_id: int) -> CommandResult:
+def transcript_build(db: Database, *, video: int) -> CommandResult:
     """Write `data/transcripts/{video_id}.md`."""
-    return CommandResult(message=f"wrote {write_transcript(db, video_id)}")
+    return CommandResult(message=f"wrote {write_transcript(db, video)}")
 
 
 def _check_ffplay(db: Database) -> HealthResult:
@@ -4395,7 +4488,7 @@ register(
         summary="Rebuild utterances and the search index.",
         params=(
             Param(
-                "video_id",
+                "video",
                 int,
                 "Video to index. 0 indexes every video whose utterances are missing or stale.",
                 default=0,
@@ -4423,10 +4516,10 @@ register(
                   default=None, short="-s"),
             Param("video_local_speaker", str,
                   "Only hits by this raw diarizer label, e.g. SPEAKER_00."
-                  " Requires --video-id.", default=None),
+                  " Requires --video.", default=None),
             Param("cuttable", bool, "Only hits that can be cut (aligned words).",
                   default=False),
-            Param("video_id", int, "Only hits in this video. 0 searches every video.",
+            Param("video", int, "Only hits in this video. 0 searches every video.",
                   default=0),
             Param("limit", int, "Maximum hits.", default=C.SEARCH_DEFAULT_LIMIT, short="-n"),
         ),
@@ -4461,10 +4554,10 @@ register(
                   default=None, short="-s"),
             Param("video_local_speaker", str,
                   "Only hits by this raw diarizer label, e.g. SPEAKER_00."
-                  " Requires --video-id.", default=None),
+                  " Requires --video.", default=None),
             Param("cuttable", bool, "Only hits that can be cut (aligned words).",
                   default=False),
-            Param("video_id", int, "Only hits in this video. 0 searches every video.",
+            Param("video", int, "Only hits in this video. 0 searches every video.",
                   default=0),
             Param("limit", int, "Maximum hits.", default=C.SEARCH_DEFAULT_LIMIT, short="-n"),
             Param("pad_ms", int, "Milliseconds of padding on each side.",
@@ -4481,7 +4574,7 @@ register(
         group="index",
         summary="Delete a video's utterances. Rebuilt by `index build`.",
         params=(
-            Param("video_id", int, "Video whose utterances to drop.", positional=True),
+            Param("video", int, "Video whose utterances to drop.", positional=True),
         ),
         handler=index_drop,
     )
@@ -4493,7 +4586,7 @@ register(
         group="transcript",
         summary="Write the regenerable markdown transcript for one video.",
         params=(
-            Param("video_id", int, "Video to write a transcript for.", positional=True),
+            Param("video", int, "Video to write a transcript for.", positional=True),
         ),
         handler=transcript_build,
     )
@@ -4512,7 +4605,7 @@ from rytp.commands import search as _search  # noqa: E402,F401
 - [ ] **Step 6: Run the tests and watch them pass**
 
 Run: `python -m pytest tests/test_commands_search.py -v`
-Expected: PASS, 38 passed.
+Expected: PASS, 40 passed.
 
 - [ ] **Step 7: Check both surfaces picked them up**
 
@@ -4614,7 +4707,7 @@ def test_indexed_videos_is_empty_before_anything_is_indexed(db: Database) -> Non
 
 def test_transcript_show_returns_the_blocks_as_a_table(db: Database) -> None:
     video_id = corpus(db, "Добрый вечер дорогие друзья", title="Evening")
-    result = resolve("transcript.show").handler(db, video_id=video_id)
+    result = resolve("transcript.show").handler(db, video=video_id)
     assert result.columns == ("anchor", "start", "end", "speaker", "text")
     assert result.rows[0][0] == f"v{video_id}:0-3"
     assert result.rows[0][1] == "00:00:00.000"
@@ -4626,7 +4719,7 @@ def test_transcript_show_writes_no_file(db: Database) -> None:
     from rytp.config import paths
 
     video_id = corpus(db, "Добрый вечер")
-    resolve("transcript.show").handler(db, video_id=video_id)
+    resolve("transcript.show").handler(db, video=video_id)
     assert not paths().transcript(video_id).exists()
 
 
@@ -4637,7 +4730,7 @@ def test_transcript_show_names_the_speaker(db: Database) -> None:
     from rytp.index.utterances import index_video
 
     index_video(db, video_id)
-    assert resolve("transcript.show").handler(db, video_id=video_id).rows[0][3] == (
+    assert resolve("transcript.show").handler(db, video=video_id).rows[0][3] == (
         "SPEAKER_00"
     )
 
@@ -4646,7 +4739,7 @@ def test_transcript_show_tells_you_to_index_first(db: Database) -> None:
     video_id = make_video(db)
     add_words(db, video_id, "Добрый вечер")
     with pytest.raises(RytpError, match="index"):
-        resolve("transcript.show").handler(db, video_id=video_id)
+        resolve("transcript.show").handler(db, video=video_id)
 
 
 def test_transcript_show_is_not_long_running() -> None:
@@ -4752,7 +4845,7 @@ def indexed_videos(db: Database) -> list[tuple[int, str, int]]:
 In `rytp/commands/search.py`, beside `transcript_build`:
 
 ```python
-def transcript_show(db: Database, *, video_id: int) -> CommandResult:
+def transcript_show(db: Database, *, video: int) -> CommandResult:
     """The transcript as rows, without writing a file.
 
     `transcript.build` produces the durable markdown at
@@ -4761,11 +4854,11 @@ def transcript_show(db: Database, *, video_id: int) -> CommandResult:
     leaving a file behind. Both render from these rows, which is what
     keeps the two surfaces saying the same thing (design §10).
     """
-    blocks = transcript_blocks(db, video_id)
+    blocks = transcript_blocks(db, video)
     if not blocks:
         raise RytpError(
-            f"video {video_id} has no utterances; run `rytp index build "
-            f"--video-id {video_id}` first"
+            f"video {video} has no utterances; run `rytp index build "
+            f"--video {video}` first"
         )
     return CommandResult(
         columns=("anchor", "start", "end", "speaker", "text"),
@@ -4779,7 +4872,7 @@ def transcript_show(db: Database, *, video_id: int) -> CommandResult:
             )
             for block in blocks
         ),
-        message=f"{len(blocks)} block(s) in video {video_id}",
+        message=f"{len(blocks)} block(s) in video {video}",
     )
 ```
 
@@ -4792,7 +4885,7 @@ register(
         group="transcript",
         summary="Read a video's transcript as a table, without writing a file.",
         params=(
-            Param("video_id", int, "Video to read.", positional=True),
+            Param("video", int, "Video to read.", positional=True),
         ),
         handler=transcript_show,
     )
@@ -4869,7 +4962,7 @@ class TranscriptScreen(Screen[None]):
         table.cursor_type = "row"
         status = self.query_one("#transcript-status", Static)
         try:
-            result = resolve("transcript.show").handler(self._db, video_id=self._video_id)
+            result = resolve("transcript.show").handler(self._db, video=self._video_id)
         except RytpError as exc:
             # A TUI that raises on a normal mistake — an unindexed video —
             # is worse than one that says what to do about it.
@@ -5066,7 +5159,7 @@ def test_a_search_fills_the_session_from_the_command(db: Database) -> None:
     video_id = corpus(db, "Добрый вечер дорогие друзья", title="Evening")
     session = SearchSession(db)
     session.run("добрый вечер")
-    assert session.columns == ("anchor", "video", "time", "speaker", "cut", "text")
+    assert session.columns == ("anchor", "video", "time", "speaker", "tier", "text")
     assert session.rows[0][0] == f"v{video_id}:0-1"
     assert session.error is None
 
@@ -5080,12 +5173,15 @@ def test_the_session_reports_the_tier_because_an_inflection_is_not_what_was_type
     assert "stem match" in session.status
 
 
-def test_the_session_shows_cuttability_per_row(db: Database) -> None:
-    """A caption-tier hit cannot be cut, and the screen has to say so."""
-    corpus(db, "Добрый вечер", source="caption")
+def test_the_session_names_the_transcript_tier_per_row(db: Database) -> None:
+    """Contracts §3 has three tiers and the screen has to distinguish them:
+    a `timed` hit needs `transcribe align`, a caption hit needs a
+    transcriber, and only `aligned` can be cut."""
+    corpus(db, "Добрый вечер", source="caption", title="Captioned")
+    corpus(db, "Добрый вечер", source="timed", title="Timed")
     session = SearchSession(db)
     session.run("добрый вечер")
-    assert session.rows[0][4] == "no"
+    assert sorted(row[4] for row in session.rows) == ["caption", "timed"]
 
 
 def test_no_hits_is_a_status_line_not_an_error(db: Database) -> None:
@@ -5516,7 +5612,7 @@ git commit -m "feat(tui): search the corpus and play a hit without retyping an a
 
 The automated run uses **caption tier** deliberately: Part 3's `ingest_captions` parses a json3 file with no model and no binary, so the whole chain from words to transcript is exercised on a machine with neither. It calls `ingest_captions` directly rather than through `transcribe captions`, because the parameter spelling of Part 3's command is Part 3's to choose and this test should not break when it changes.
 
-The argv in this test (`--video-id`, `--cuttable`, `--speaker`) is the one place Part 4 assumes how Part 1's generated CLI spells a flag. **If it spells one differently, change the argv here, not the `Param`** — the registry definition is the contract and the surface is generated from it.
+The argv in this test (`--video`, `--cuttable`, `--speaker`) is the one place Part 4 assumes how Part 1's generated CLI spells a flag. **If it spells one differently, change the argv here, not the `Param`** — the registry definition is the contract and the surface is generated from it.
 
 **Files:**
 - Create: `tests/test_index_end_to_end.py`
@@ -5593,7 +5689,7 @@ def test_captions_become_a_searchable_index_and_a_transcript(
     runner = CliRunner()
     app = build_app()
 
-    built = runner.invoke(app, ["index", "build", "--video-id", str(captioned)])
+    built = runner.invoke(app, ["index", "build", "--video", str(captioned)])
     assert built.exit_code == 0, built.output
     assert db.conn.execute("SELECT COUNT(*) FROM utterances").fetchone()[0] >= 3
 
@@ -5844,7 +5940,7 @@ git commit -m "test: walk captions through index, search and transcript end to e
 
 Run this after the last task, with the design and the contracts open.
 
-- [ ] **Spec coverage.** Design §7, sentence by sentence: utterance FTS index (Task 2); exact phrase first, stem column as fallback (Task 4); results carry video, timestamp, speaker, surrounding sentence and cuttability (Task 4); filters by speaker and cuttable only (Task 4); playback and export through ffplay/ffmpeg (Task 6); markdown transcripts at `data/transcripts/{video_id}.md` with stable anchors (Task 7). Design §4 "Utterances": contiguous runs, speaker split, silence fallback, two FTS columns (Task 2). Contracts §3: `unicode61` never `porter` (Part 1's migration, re-asserted in Task 2), cuttable is `source = 'aligned'` (Task 4). Contracts §4: `stem_text` in `rytp/models.py` (Task 1), ё→е inherited from `normalize_text` and tested in both directions (Task 4), utterances re-derived after words change (Tasks 2, 3, 9). Contracts §5: `index` in `JOB_HANDLERS` with a payload-free readiness predicate (Task 3), commands in the registry (Task 8).
+- [ ] **Spec coverage.** Design §7, sentence by sentence: utterance FTS index (Task 2); exact phrase first, stem column as fallback (Task 4); results carry video, timestamp, speaker, surrounding sentence and cuttability (Task 4); filters by speaker and cuttable only (Task 4); playback and export through ffplay/ffmpeg (Task 6); markdown transcripts at `data/transcripts/{video_id}.md` with stable anchors (Task 7). Design §4 "Utterances": contiguous runs, speaker split, silence fallback, two FTS columns (Task 2). Contracts §3: `unicode61` never `porter` (Part 1's migration, re-asserted in Task 2); three transcript tiers, all searchable, only `aligned` cuttable, each named in results and in the transcript header (Tasks 4, 7, 8). Contracts §4: `stem_text` in `rytp/models.py` (Task 1), ё→е inherited from `normalize_text` and tested in both directions (Task 4), utterances re-derived after words change (Tasks 2, 3, 9). Contracts §5: `index` in `JOB_HANDLERS` with a payload-free readiness predicate (Task 3), commands in the registry (Task 8).
 - [ ] **Both named regressions have a test that cannot be weakened.** `test_a_two_word_phrase_whose_words_are_adjacent_returns_a_hit` and `test_a_russian_inflection_is_found_through_the_stem_tier`, Task 4 Step 1.
 - [ ] **Cross-boundary coverage is explicit.** Task 5 covers a silence split (found), a speaker split (correctly not found), a cross-video pair (not found), a bridged hit through the stem tier, the three filters on a bridged hit, and the known limitation.
 - [ ] **No test spawns a player.** `grep -rn "subprocess" tests/test_index_*.py tests/test_commands_search.py tests/test_tui_search.py` should show only the deliberate import probes in `test_index_job.py` and the `CompletedProcess` fakes. `rytp/index/export.py` is the only Part 4 module importing `subprocess`; the TUI screens reach it only through `search.play`.
@@ -5856,7 +5952,7 @@ Run this after the last task, with the design and the contracts open.
 - [ ] **Names agree across tasks.** Task 2: `IndexedWord`, `UtteranceDraft`, `implied_end_ms`, `build_utterances`, `words_for`, `index_video`, `index_readiness`, `videos_needing_index`. Tasks 4-5: `MatchTier`, `SearchHit`, `SearchResult`, `AnchorSpan`, `anchor_for`, `parse_anchor`, `anchor_filename`, `query_tokens`, `tokens_for_tier`, `fts_phrase`, `span_for_anchor`, `search`, `rarest_token_index`, `walk_matches`. Tasks 6-7: `MediaToolMissing`, `ClipError`, `clip_source`, `padded`, `build_clip_command`, `build_play_command`, `export_clip`, `play_clip`, `timestamp`, `TranscriptBlock`, `transcript_blocks`, `render_transcript`, `write_transcript`. Task 8 imports exactly these spellings and no others.
 - [ ] **`index.drop` leaves nothing behind.** Utterances gone, `utterances_fts` gone with them (trigger), `words` untouched, `integrity-check` clean, and the video is no longer searchable by any route — including the cross-boundary walk, which skips a run no utterance covers. Four tests in Task 2, three in Task 8.
 - [ ] **Two health checks, honest results, correct exit code.** `ffplay` and `fts5` are in `HEALTH_CHECKS`; both return a `HealthResult` rather than raising; `ok` reports what was actually found in each case; `ffplay` is `required=False` and `fts5` is `required=True` (contracts §5); and the FTS5 remedy is a fix a user can run rather than a restatement of the problem.
-- [ ] **Two speaker identifier spaces, one resolver.** `grep -n "local_label" rytp/index/ rytp/commands/search.py` finds it only in the *display* COALESCE, never in a filter. `rytp/index/search.py` takes `frozenset[int]` and no speaker string; `rytp/commands/search.py` calls `speaker_scope` and defines no resolution of its own (contracts §5). `--speaker` rejects `SPEAKER_00`; `--video-local-speaker` without `--video-id` is an error. All four pinned by tests in Task 8.
+- [ ] **Two speaker identifier spaces, one resolver.** `grep -n "local_label" rytp/index/ rytp/commands/search.py` finds it only in the *display* COALESCE, never in a filter. `rytp/index/search.py` takes `frozenset[int]` and no speaker string; `rytp/commands/search.py` calls `resolve_speaker_filter` and defines no resolution of its own (contracts §5), passing `video or None` so the command's `0`-means-every-video sentinel never reaches the resolver's `video_id: int | None`. `--speaker` rejects `SPEAKER_00`; `--video-local-speaker` without `--video` is an error. All four pinned by tests in Task 8.
 - [ ] **Every `NOT NULL` column is supplied by its inserting fixture** (contracts §3) — `video_speakers.engine` most easily missed. Task 1's parametrized test names them; `make_speaker` supplies `engine`.
 - [ ] **Portable run steps** (contracts §1). no run step in this plan names an absolute interpreter, a home directory or a system temp path. Every step is `python -m pytest`, `ruff`, `mypy` or `python scripts/...`.
 - [ ] **One row, one token.** Contracts §4 and Part 3's `split_token` are what let `_locate` and `_row_run` compare rows to tokens directly. `grep -n "split()" rytp/index/search.py` should find it only in `query_tokens` and `tokens_for_tier`, never over a `words` column. The test helper `stored_tokens` seeds rows the same way, and `test_a_hyphen_and_a_yo_in_the_same_query` pins the interaction with the ё fold.
@@ -5866,6 +5962,6 @@ Run this after the last task, with the design and the contracts open.
 
 - **Part 5 (assembly)** should build its longest-run matcher on `walk_matches` / `rarest_token_index` in `rytp/index/search.py` rather than writing a second ordinal walk. That function is already design §8's access path — anchor on a word through `words(normalized_text)`, then walk forward comparing ordinals — and it already enforces the single-speaker rule that keeps a match honest. What Part 5 adds is longest-run-wins, scoring and `Fragment`, not a new traversal.
 - **Part 7 (diarization)** deletes a video's utterances and enqueues its `index` job after assigning speakers, which is exactly right: design §7's speaker filter searches utterances, so they have to be rebuilt to carry the speakers and to be re-split on speaker change instead of on silence. Task 3's `test_the_state_part_seven_leaves_behind_is_ready` pins that hand-off from this side. `index_readiness` also covers the weaker case where speakers are filled in place and the utterances are left alone, so a reconcile re-fires even if that enqueue is ever missed.
-- **Part 5 and Part 7** both had a `resolve_speaker` of their own when this plan was reviewed. Contracts §5 now puts one in `rytp/commands/__init__.py` and forbids the rest; Part 4 calls that one and nothing else. If Part 1's spelling differs from `speaker_scope`, Task 1 Step 1 catches it in one place.
+- **Part 5 and Part 7** both had a `resolve_speaker` of their own, and an earlier draft of this plan had a third shape, which is why contracts §5 now pins the signature rather than only naming the responsibility. Part 4 calls `resolve_speaker_filter` and nothing else; Task 1 asserts the dataclass fields and the keyword names, so a drift shows up in one test rather than four call sites.
 - **Whoever adds more TUI screens** should keep the `SearchSession` split: logic in a plain dataclass calling registered handlers, the `Screen` a shell over it. It is what let Task 10's behaviour be tested without a terminal, and it is why the unsettled speaker-resolver signature does not reach the TUI at all.
 - **Whoever owns the ingest chain** should decide whether `ingest` gains `index` (and `transcribe`) as a follow-on. Today Part 2's chain stops at `extract_wav`, Part 3 registers no job kinds, and `index.build --enqueue` (Task 8) is the only thing that creates an `index` job.

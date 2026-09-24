@@ -1,16 +1,15 @@
-"""Diarizer subsystem — speaker diarization engines.
+"""Speaker diarization and the speaker roster.
 
-Public surface:
+Importing this package is what makes an engine's name resolvable: each
+module registers its class at import time, so a name that is never imported
+is a name that does not exist.
 
-* :class:`Diarizer` — protocol (re-exported from :mod:`rytp.engines`).
-* :class:`DiarSegment` — typed tuple (re-exported).
-* :class:`NullDiarizer` — default, no HF token.
-* :class:`EnergyDiarizer` — simple energy-based diarization, no HF token.
-* :class:`PyannoteDiarizer` — gated on HF_TOKEN. Importing this module
-  is safe; instantiation is what requires ``rytp[pyannote]``.
+Only the engine modules are imported here. `store`, `pipeline`, `link` and
+`mapper` are imported by their callers, because `pyannote` and `embed` are
+loaded inside a *foreign* interpreter by the out-of-process seam and must
+not drag the database layer along with them.
 """
-from rytp.diarize.base import DiarSegment, Diarizer, NullDiarizer
-from rytp.diarize.energy import EnergyDiarizer
-from rytp.diarize.pyannote import PyannoteDiarizer
 
-__all__ = ["DiarSegment", "Diarizer", "NullDiarizer", "EnergyDiarizer", "PyannoteDiarizer"]
+from __future__ import annotations
+
+from rytp.diarize import embed, none, pyannote  # noqa: F401

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the two transcript tiers — free caption-tier words for the whole corpus, and cut-accurate aligned-tier words for the videos worth mining — on top of swappable transcriber/aligner engines, energy-measured word boundaries, and a one-row-per-video acoustic fingerprint.
+**Goal:** Build the three transcript tiers — free `caption` words for the whole corpus, `timed` words wherever a transcriber has run, and cut-accurate `aligned` words for the videos worth mining — on top of swappable transcriber/aligner engines, energy-measured word boundaries, and a one-row-per-video acoustic fingerprint.
 
-**Architecture:** Text comes from a transcriber, rough timings from an aligner, and the *final* boundary is measured in the audio — the local energy minimum between two words, snapped to a zero crossing, with voice-activity edges taken as free true boundaries. Nothing downstream may assume a particular engine: engines are classes in a name registry, `words.engine` records what produced each row, and a `transcribe.compare` command runs several engines over the same audio and reports where they disagree on text, on timings, and on how much silence actually sits at each claimed boundary. Engines whose dependencies conflict declare `out_of_process = True` and run under their own interpreter behind a JSON-file subprocess seam.
+**Architecture:** Text comes from a transcriber, rough timings from an aligner, and the *final* boundary is measured in the audio. Only a run that actually had an aligner writes the cuttable `aligned` tier; a transcriber's own timestamps are written `timed`, because measured on real data 78.7% of their word gaps are exactly zero and energy refinement cannot place a boundary that was never there. — the local energy minimum between two words, snapped to a zero crossing, with voice-activity edges taken as free true boundaries. Nothing downstream may assume a particular engine: engines are classes in a name registry, `words.engine` records what produced each row, and a `transcribe.compare` command runs several engines over the same audio and reports where they disagree on text, on timings, and on how much silence actually sits at each claimed boundary. Engines whose dependencies conflict declare `out_of_process = True` and run under their own interpreter behind a JSON-file subprocess seam.
 
 **Tech Stack:** Python 3.11+, SQLite, numpy (base dependency), stdlib `wave` and `subprocess`, ffmpeg for loudness only. Optional extras, all lazily imported and none required by the test suite: `faster-whisper`, `gigaam`, Montreal Forced Aligner (`russian_mfa`), `torch`/`transformers` for a wav2vec2 CTC fallback.
 
@@ -48,6 +48,8 @@ Part 3 consumes these. They must exist before the first Part 3 test runs. Each i
 | `rytp/db/schema.py`: `MIGRATIONS` creating `videos`, `assets`, `words`, `utterances`, `video_speakers`, `video_acoustics`, `settings` exactly as contracts §3 spells them | Part 1 | all DB tasks |
 | `rytp/commands/__init__.py`: `REQUIRED`, `Param`, `Command`, `CommandResult`, `register`, `resolve`, `COMMANDS` (contracts §5) | Part 1 | Task 17 |
 | `rytp/constants.py` exists and is importable with **stdlib imports only** | Part 1 | everywhere |
+| `rytp/constants.py`: `SETTING_DEFAULT_TRANSCRIBER` (`"default_transcriber"`) and `DEFAULT_TRANSCRIBER_FALLBACK` (`"gigaam"`), contracts §3 "Choosing a transcriber" — declared in Part 2's block beside `SETTING_DEFAULT_ALIGNER`, because Part 2's `ingest` must resolve them while Part 3 may still be absent | Part 2 | one import site, `rytp/transcribe/registry.py::default_transcriber` |
+| `rytp/db/queries.py`: `set_setting(db, key, value)` | Part 1 | tests only — Tasks 1, 17, 19 write `default_transcriber` |
 | `rytp/__init__.py` and `rytp/transcribe/__init__.py` stay **import-light** (no numpy, no heavy deps) | Part 1 / this part | the out-of-process child imports engine modules under a foreign interpreter |
 | `tests/conftest.py` fixtures `tmp_path`, `data_dir`, `db` with their contracted names and semantics | Part 1 | all tests |
 | `tests/conftest.py` roots `tmp_path` at `$RYTP_TEST_TMP` when that variable is set, falling back to a workspace-local directory — which is why every test invocation below sets it | Part 1 | all tests |
@@ -70,7 +72,7 @@ Contracts §2 fixes the tree. Part 3 owns:
 | File | Responsibility |
 |---|---|
 | `rytp/transcribe/base.py` | Protocols (`Transcriber`, `Aligner`), engine errors, the absolute-timestamp convention, and the two stdlib-only helpers every adapter needs (`shift_words`, `slice_wav_window`). **Import-light on purpose** — imported by every adapter, including inside a foreign interpreter. |
-| `rytp/transcribe/registry.py` | `TRANSCRIBERS` / `ALIGNERS` name→**class** registries, `register_*`, `resolve_*`, the HF-token gate, the settings lookup that supplies an out-of-process engine's interpreter, and the row source for `transcribe.engines`. |
+| `rytp/transcribe/registry.py` | `TRANSCRIBERS` / `ALIGNERS` name→**class** registries, `register_*`, `resolve_*`, the HF-token gate, the settings lookups that supply an out-of-process engine's interpreter and the `default_transcriber` (contracts §3), and the row source for `transcribe.engines`. |
 | `rytp/transcribe/subproc.py` | *(added to the contract tree — justified below)* The out-of-process seam: parent-side runner and child-side entry point. |
 | `rytp/transcribe/captions.py` | json3 auto-captions → caption-tier `words` rows. |
 | `rytp/transcribe/pipeline.py` | *(added to the contract tree — justified below)* Aligned-tier orchestration: VAD chunk → transcribe → align → refine → write; plus re-alignment of existing words. |
@@ -87,7 +89,7 @@ Contracts §2 fixes the tree. Part 3 owns:
 **Two files added beyond the contract tree, with reasons:**
 
 - `rytp/transcribe/subproc.py` — contracts §6 mandates an out-of-process seam but gives it no home. It cannot live in `base.py`, which must stay importable under a foreign interpreter with nothing but the standard library; process management, temp files and stderr handling are a separate responsibility.
-- `rytp/transcribe/pipeline.py` — the aligned-tier orchestration imports numpy and `rytp.audio`, which `base.py` must not, and command handlers stay thin per contracts §5.
+- `rytp/transcribe/pipeline.py` — the transcription orchestration imports numpy and `rytp.audio`, which `base.py` must not, and command handlers stay thin per contracts §5.
 - `rytp/transcribe/readiness.py` — Part 2's registration contract requires the readiness predicates to live in a module light enough for `rytp/jobs/__init__.py` to import at module load. `pipeline.py` imports numpy and is therefore disqualified.
 - `rytp/transcribe/health.py` — contracts §5 has each part contribute its own `doctor` checks. They are neither a command nor a stage, and they must stay importable without touching an engine.
 
@@ -115,7 +117,7 @@ Do **not** copy `fake_video_row` from the current `tests/conftest.py`: it contai
 - Consumes: `rytp.models.RawWord`, `rytp.models.Span`, `rytp.models.RytpError`; `Database.conn`.
 - Produces:
   - `rytp.transcribe.base`: `Transcriber`, `Aligner` (Protocols), `EngineUnavailable`, `EngineSubprocessError`, `split_token(text) -> list[tuple[str, str]]`, `shift_words(words, offset_ms) -> list[RawWord]`, `slice_wav_window(src, dst, start_ms, end_ms) -> Path`.
-  - `rytp.transcribe.registry`: `TRANSCRIBERS`, `ALIGNERS`, `register_transcriber`, `register_aligner`, `resolve_transcriber`, `resolve_aligner`, `check_available(cls)`, `interpreter_for(db, name)`, `setting(db, key, default)`, `load_transcriber(db, name, **kw)`, `load_aligner(db, name, **kw)`, `engine_rows(db)`.
+  - `rytp.transcribe.registry`: `TRANSCRIBERS`, `ALIGNERS`, `register_transcriber`, `register_aligner`, `resolve_transcriber`, `resolve_aligner`, `check_available(cls)`, `interpreter_for(db, name)`, `setting(db, key, default)`, `default_transcriber(db)`, `load_transcriber(db, name, **kw)`, `load_aligner(db, name, **kw)`, `engine_rows(db)`.
   - `tests/fake_engines.py`: `FakeTranscriber`, `NoEndTimesTranscriber`, `FakeAligner`, `ShortAligner`, `GatedTranscriber`, `OutOfProcessTranscriber`, `MissingModuleTranscriber`, `registered(*classes)`.
 
 - [ ] **Step 1: Append the Part 3 constants block to `rytp/constants.py`**
@@ -261,8 +263,12 @@ ENGINE_SUBPROCESS_STDERR_TAIL: int = 20
 #: words.engine value for caption-tier rows (design §6, tier 1).
 CAPTION_ENGINE: str = "captions:json3"
 
-#: Default engine names and model identifiers (design §6, "Recommended stack").
-DEFAULT_TRANSCRIBER: str = "whisper"
+#: Default model identifiers (design §6, "Recommended stack").
+#: **There is deliberately no DEFAULT_TRANSCRIBER here.** contracts §3
+#: "Choosing a transcriber" makes the engine a *setting* — Part 2's
+#: `SETTING_DEFAULT_TRANSCRIBER`, read through
+#: `rytp.transcribe.registry.default_transcriber` — so that a run which used
+#: the default can say so. A constant cannot; that is the whole point.
 WHISPER_DEFAULT_MODEL: str = "large-v3"
 GIGAAM_DEFAULT_MODEL: str = "v3_rnnt"
 MFA_ACOUSTIC_MODEL: str = "russian_mfa"
@@ -460,7 +466,9 @@ import sys
 
 import pytest
 
+from rytp import constants as C
 from rytp.db import Database
+from rytp.db.queries import set_setting
 from rytp.transcribe import registry
 from rytp.transcribe.base import EngineUnavailable
 from tests.fake_engines import (
@@ -552,6 +560,31 @@ def test_engine_rows_reports_kind_and_availability(db: Database) -> None:
     assert rows["fake-aligner"][1] == "aligner"
     assert rows["fake"][4] == "ready"
     assert "definitely_not_installed_xyz" in rows["fake-missing"][4]
+
+
+def test_the_default_transcriber_is_the_russian_engine_out_of_the_box(
+    db: Database,
+) -> None:
+    # contracts §3: the corpus is Russian and gigaam roughly halves Whisper's
+    # word error rate there. Part 1 seeds no row for this key, so the value
+    # has to come from the fallback or "defaults to gigaam" is not true.
+    assert registry.default_transcriber(db) == C.DEFAULT_TRANSCRIBER_FALLBACK
+    assert registry.default_transcriber(db) == "gigaam"
+
+
+def test_the_setting_wins_over_the_fallback(db: Database) -> None:
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "whisper")
+    assert registry.default_transcriber(db) == "whisper"
+
+
+def test_an_empty_default_transcriber_is_not_a_way_to_turn_it_off(
+    db: Database,
+) -> None:
+    # Empty is meaningful for default_aligner and meaningless here: a
+    # transcribe run with no engine does nothing at all, so there is no
+    # unset path and this always answers with a name.
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "  ")
+    assert registry.default_transcriber(db) == C.DEFAULT_TRANSCRIBER_FALLBACK
 ```
 
 - [ ] **Step 4: Run the test to verify it fails**
@@ -805,6 +838,33 @@ def setting(db: Database, key: str, default: str | None = None) -> str | None:
     return default if row is None else str(row[0])
 
 
+def default_transcriber(db: Database) -> str:
+    """The engine to use when no ``--transcriber`` was named (contracts §3).
+
+    Reads Part 2's ``default_transcriber`` setting, falling back to the
+    shipped value — Part 1's migration seeds ``default_aligner`` and not this
+    key, so the fallback is what makes "defaults to gigaam" true. **Empty is
+    not meaningful here**, unlike for the aligner: an empty aligner reads as
+    "no alignment, the words stay `timed`", an empty transcriber would mean
+    nothing runs. So this always returns a name.
+
+    `gigaam` is the Russian-specific engine and published benchmarks put it
+    at roughly half Whisper's Russian word error rate, which matters at
+    35-90 GPU-hours for the corpus. **A starting point, not a verdict:** the
+    one published test on *noisy YouTube* audio — which is exactly this
+    corpus — favoured a Russian-finetuned Whisper instead. That is what
+    ``transcribe compare`` is for; re-run it on real material and rewrite the
+    setting rather than treating this value as settled.
+
+    Callers that used this rather than an explicit name must say so, and must
+    let :func:`check_available` raise when the chosen engine is not
+    installed — never substitute another one. ``words.engine`` records what
+    actually ran, which only helps if nothing lies about what it used.
+    """
+    name = (setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "") or "").strip()
+    return name or C.DEFAULT_TRANSCRIBER_FALLBACK
+
+
 def interpreter_for(db: Database, name: str) -> str:
     """Interpreter an out-of-process engine runs under (design §6).
 
@@ -915,7 +975,7 @@ Run:
 ```bash
 python -m pytest tests/test_transcribe_registry.py tests/test_transcribe_tokens.py -v
 ```
-Expected: 22 passed.
+Expected: 25 passed.
 
 - [ ] **Step 9: Lint and type-check**
 
@@ -2466,7 +2526,7 @@ git commit -m "feat(audio): plan transcriber chunks at silences under the per-ca
 
 ### Task 8: Caption tier ingest
 
-Tier 1 of design §6: auto-captions Part 2 already downloaded become searchable words for no GPU time at all. They carry per-word start times on a 40 ms grid and **no end times**, their alignment is loose, and the schema forbids cutting them (`CHECK (source = 'caption' OR end_ms IS NOT NULL)`).
+Tier 1 of contracts §3: auto-captions Part 2 already downloaded become searchable words for no GPU time at all. They carry per-word start times on a 40 ms grid and **no end times**, their alignment is loose, and the schema forbids cutting them (`CHECK (source = 'caption' OR end_ms IS NOT NULL)`).
 
 **Files:**
 - Create: `rytp/transcribe/captions.py`
@@ -2811,18 +2871,19 @@ def captions_asset_path(db: Database, video_id: int) -> Path:
 def ingest_captions(db: Database, video_id: int, path: Path | None = None) -> int:
     """Replace the video's words with caption-tier rows. Returns how many.
 
-    Refuses to run on an aligned-tier video: that would trade real boundaries
-    for loose ones. Promotion goes the other way, through
+    Refuses to run on a video that already has `timed` or `aligned` words:
+    either is better text than captions, so overwriting would be a downgrade.
+    Promotion goes the other way, through
     :func:`rytp.transcribe.pipeline.transcribe_video`.
     """
     source = path if path is not None else captions_asset_path(db, video_id)
-    aligned = db.conn.execute(
-        "SELECT COUNT(*) FROM words WHERE video_id = ? AND source = 'aligned'",
+    transcribed = db.conn.execute(
+        "SELECT COUNT(*) FROM words WHERE video_id = ? AND source <> 'caption'",
         (video_id,),
     ).fetchone()[0]
-    if aligned:
+    if transcribed:
         raise CaptionDowngrade(
-            f"video {video_id} already has {aligned} aligned words; "
+            f"video {video_id} already has {transcribed} transcribed words; "
             "captions would be a downgrade"
         )
     caption_words = parse_json3(load_json3(source))
@@ -2878,7 +2939,7 @@ git commit -m "feat(transcribe): ingest json3 auto-captions as caption-tier word
 
 ---
 
-### Task 9: The aligned-tier pipeline
+### Task 9: The transcription pipeline — `timed` and `aligned`
 
 **Files:**
 - Create: `rytp/transcribe/pipeline.py`
@@ -2911,7 +2972,7 @@ class ScorelessAligner(FakeAligner):
 Create `tests/test_transcribe_pipeline.py`:
 
 ```python
-"""Tier 2: transcriber text, aligner timings, measured boundaries, one write."""
+"""Transcriber text, aligner timings, measured boundaries, one write, one tier."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -2923,6 +2984,8 @@ from rytp.models import RytpError
 from rytp.transcribe.pipeline import (
     AlignmentMismatch,
     engine_tag,
+    speaker_loss_warning,
+    tier_for,
     transcribe_video,
 )
 from tests.fake_engines import (
@@ -2970,12 +3033,24 @@ def test_engine_tag_records_every_stage() -> None:
     assert engine_tag("whisper", None, False) == "whisper"
 
 
-def test_transcribe_writes_cuttable_aligned_words(db: Database, tmp_path: Path) -> None:
+def test_only_a_run_with_an_aligner_produces_a_cuttable_tier() -> None:
+    assert tier_for("mfa") == "aligned"
+    assert tier_for(None) == "timed"
+    assert tier_for("") == "timed"
+
+
+def test_without_an_aligner_the_words_are_timed_and_not_cuttable(
+    db: Database, tmp_path: Path
+) -> None:
+    # Contracts §3: the transcriber's own timestamps are 78.7% zero-gap on
+    # real data. Energy refinement improves them but cannot place a boundary
+    # that was never there, so these rows are searchable, not cuttable.
     video_id = _make_video(db)
     wav = _make_wav(tmp_path)
     with registered(FakeTranscriber):
         outcome = transcribe_video(db, video_id, wav_path=wav, transcriber="fake")
     assert outcome.n_words == 3
+    assert outcome.source == "timed"
     rows = db.conn.execute(
         "SELECT ord, start_ms, end_ms, text, source, engine FROM words "
         "WHERE video_id = ? ORDER BY ord",
@@ -2983,8 +3058,53 @@ def test_transcribe_writes_cuttable_aligned_words(db: Database, tmp_path: Path) 
     ).fetchall()
     assert [row[0] for row in rows] == [0, 1, 2]
     assert all(row[2] is not None and row[2] > row[1] for row in rows)
-    assert {row[4] for row in rows} == {"aligned"}
+    assert {row[4] for row in rows} == {"timed"}
     assert {row[5] for row in rows} == {"fake+energy"}
+
+
+def test_with_an_aligner_the_words_are_aligned_and_cuttable(
+    db: Database, tmp_path: Path
+) -> None:
+    video_id = _make_video(db)
+    with registered(FakeTranscriber, FakeAligner):
+        outcome = transcribe_video(
+            db,
+            video_id,
+            wav_path=_make_wav(tmp_path),
+            transcriber="fake",
+            aligner="fake-aligner",
+        )
+    assert outcome.source == "aligned"
+    sources = {
+        row[0]
+        for row in db.conn.execute(
+            "SELECT source FROM words WHERE video_id = ?", (video_id,)
+        ).fetchall()
+    }
+    assert sources == {"aligned"}
+
+
+def test_replacing_a_transcript_reports_the_speaker_labels_it_destroyed(
+    db: Database, tmp_path: Path
+) -> None:
+    # Contracts §4 deletes them and Part 7's diarize is reopenable=False, so
+    # nothing brings them back. Saying so is the least this can do.
+    video_id = _make_video(db)
+    wav = _make_wav(tmp_path)
+    with registered(FakeTranscriber):
+        transcribe_video(db, video_id, wav_path=wav, transcriber="fake")
+        db.conn.execute(
+            "INSERT INTO video_speakers (video_id, local_label, engine) "
+            "VALUES (?, 'SPEAKER_00', 'fake-diarizer')",
+            (video_id,),
+        )
+        db.conn.commit()
+        outcome = transcribe_video(db, video_id, wav_path=wav, transcriber="fake")
+    assert outcome.speakers_lost == 1
+    warning = speaker_loss_warning(video_id, outcome.speakers_lost)
+    assert warning is not None
+    assert "speakers diarize" in warning
+    assert speaker_loss_warning(video_id, 0) is None
 
 
 def test_adjacent_words_share_a_measured_boundary(db: Database, tmp_path: Path) -> None:
@@ -3243,12 +3363,16 @@ class AlignmentMismatch(RytpError):
 
 @dataclass(frozen=True)
 class TranscribeOutcome:
-    """What one aligned-tier run produced."""
+    """What one transcription run produced, including which tier it wrote."""
 
     video_id: int
     n_words: int
     n_chunks: int
     engine: str
+    #: The `words.source` tier this run wrote: "timed" or "aligned".
+    source: str
+    #: Speaker labels destroyed along with the old transcript, if any.
+    speakers_lost: int
     median_align_score: float | None
 
 
@@ -3257,6 +3381,26 @@ _WORD_COLUMNS = (
     "confidence, align_score, source, engine, video_speaker_id"
 )
 _INSERT_WORD = f"INSERT INTO words ({_WORD_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+
+def tier_for(aligner: str | None) -> str:
+    """Which `words.source` tier this run produces (contracts §3).
+
+    An aligner ran, so every boundary was actually placed: ``aligned``, which
+    is the definition of cuttable. No aligner, so the boundaries are the
+    transcriber's own: ``timed`` — searchable, not cuttable.
+
+    This is the whole point of the three-tier scheme. Measured on the owner's
+    real data, 78.7% of the transcriber's word gaps are exactly zero, because
+    it sets ``word[i].end == word[i+1].start`` and absorbs every pause into a
+    neighbour. Energy refinement still runs on a `timed` transcript and still
+    improves it, but it relocates a boundary inside a window — it cannot place
+    one that was never there. Writing these rows ``aligned`` and hoping is
+    exactly what the design exists to prevent, and nothing downstream could
+    have caught it: ``align_score`` is null without an aligner and no consumer
+    reads ``words.engine``.
+    """
+    return "aligned" if aligner else "timed"
 
 
 def engine_tag(transcriber: str, aligner: str | None, refined: bool) -> str:
@@ -3344,13 +3488,16 @@ def transcribe_video(
         spans = enforce_monotonic(spans, total_ms=total_ms)
 
     tag = engine_tag(transcriber, aligner, refine)
-    replace_words(db, video_id, words, spans, tag)
+    tier = tier_for(aligner)
+    removed = replace_words(db, video_id, words, spans, tag, source=tier)
     scores = [span.score for span in spans if span.score is not None]
     return TranscribeOutcome(
         video_id=video_id,
         n_words=len(words),
         n_chunks=len(chunks),
         engine=tag,
+        source=tier,
+        speakers_lost=removed.video_speakers,
         median_align_score=float(median(scores)) if scores else None,
     )
 
@@ -3489,6 +3636,24 @@ def invalidate_transcript(db: Database, video_id: int) -> TranscriptRemoval:
     return removed
 
 
+def speaker_loss_warning(video_id: int, speakers_lost: int) -> str | None:
+    """Warn when replacing a transcript threw away human work, permanently.
+
+    Contracts §4 makes replacing a video's words delete its `video_speakers`,
+    and Part 7 registers `diarize` with ``reopenable=False`` so `reconcile`
+    will never bring it back. Both decisions are right on their own; together
+    they mean a re-transcribed video loses its speaker dimension for good and
+    says nothing about it. This is that something.
+    """
+    if speakers_lost <= 0:
+        return None
+    return (
+        f"warning: dropped {speakers_lost} speaker label(s) with the previous "
+        f"transcript. Nothing re-derives them — run `rytp speakers diarize "
+        f"{video_id}` and re-map the labels to get the speaker dimension back."
+    )
+
+
 def enqueue_index(db: Database, video_id: int) -> None:
     """Ask for the video's utterances to be rebuilt (contracts §5).
 
@@ -3544,8 +3709,14 @@ def replace_words(
     words: Sequence[RawWord],
     spans: Sequence[Span],
     engine: str,
-) -> int:
-    """Swap in a fresh set of aligned words for one video, in one transaction."""
+    *,
+    source: str,
+) -> TranscriptRemoval:
+    """Swap in a fresh transcript for one video, in one transaction.
+
+    ``source`` is the tier from :func:`tier_for`. Returns what the replacement
+    destroyed, so a caller can warn about speaker labels it cannot rebuild.
+    """
     rows = []
     for ordinal, (word, span) in enumerate(zip(words, spans, strict=True)):
         normalized = normalize_text(word.text)
@@ -3560,15 +3731,15 @@ def replace_words(
                 stem_text(normalized),
                 word.confidence,
                 span.score,
-                "aligned",
+                source,
                 engine,
                 None,
             )
         )
     with db.transaction():
-        invalidate_transcript(db, video_id)
+        removed = invalidate_transcript(db, video_id)
         db.conn.executemany(_INSERT_WORD, rows)
-    return len(rows)
+    return removed
 ```
 
 - [ ] **Step 5: Run the test to verify it passes**
@@ -3591,12 +3762,12 @@ Expected: no findings.
 
 ```bash
 git add rytp/transcribe/pipeline.py tests/fake_engines.py tests/test_transcribe_pipeline.py
-git commit -m "feat(transcribe): aligned-tier pipeline with measured word boundaries"
+git commit -m "feat(transcribe): transcription pipeline writing the timed and aligned tiers"
 ```
 
 ---
 
-### Task 10: Re-alignment of existing words
+### Task 10: Alignment of existing words — the `timed` to `aligned` upgrade
 
 Design §4 lists `align` as its own job kind. Since the database is the only channel between stages, a separate align job can only mean one thing: re-time words that already exist, keeping their text. That is exactly the operation that makes aligners swappable (design §11, M0) — try a different one without paying for transcription again.
 
@@ -3638,6 +3809,30 @@ def test_realign_retimes_words_without_changing_their_text(
     assert {row[3] for row in after} == {"fake+fake-aligner+energy"}
 
 
+def test_aligning_upgrades_a_timed_transcript_in_place(
+    db: Database, tmp_path: Path
+) -> None:
+    # The promotion path of contracts §3: same text, same ordinals, tier moves
+    # from timed to aligned and the words become cuttable.
+    video_id = _make_video(db)
+    wav = _make_wav(tmp_path)
+    with registered(FakeTranscriber, FakeAligner):
+        transcribe_video(db, video_id, wav_path=wav, transcriber="fake")
+        assert {
+            row[0]
+            for row in db.conn.execute(
+                "SELECT source FROM words WHERE video_id = ?", (video_id,)
+            ).fetchall()
+        } == {"timed"}
+        outcome = realign_video(db, video_id, wav_path=wav, aligner="fake-aligner")
+    assert outcome.source == "aligned"
+    rows = db.conn.execute(
+        "SELECT source, text FROM words WHERE video_id = ? ORDER BY ord", (video_id,)
+    ).fetchall()
+    assert {row[0] for row in rows} == {"aligned"}
+    assert [row[1] for row in rows] == ["один", "два", "три"]
+
+
 def test_realign_keeps_speaker_labels(db: Database, tmp_path: Path) -> None:
     video_id = _make_video(db)
     wav = _make_wav(tmp_path)
@@ -3662,6 +3857,8 @@ def test_realign_keeps_speaker_labels(db: Database, tmp_path: Path) -> None:
 
 
 def test_realign_refuses_a_caption_tier_video(db: Database, tmp_path: Path) -> None:
+    # Captions have starts on a 40 ms grid and no ends; there is nothing there
+    # for an aligner to improve. Transcribe first.
     video_id = _make_video(db)
     db.conn.execute(
         "INSERT INTO words (video_id, ord, start_ms, text, normalized_text, stem, "
@@ -3710,11 +3907,17 @@ def realign_video(
     refine: bool = True,
     aligner_kwargs: dict[str, Any] | None = None,
 ) -> TranscribeOutcome:
-    """Re-time a video's existing words with a different aligner.
+    """Align a video's existing words, upgrading the tier in place.
 
-    The text is kept, so ordinals and therefore speaker labels stay valid;
-    only the timings, the alignment scores and the engine tag change. This is
-    what makes aligners swappable without paying for transcription again.
+    Two jobs in one. A `timed` transcript — the transcriber's own timestamps,
+    searchable but not cuttable — becomes `aligned` and therefore cuttable,
+    which is the promotion path contracts §3 describes. An already-`aligned`
+    transcript gets re-timed by a different aligner, which is what makes
+    aligners swappable without paying for transcription again.
+
+    Either way the text is kept, so ordinals and the speaker labels hanging
+    off them stay valid; only the timings, the alignment scores, the engine
+    tag and the source tier change.
     """
     rows = db.conn.execute(
         "SELECT ord, start_ms, text, confidence, source, engine FROM words "
@@ -3723,7 +3926,7 @@ def realign_video(
     ).fetchall()
     if not rows:
         raise RytpError(f"video {video_id} has no words to re-align")
-    if any(str(row[4]) != "aligned" for row in rows):
+    if any(str(row[4]) == "caption" for row in rows):
         raise RytpError(
             f"video {video_id} is caption-tier; run transcribe run to promote it"
         )
@@ -3777,10 +3980,11 @@ def realign_video(
     tag = engine_tag(base, aligner, refine)
     with db.transaction():
         # Utterances copy word timings, so they are stale; Part 4 rebuilds them.
+        # Speaker labels are kept: the text and the ordinals did not change.
         db.conn.execute("DELETE FROM utterances WHERE video_id = ?", (video_id,))
         db.conn.executemany(
-            "UPDATE words SET start_ms = ?, end_ms = ?, align_score = ?, engine = ? "
-            "WHERE video_id = ? AND ord = ?",
+            "UPDATE words SET start_ms = ?, end_ms = ?, align_score = ?, engine = ?, "
+            "source = 'aligned' WHERE video_id = ? AND ord = ?",
             [
                 (span.start_ms, span.end_ms, span.score, tag, video_id, int(rows[index][0]))
                 for index, span in enumerate(ordered)
@@ -3792,6 +3996,8 @@ def realign_video(
         n_words=len(ordered),
         n_chunks=len(chunks),
         engine=tag,
+        source="aligned",
+        speakers_lost=0,
         median_align_score=float(median(scores)) if scores else None,
     )
 ```
@@ -6090,9 +6296,17 @@ from pathlib import Path
 import pytest
 
 import rytp.commands.transcribe  # noqa: F401 - importing registers the commands
+from rytp import constants as C
 from rytp.commands import COMMANDS, CommandResult, resolve
 from rytp.db import Database
-from tests.fake_engines import FakeAligner, FakeTranscriber, registered
+from rytp.db.queries import set_setting
+from rytp.transcribe.base import EngineUnavailable
+from tests.fake_engines import (
+    FakeAligner,
+    FakeTranscriber,
+    MissingModuleTranscriber,
+    registered,
+)
 from tests.synth_audio import concat, silence, tone, write_wav
 
 NAMES = (
@@ -6175,7 +6389,61 @@ def test_run_handler_transcribes_with_the_named_engines(
             wav=_wav(tmp_path),
         )
     assert result.rows[0][1] == "3"
-    assert result.rows[0][3] == "fake+fake-aligner+energy"
+    assert result.rows[0][3] == "aligned"
+    assert result.rows[0][4] == "fake+fake-aligner+energy"
+
+
+def test_the_default_transcriber_is_announced_when_no_flag_named_one(
+    db: Database, tmp_path: Path
+) -> None:
+    # contracts §3: "set a default and inform" was chosen over "refuse until
+    # configured", so this message is the only thing standing between the
+    # owner and 35-90 GPU-hours spent on an engine nobody picked.
+    video_id = _make_video(db)
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "fake")
+    with registered(FakeTranscriber):
+        result = resolve("transcribe.run").handler(
+            db, video_id=video_id, wav=_wav(tmp_path)
+        )
+    message = result.message or ""
+    assert "fake" in message
+    assert C.SETTING_DEFAULT_TRANSCRIBER in message
+    assert result.rows[0][4].startswith("fake")
+
+
+def test_an_explicitly_named_transcriber_is_not_announced(
+    db: Database, tmp_path: Path
+) -> None:
+    # Nothing was chosen on the owner's behalf, so there is nothing to report.
+    video_id = _make_video(db)
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "fake")
+    with registered(FakeTranscriber):
+        result = resolve("transcribe.run").handler(
+            db, video_id=video_id, transcriber="fake", wav=_wav(tmp_path)
+        )
+    assert C.SETTING_DEFAULT_TRANSCRIBER not in (result.message or "")
+
+
+def test_an_uninstalled_default_fails_and_substitutes_nothing(
+    db: Database, tmp_path: Path
+) -> None:
+    # contracts §3: never fall back to another engine. A silent substitution
+    # is the same bug wearing a different hat, and worse — the corpus would
+    # hold rows from two engines with nothing recording which, and
+    # `words.engine` only helps if nothing lies about what it used.
+    video_id = _make_video(db)
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "fake-missing")
+    with registered(FakeTranscriber, MissingModuleTranscriber):
+        with pytest.raises(EngineUnavailable) as excinfo:
+            resolve("transcribe.run").handler(
+                db, video_id=video_id, wav=_wav(tmp_path)
+            )
+    assert "pip install rytp[" in str(excinfo.value)
+    # The zero rows are what proves nothing was substituted: `fake` was
+    # registered and ready right beside it, and no word came from it.
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM words WHERE video_id = ?", (video_id,)
+    ).fetchone()[0] == 0
 
 
 def test_align_handler_retimes_existing_words(db: Database, tmp_path: Path) -> None:
@@ -6186,7 +6454,8 @@ def test_align_handler_retimes_existing_words(db: Database, tmp_path: Path) -> N
         result = resolve("transcribe.align").handler(
             db, video_id=video_id, aligner="fake-aligner", wav=wav
         )
-    assert result.rows[0][3] == "fake+fake-aligner+energy"
+    assert result.rows[0][3] == "aligned"
+    assert result.rows[0][4] == "fake+fake-aligner+energy"
 
 
 def test_engines_handler_lists_what_is_registered(db: Database) -> None:
@@ -6313,7 +6582,7 @@ from rytp.models import RytpError
 from rytp.transcribe.captions import ingest_captions
 from rytp.transcribe.compare import comparison_rows, render_report, run_comparison
 from rytp.transcribe.pipeline import enqueue_index, realign_video, transcribe_video
-from rytp.transcribe.registry import engine_rows
+from rytp.transcribe.registry import default_transcriber, setting
 
 
 def _load_engine_modules() -> None:
@@ -6359,36 +6628,65 @@ def _run_handler(
     db: Database,
     *,
     video_id: int,
-    transcriber: str = C.DEFAULT_TRANSCRIBER,
+    transcriber: str = "",
     aligner: str = "",
     language: str = C.DEFAULT_LANGUAGE,
     refine: bool = True,
     wav: Path | None = None,
 ) -> CommandResult:
     _load_engine_modules()
+    # An empty --transcriber falls back to the configured default, and says
+    # which engine that was. Contracts §3: the owner chose "set a default and
+    # inform" over "refuse until configured", so this line is the entire
+    # mechanism keeping the choice visible instead of accidental — 35-90
+    # GPU-hours is expensive to discover late. If that engine is not
+    # installed, `load_transcriber` raises `EngineUnavailable` with the pip
+    # hint and nothing here catches it: a silent substitution would leave the
+    # corpus holding rows from two engines with nothing recording which.
+    chosen_transcriber = transcriber.strip() or default_transcriber(db)
+    # An empty --aligner falls back to the configured default. Contracts §3:
+    # with no aligner at all the result is the `timed` tier, which is
+    # searchable but not cuttable, so the setting is how an owner who always
+    # wants cuttable words stops having to remember the flag.
+    chosen_aligner = aligner or setting(db, "default_aligner", "") or None
     outcome = transcribe_video(
         db,
         video_id,
         wav_path=_wav_for(video_id, wav),
-        transcriber=transcriber,
-        aligner=aligner or None,
+        transcriber=chosen_transcriber,
+        aligner=chosen_aligner,
         language=language or None,
         refine=refine,
     )
     # The words just changed, so the video's utterances are gone and its
     # search index is stale until Part 4 rebuilds it.
     enqueue_index(db, video_id)
+    notes = [f"video {video_id}: {outcome.n_words} {outcome.source} words"]
+    if not transcriber.strip():
+        notes.append(
+            f"transcriber {chosen_transcriber!r}, from setting "
+            f"{C.SETTING_DEFAULT_TRANSCRIBER} (pass --transcriber to override)"
+        )
+    if outcome.source == "timed":
+        notes.append(
+            "not cuttable — run `rytp transcribe align` with an aligner to upgrade them"
+        )
+    warning = speaker_loss_warning(video_id, outcome.speakers_lost)
+    if warning:
+        notes.append(warning)
     return CommandResult(
-        columns=("video", "words", "chunks", "engine", "median align score"),
+        columns=("video", "words", "chunks", "tier", "engine", "median align score"),
         rows=(
             (
                 str(outcome.video_id),
                 str(outcome.n_words),
                 str(outcome.n_chunks),
+                outcome.source,
                 outcome.engine,
                 _number(outcome.median_align_score),
             ),
         ),
+        message=". ".join(notes),
     )
 
 
@@ -6410,16 +6708,18 @@ def _align_handler(
     )
     enqueue_index(db, video_id)
     return CommandResult(
-        columns=("video", "words", "chunks", "engine", "median align score"),
+        columns=("video", "words", "chunks", "tier", "engine", "median align score"),
         rows=(
             (
                 str(outcome.video_id),
                 str(outcome.n_words),
                 str(outcome.n_chunks),
+                outcome.source,
                 outcome.engine,
                 _number(outcome.median_align_score),
             ),
         ),
+        message=f"video {video_id}: {outcome.n_words} words are now cuttable",
     )
 
 
@@ -6527,13 +6827,23 @@ register(
             Param(
                 name="transcriber",
                 type=str,
-                help="Registered transcriber name.",
-                default=C.DEFAULT_TRANSCRIBER,
+                help=(
+                    "Registered transcriber name. Empty falls back to the "
+                    "default_transcriber setting ('gigaam' out of the box), "
+                    "and the result says which engine that chose. If it is "
+                    "not installed the command fails with the install hint "
+                    "rather than running a different one."
+                ),
+                default="",
             ),
             Param(
                 name="aligner",
                 type=str,
-                help="Registered aligner name; empty to use the transcriber's own timings.",
+                help=(
+                    "Registered aligner name. Empty falls back to the "
+                    "default_aligner setting; with neither, the words are "
+                    "written as the searchable-but-not-cuttable 'timed' tier."
+                ),
                 default="",
             ),
             Param(name="language", type=str, help="Spoken language.", default=C.DEFAULT_LANGUAGE),
@@ -6633,7 +6943,7 @@ Run:
 ```bash
 python -m pytest tests/test_commands_transcribe.py -v
 ```
-Expected: 11 passed.
+Expected: 14 passed.
 
 - [ ] **Step 6: Lint and type-check**
 
@@ -6725,7 +7035,8 @@ def test_a_video_goes_from_captions_to_cuttable_words(db: Database, tmp_path: Pa
     assert {row[0] for row in caption_rows} == {"caption"}
     assert all(row[1] is None for row in caption_rows)
 
-    # Tier 2: promotion replaces them with boundaries good enough to cut on.
+    # An aligner runs here, so promotion replaces the caption words with the
+    # cuttable `aligned` tier. Without one they would land as `timed`.
     with registered(FakeTranscriber, FakeAligner):
         resolve("transcribe.run").handler(
             db, video_id=video_id, transcriber="fake", aligner="fake-aligner", wav=wav
@@ -6748,6 +7059,7 @@ def test_a_video_goes_from_captions_to_cuttable_words(db: Database, tmp_path: Pa
         (video_id,),
     ).fetchall()
     assert [row[0] for row in aligned] == [0, 1, 2]
+    # An aligner ran, so these are cuttable. Without one they would be `timed`.
     assert all(row[3] == "aligned" for row in aligned)
     assert all(row[2] is not None and row[2] > row[1] for row in aligned)
     assert all(row[4] == "fake+fake-aligner+energy" for row in aligned)
@@ -6851,16 +7163,24 @@ from pathlib import Path
 
 import pytest
 
+from rytp import constants as C
 from rytp.audio.extract import wav_path
 from rytp.db import Database
+from rytp.db.queries import set_setting
 from rytp.jobs import JOB_HANDLERS, JOB_KINDS, Readiness
+from rytp.transcribe.base import EngineUnavailable
 from rytp.transcribe.readiness import (
     align_readiness,
     caption_words_readiness,
     fingerprint_readiness,
     transcribe_readiness,
 )
-from tests.fake_engines import FakeAligner, FakeTranscriber, registered
+from tests.fake_engines import (
+    FakeAligner,
+    FakeTranscriber,
+    MissingModuleTranscriber,
+    registered,
+)
 from tests.synth_audio import concat, silence, tone, write_wav
 
 KINDS = ("caption_words", "transcribe", "align", "fingerprint")
@@ -7019,6 +7339,49 @@ def test_the_transcribe_handler_takes_its_engines_from_the_payload(db: Database)
     assert {row[1] for row in rows} == {"fake+fake-aligner+energy"}
 
 
+def test_a_payload_with_no_transcriber_uses_the_setting_and_says_so(
+    db: Database,
+) -> None:
+    # contracts §3: a run that used the default must announce it. A job's
+    # announcement is the note the worker stores on the row, which is the
+    # only place a hand-made job can say what it picked.
+    video_id = _make_video(db)
+    _place_wav(video_id)
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "fake")
+    with registered(FakeTranscriber):
+        note = JOB_HANDLERS["transcribe"](db, video_id, {})
+    assert note is not None
+    assert "fake" in note
+    assert C.SETTING_DEFAULT_TRANSCRIBER in note
+
+
+def test_a_payload_that_names_its_transcriber_leaves_no_note(db: Database) -> None:
+    # Nothing was chosen on the job's behalf, so a note would be noise —
+    # and `rytp jobs stats` counts notes.
+    video_id = _make_video(db)
+    _place_wav(video_id)
+    with registered(FakeTranscriber):
+        assert JOB_HANDLERS["transcribe"](db, video_id, {"transcriber": "fake"}) is None
+
+
+def test_an_uninstalled_default_fails_the_job_rather_than_substituting(
+    db: Database,
+) -> None:
+    # contracts §3: never fall back to another engine. `words.engine` records
+    # what actually ran, which only helps if nothing lies about what it used.
+    video_id = _make_video(db)
+    _place_wav(video_id)
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "fake-missing")
+    with registered(FakeTranscriber, MissingModuleTranscriber):
+        with pytest.raises(EngineUnavailable) as excinfo:
+            JOB_HANDLERS["transcribe"](db, video_id, {})
+    assert "pip install rytp[" in str(excinfo.value)
+    # `fake` was registered and ready beside it, and wrote nothing.
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM words WHERE video_id = ?", (video_id,)
+    ).fetchone()[0] == 0
+
+
 def test_transcribing_asks_for_the_index_to_be_rebuilt(db: Database) -> None:
     # Part 2's chain stops at extract_wav, so this is the only thing that
     # makes a freshly transcribed video searchable without a hand-run command.
@@ -7104,9 +7467,10 @@ if TYPE_CHECKING:
     from rytp.jobs import Readiness
 
 
-def _has_aligned_words(db: Database, video_id: int) -> bool:
+def _has_transcribed_words(db: Database, video_id: int) -> bool:
+    """Any non-caption words: the video has been transcribed, at either tier."""
     row = db.conn.execute(
-        "SELECT 1 FROM words WHERE video_id = ? AND source = 'aligned' LIMIT 1",
+        "SELECT 1 FROM words WHERE video_id = ? AND source <> 'caption' LIMIT 1",
         (video_id,),
     ).fetchone()
     return row is not None
@@ -7139,28 +7503,34 @@ def caption_words_readiness(db: Database, video_id: int) -> Readiness:
 
 
 def transcribe_readiness(db: Database, video_id: int) -> Readiness:
-    """Runnable once the cached WAV exists; satisfied once words are aligned.
+    """Runnable once the cached WAV exists; satisfied once the video has words.
+
+    Satisfied at either transcript tier: `timed` means transcription already
+    happened, and getting from there to `aligned` is the `align` job's work,
+    not a reason to transcribe again.
 
     ``Readiness`` is imported inside the function because ``rytp.jobs``
     imports this module: a module-level import would close the cycle.
     """
     from rytp.jobs import Readiness
 
-    if _has_aligned_words(db, video_id):
+    if _has_transcribed_words(db, video_id):
         return Readiness.SATISFIED
     return Readiness.READY if wav_path(video_id).exists() else Readiness.BLOCKED
 
 
 def align_readiness(db: Database, video_id: int) -> Readiness:
-    """Runnable when there are aligned words and a WAV to re-measure against.
+    """Runnable when there is a transcript to align and a WAV to align it to.
 
-    Never *satisfied*: re-timing is a one-shot the user asked for, which is
-    also why the kind sets ``reopenable=False``. Enqueue it again to run it
-    again.
+    Either tier qualifies: `timed` rows get upgraded to `aligned`, and
+    `aligned` rows get re-timed by a different aligner. Never *satisfied*,
+    because "already aligned" does not mean "aligned by the engine you just
+    asked for" — which is also why the kind sets ``reopenable=False``.
+    Enqueue it again to run it again.
     """
     from rytp.jobs import Readiness
 
-    if not _has_aligned_words(db, video_id):
+    if not _has_transcribed_words(db, video_id):
         return Readiness.BLOCKED
     return Readiness.READY if wav_path(video_id).exists() else Readiness.BLOCKED
 
@@ -7214,23 +7584,38 @@ def _run_caption_words(db: Database, video_id: int, payload: dict[str, Any]) -> 
     enqueue_index(db, video_id)
 
 
-def _run_transcribe(db: Database, video_id: int, payload: dict[str, Any]) -> None:
+def _run_transcribe(db: Database, video_id: int, payload: dict[str, Any]) -> str | None:
     from rytp import constants as C
     from rytp.audio.extract import wav_path
     from rytp.transcribe.pipeline import enqueue_index, transcribe_video
+    from rytp.transcribe.registry import default_transcriber
 
     _load_transcribe_engines()
+    # `ingest --transcribe` and `transcribe run --enqueue` both stamp the
+    # engine at enqueue time, so this branch is for a job made by hand.
+    # contracts §3 still applies: resolve the setting, never a constant, and
+    # say which engine it picked — which for a job is the note the worker
+    # stores on the row. If it is not installed, `transcribe_video` raises
+    # with the install hint and the job fails; it must not run another one.
+    named = str(payload.get("transcriber") or "").strip()
+    transcriber = named or default_transcriber(db)
     transcribe_video(
         db,
         video_id,
         wav_path=wav_path(video_id),
-        transcriber=payload.get("transcriber") or C.DEFAULT_TRANSCRIBER,
+        transcriber=transcriber,
         aligner=payload.get("aligner") or None,
         language=payload.get("language") or C.DEFAULT_LANGUAGE,
         refine=bool(payload.get("refine", True)),
     )
     # New words mean the video's utterances are gone: ask Part 4 to rebuild.
     enqueue_index(db, video_id)
+    if named:
+        return None
+    return (
+        f"no transcriber in the payload; used {transcriber!r} from setting "
+        f"{C.SETTING_DEFAULT_TRANSCRIBER}"
+    )
 
 
 def _run_align(db: Database, video_id: int, payload: dict[str, Any]) -> None:
@@ -7311,7 +7696,7 @@ Run:
 ```bash
 python -m pytest tests/test_transcribe_jobs.py -v
 ```
-Expected: 16 passed.
+Expected: 19 passed.
 
 - [ ] **Step 6: Write the failing test for the `--enqueue` flag**
 
@@ -7332,6 +7717,36 @@ def test_run_can_queue_the_work_instead_of_doing_it(db: Database, tmp_path: Path
     ).fetchone()
     assert row is not None
     assert "mfa" in row[0]
+
+
+def test_queuing_stamps_and_announces_the_default_transcriber(db: Database) -> None:
+    # contracts §3 wants the choice made and reported at enqueue time. A job
+    # row that names no engine defers the decision to a worker that nobody
+    # is watching, which is the hole this closes.
+    video_id = _make_video(db)
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "whisper")
+    result = resolve("transcribe.run").handler(db, video_id=video_id, enqueue=True)
+    message = result.message or ""
+    assert "whisper" in message
+    assert C.SETTING_DEFAULT_TRANSCRIBER in message
+    row = db.conn.execute(
+        "SELECT payload_json FROM jobs WHERE kind = 'transcribe' AND target_id = ?",
+        (video_id,),
+    ).fetchone()
+    assert json.loads(row[0])["transcriber"] == "whisper"
+
+
+def test_a_misspelled_transcriber_is_rejected_before_the_job_exists(
+    db: Database,
+) -> None:
+    # Not after five failed retries on a GPU worker.
+    video_id = _make_video(db)
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "gigaamm")
+    with pytest.raises(ValueError, match="gigaamm"):
+        resolve("transcribe.run").handler(db, video_id=video_id, enqueue=True)
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'transcribe'"
+    ).fetchone()[0] == 0
 
 
 def test_queuing_needs_no_wav_and_no_engine_installed(db: Database) -> None:
@@ -7380,19 +7795,40 @@ keyword and an early return. In `_run_handler`, immediately after the signature:
 
 ```python
     if enqueue:
-        return _queue(
+        # Resolve the engine here rather than leaving it to the worker.
+        # contracts §3 wants an unregistered name rejected at enqueue time,
+        # and wants the choice announced when it came from the setting —
+        # neither is possible once this is a row in a table nobody is
+        # watching. `resolve_transcriber` is a *name* lookup, deliberately
+        # not `check_available`: enqueueing must not require the engine to be
+        # installed on the machine doing the enqueueing, only on the worker.
+        _load_engine_modules()
+        chosen_transcriber = transcriber.strip() or default_transcriber(db)
+        resolve_transcriber(chosen_transcriber)
+        result = _queue(
             db,
             "transcribe",
             video_id,
             {
-                "transcriber": transcriber,
+                "transcriber": chosen_transcriber,
                 "aligner": aligner,
                 "language": language,
                 "refine": refine,
             },
         )
+        if not transcriber.strip():
+            return CommandResult(
+                message=(
+                    f"{result.message}; transcriber {chosen_transcriber!r}, from "
+                    f"setting {C.SETTING_DEFAULT_TRANSCRIBER} "
+                    f"(pass --transcriber to override)"
+                )
+            )
+        return result
     _load_engine_modules()
 ```
+
+`resolve_transcriber` joins `default_transcriber` and `setting` on the import line at the top of the module.
 
 In `_align_handler`:
 
@@ -7427,7 +7863,7 @@ Run:
 ```bash
 python -m pytest tests/test_transcribe_jobs.py tests/test_commands_transcribe.py -v
 ```
-Expected: 30 passed.
+Expected: 38 passed.
 
 - [ ] **Step 9: Re-run the whole gate**
 
@@ -7542,8 +7978,10 @@ from rytp.transcribe.pipeline import (
     enqueue_index,
     invalidate_transcript,
     realign_video,
+    speaker_loss_warning,
     transcribe_video,
 )
+from rytp.transcribe.registry import engine_rows, setting
 ```
 
 The handler:
@@ -7558,12 +7996,16 @@ def _remove_handler(db: Database, *, video_id: int) -> CommandResult:
     ``transcribe run`` rebuilds exactly what this removed.
     """
     removed = invalidate_transcript(db, video_id)
+    notes = [f"removed the transcript of video {video_id}"]
+    warning = speaker_loss_warning(video_id, removed.video_speakers)
+    if warning:
+        notes.append(warning)
     return CommandResult(
         columns=("words", "utterances", "speaker labels"),
         rows=(
             (str(removed.words), str(removed.utterances), str(removed.video_speakers)),
         ),
-        message=f"removed the transcript of video {video_id}",
+        message=". ".join(notes),
     )
 ```
 
@@ -7956,11 +8398,13 @@ git commit -m "feat(doctor): report which engines and which GPU are usable here"
 
 ## Self-review notes for the executor
 
-Six things are worth re-reading before you start, because they are where this plan is most likely to be wrong in practice.
+Eight things are worth re-reading before you start, because they are where this plan is most likely to be wrong in practice.
 
 1. **`refine_boundaries` is the only part with no reference to check against.** Its tests are property-style on synthesised audio for exactly that reason: a boundary landing inside a known gap, never moving further than the rail, never crossing its neighbour, idempotent, deterministic. If you change the algorithm, keep those properties and the tests stay meaningful.
 2. **Every engine adapter's library call is unverified.** `gigaam.child_main`, `mfa.child_main` and `wav2vec2.child_main` are written against documented APIs that nobody here has run. Their *contracts* — the dictionaries they return — are what the rest of the code depends on, and those are covered by tests. When you install a real engine, expect to rewrite the body of one function and nothing else.
 3. **One word row holds exactly one token.** `normalize_text` turns a hyphen into a space, so "кто-то" becomes two rows sharing a measured boundary rather than one unfindable row. `tests/test_transcribe_tokens.py` pins the rule and, more importantly, pins that it still agrees with whatever `normalize_text` does — if Part 1 ever changes its punctuation handling, that test fails rather than the corpus silently losing words.
-4. **One function owns the cross-part invariant.** `invalidate_transcript` is the only place `words`, `utterances` and `video_speakers` are deleted together, and all three callers — caption ingest, aligned-tier replacement, and `transcribe.remove` — go through it. Do not inline it back; two copies of an invariant is one copy too many.
+4. **One function owns the cross-part invariant.** `invalidate_transcript` is the only place `words`, `utterances` and `video_speakers` are deleted together, and all three callers — caption ingest, transcript replacement, and `transcribe.remove` — go through it. Do not inline it back; two copies of an invariant is one copy too many.
 5. **`transcribe.remove` deliberately has no `--yes`.** Contracts §5 requires confirmation flags only of commands that delete files. This one deletes derived rows that `transcribe run` rebuilds, and the cached WAV survives. A future reviewer will want to add a prompt; the plan says not to, and `test_remove_needs_no_confirmation_flags` will fail if someone does.
-6. **Three tables are written by Part 3, two of them owned elsewhere.** `words` is ours; `utterances` (Part 4) and `video_speakers` (Part 7) are deleted whenever words change. This is not a local decision — contracts §4 "Cross-part invariants" requires any stage that deletes or replaces a video's words to delete that video's `utterances` and `video_speakers` rows **in the same transaction**. Tasks 8 and 9 replace a video's words and so delete both, in one transaction. Task 10 is the exception that proves the rule: re-alignment updates timings in place without touching a single word's text or ordinal, so the speaker labels stay valid and are kept — but the utterances still go, because they copy the timings that just changed.
+6. **`timed` is not `aligned`, and the difference is the product.** Only a run that actually had an aligner may write `source='aligned'`, because that value is the definition of cuttable (contracts §3). `tier_for()` is the single place that decides, and `test_only_a_run_with_an_aligner_produces_a_cuttable_tier` pins it. If a future change makes the no-aligner path write `aligned` again, the tool will confidently cut audio on boundaries that were never measured.
+7. **Three tables are written by Part 3, two of them owned elsewhere.** `words` is ours; `utterances` (Part 4) and `video_speakers` (Part 7) are deleted whenever words change. This is not a local decision — contracts §4 "Cross-part invariants" requires any stage that deletes or replaces a video's words to delete that video's `utterances` and `video_speakers` rows **in the same transaction**. Tasks 8 and 9 replace a video's words and so delete both, in one transaction. Task 10 is the exception that proves the rule: re-alignment updates timings in place without touching a single word's text or ordinal, so the speaker labels stay valid and are kept — but the utterances still go, because they copy the timings that just changed.
+8. **There is no default transcriber constant, and that is the point.** contracts §3 "Choosing a transcriber" makes the engine `settings.default_transcriber` (Part 2's key, `gigaam` out of the box), read through `registry.default_transcriber`, so that a run which used the default can *say* which engine it picked — in `transcribe run`'s message, in `ingest`'s message, and in the note a hand-made job leaves on its row. A constant cannot announce itself. Two rules go with it and both have tests: an engine that is not installed **fails with the install hint and is never quietly replaced** — a mixed corpus is interpretable only because `words.engine` records what actually ran, and that stops being true the moment something substitutes; and the default is **a starting point, not a verdict** — `gigaam` roughly halves Whisper's Russian word error rate on published benchmarks, but the one published test on *noisy YouTube* audio, which is exactly this corpus, favoured a Russian-finetuned Whisper. `transcribe compare` (Task 14) is how you settle it on real material; rewrite the setting, not the code.

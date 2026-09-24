@@ -34,7 +34,7 @@
 | `rytp.models.{RytpError, NotFoundError, InvalidInputError, Fragment, normalize_text, stem_text, utc_now_iso}` | Part 1 | types, tokenisation, stem-tier substitutions |
 | `rytp.config.paths().cutlist(name)`, `rytp.config.ensure_dir` | Part 1 | where a cut list lives |
 | `rytp.commands.{Command, CommandResult, Param, register}` | Part 1 | the three commands |
-| `rytp.commands.resolve_speaker_filter` — the one shared speaker resolver (contracts §5) | Part 1 | `--speaker`; Part 5 must not roll its own |
+| `rytp.commands.{resolve_speaker_filter, SpeakerFilter}` — the one shared speaker resolver, signature pinned in contracts §5 | Part 1 | `--speaker`; Part 5 must not roll its own |
 | `words` rows with `ord`, real `start_ms`/`end_ms`, `align_score`, `source='aligned'` | Part 3 | everything cuttable |
 | `video_acoustics` rows | Part 3 | the consistency half of the knob |
 | `video_speakers` / `speakers` | Parts 1 (schema) and 7 (rows) | the `--speaker` filter; null until a video is diarized |
@@ -44,7 +44,9 @@
 ### Two assumptions about the data, stated up front
 
 1. **A target token is exactly one `words` row, both sides.** This is a contract invariant (contracts §4): "A stored word row holds exactly one token, and the tokens stored for a piece of text are exactly `normalize_text(text).split()`." `normalize_text` turns every non-`\w` character into a space, so "кто-то" is two tokens — and Part 3's `split_token()` splits at write time to match, giving the interior boundary a measured time from `refine_boundaries` rather than an interpolated one. Assembly tokenises the target through the same function, so the two sides agree by construction: a hyphenated source word is two ordinally adjacent rows, fully searchable and fully assemblable, and a run may extend straight through it. Task 2 pins that with a test. Nothing in this part compensates for punctuation, and nothing needs to.
-2. **`align_score` is nullable.** MFA-class aligners report no per-word confidence and Part 3 stores `None`. Every read of `align_score` — in SQL `ORDER BY` as well as in Python — substitutes `ASSEMBLE_DEFAULT_ALIGN_SCORE`, or NULL rows sort to one end and get silently dropped by a candidate cap.
+2. **Three tiers, and only one of them is cuttable.** Contracts §3: `source` is `caption | timed | aligned`, and "Cuttable is `source = 'aligned'` and nothing else may be cut." `timed` is new and it matters here: a transcriber's own word timestamps put 78.7% of gaps at exactly zero, so those rows are good *text* and unusable *boundaries*. Before the tier split they were written as `aligned` and this part would have cut on them. The eligibility rule in Task 2 is unchanged — `source = 'aligned'` — but it now means what it says.
+
+3. **A null `align_score` narrowed in meaning but did not disappear.** It used to cover two cases: an unaligned row, and an aligner that reports no per-word confidence. The first is now `timed` and excluded by the tier filter, so on an `aligned` row a null can only be the second — MFA reports none (contracts §6 makes `Span.score` `float | None`, and Part 3's `ScorelessAligner` exists for exactly this). Refusing to assemble from an MFA corpus would be wrong, so `ASSEMBLE_DEFAULT_ALIGN_SCORE` stays, as a neutral stand-in that keeps such a word usable while ranking it below a measured one. It is applied in SQL `ORDER BY` as well as in Python, or NULL rows sort to one end and get silently dropped by a candidate cap.
 
 ---
 
@@ -184,6 +186,17 @@ def test_caption_words_have_no_end_and_the_check_constraint_holds(db: Database) 
     rows = word_rows(db, video_id)
     assert [row["source"] for row in rows] == ["caption", "caption"]
     assert rows[0]["end_ms"] is None
+    assert rows[0]["align_score"] is None
+
+
+def test_timed_words_have_ends_but_no_alignment_score(db: Database) -> None:
+    """contracts §3: timed rows are good text and unusable boundaries."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "мы все", source="timed")
+    rows = word_rows(db, video_id)
+    assert [row["source"] for row in rows] == ["timed", "timed"]
+    assert rows[0]["end_ms"] == WORD_MS
+    assert rows[0]["align_score"] is None
 
 
 def test_video_speakers_rows_carry_the_engine_that_made_them(db: Database) -> None:
@@ -354,15 +367,20 @@ def add_words(
 
     Ordinals continue after whatever the video already has, so a test can
     build one video from several calls with different speakers or gaps.
-    Caption rows get no ``end_ms`` and no ``align_score``: contracts §3
-    makes that the definition of the caption tier, and the CHECK constraint
-    enforces it.
+
+    The tier decides which columns may be filled (contracts §3, "Three
+    transcript tiers"). ``caption`` rows have no ``end_ms``, which the
+    table's CHECK constraint enforces. ``timed`` rows have real ends but
+    no ``align_score``, because nothing measured one — that is what makes
+    them searchable and not cuttable. Only ``aligned`` rows carry a score,
+    and even then it may be None when the aligner reports no confidence.
     """
     row = db.conn.execute(
         "SELECT COALESCE(MAX(ord) + 1, 0) AS next FROM words WHERE video_id = ?", (video_id,)
     ).fetchone()
     ordinal = int(row["next"])
     captions = source == "caption"
+    scored = source == "aligned"
     cursor_ms = start_ms
     rows: list[tuple[Any, ...]] = []
     for token in text.split():
@@ -377,7 +395,7 @@ def add_words(
                 normalized,
                 stem_text(normalized),
                 None,
-                None if captions else align_score,
+                align_score if scored else None,
                 source,
                 engine,
                 video_speaker_id,
@@ -462,9 +480,11 @@ ASSEMBLE_EDGE_ALIGN_WEIGHT: Final = 0.6
 #: itself is doubtful, and design §3 puts precision above recall.
 ASSEMBLE_MEAN_ALIGN_WEIGHT: Final = 0.2
 
-#: Stand-in for a NULL align_score. MFA-class aligners report no per-word
-#: confidence (design §6), so NULL means "unknown", not "bad"; 0.5 keeps
-#: such a word usable while preferring a measured, well-anchored one.
+#: Stand-in for a NULL align_score on an *aligned* row. With the three
+#: tiers (contracts §3) an unaligned row is `timed` and never reaches
+#: here, so a NULL can only mean the aligner reported no per-word
+#: confidence — MFA does not (design §6). That is "unknown", not "bad":
+#: 0.5 keeps such a word usable while preferring a measured one.
 ASSEMBLE_DEFAULT_ALIGN_SCORE: Final = 0.5
 
 #: Default floor for --min-align-score: accept everything. Raising it is
@@ -623,6 +643,7 @@ Runs are recorded at **every** prefix length, not only the maximal one, because 
   - `MatchFilters(exclude_video_ids=frozenset(), video_speaker_ids=None, min_align_score=C.ASSEMBLE_MIN_ALIGN_SCORE, max_internal_gap_ms=C.ASSEMBLE_MAX_INTERNAL_GAP_MS, max_run_words=C.ASSEMBLE_MAX_RUN_WORDS, max_occurrences=C.ASSEMBLE_MAX_OCCURRENCES_PER_TOKEN, max_seeds_per_video=C.ASSEMBLE_MAX_SEEDS_PER_VIDEO)` — frozen.
   - `RunTable = dict[tuple[int, int], dict[int, CandidateRun]]` — keyed `(target position, run length in words)`, value maps `video_id` to the best run of that shape in that video.
   - `tokenize(target: str) -> tuple[str, ...]`
+  - `occurrence_query(filters: MatchFilters, token: str = "") -> tuple[str, dict[str, object]]` — the hot lookup as SQL plus parameters, so Task 12 can assert its query plan
   - `find_occurrences(db, token: str, filters: MatchFilters) -> list[WordRow]`
   - `build_run_table(db, tokens: Sequence[str], filters: MatchFilters) -> RunTable`
 
@@ -709,11 +730,44 @@ def test_find_occurrences_coalesces_a_null_align_score(db: Database) -> None:
     )
 
 
-def test_caption_words_are_never_eligible(db: Database) -> None:
-    """Design §8: 'Caption-tier words are searchable but never assembled from.'"""
+def test_only_aligned_words_are_eligible(db: Database) -> None:
+    """contracts §3: cuttable is source = 'aligned' and nothing else.
+
+    Captions carry no ends at all; `timed` rows carry a transcriber's own
+    timestamps, which put 78.7% of word gaps at exactly zero and cannot be
+    cut on. Both are searchable elsewhere and neither is assemblable.
+    """
+    for tier in ("caption", "timed"):
+        video_id = add_video(db, external_id=f"VIDEO_{tier}")
+        add_words(db, video_id, "неизбежно", source=tier)
+        assert find_occurrences(db, "неизбежно", MatchFilters()) == [], tier
+    cuttable = add_video(db, external_id="VIDEO_OK")
+    add_words(db, cuttable, "неизбежно", source="aligned")
+    assert [row.video_id for row in find_occurrences(db, "неизбежно", MatchFilters())] == [
+        cuttable
+    ]
+
+
+def test_an_empty_speaker_filter_matches_nothing_not_everything(db: Database) -> None:
+    """contracts §5 rule 2: a resolved-but-unmapped speaker returns nothing."""
     video_id = add_video(db, external_id="VIDEO_A")
-    add_words(db, video_id, "неизбежно", source="caption")
-    assert find_occurrences(db, "неизбежно", MatchFilters()) == []
+    add_words(db, video_id, "неизбежно")
+    assert find_occurrences(db, "неизбежно", MatchFilters()) != []
+    empty = MatchFilters(video_speaker_ids=frozenset())
+    assert find_occurrences(db, "неизбежно", empty) == []
+    assert build_run_table(db, ("неизбежно",), empty) == {}
+
+
+def test_an_aligned_word_with_no_score_is_usable_but_outranked(db: Database) -> None:
+    """A null score on an aligned row means the aligner reported none (MFA),
+    not that the row is unaligned — that case is the `timed` tier now."""
+    scoreless = add_video(db, external_id="VIDEO_A")
+    add_words(db, scoreless, "неизбежно", align_score=None)
+    measured = add_video(db, external_id="VIDEO_B")
+    add_words(db, measured, "неизбежно", align_score=0.95)
+    found = find_occurrences(db, "неизбежно", MatchFilters())
+    assert [row.video_id for row in found] == [measured, scoreless]
+    assert found[1].align_score == pytest.approx(C.ASSEMBLE_DEFAULT_ALIGN_SCORE)
 
 
 def test_excluded_videos_are_dropped(db: Database, corpus: tuple[int, int]) -> None:
@@ -898,6 +952,7 @@ __all__ = [
     "WordRow",
     "build_run_table",
     "find_occurrences",
+    "occurrence_query",
     "tokenize",
 ]
 
@@ -990,7 +1045,15 @@ def _eligibility_sql(filters: MatchFilters) -> str:
     if filters.exclude_video_ids:
         clauses.append(f"video_id NOT IN ({_int_list(filters.exclude_video_ids)})")
     if filters.video_speaker_ids is not None:
-        clauses.append(f"video_speaker_id IN ({_int_list(filters.video_speaker_ids)})")
+        # An empty set means "a real person, mapped to no video yet". It must
+        # match nothing. SQLite does accept an empty `IN ()` as false, but that
+        # is a non-standard extension and contracts §5 calls this exact case
+        # "the classic silent-wrong-answer bug in a SQL IN clause" — so say it
+        # outright rather than lean on a dialect quirk.
+        if not filters.video_speaker_ids:
+            clauses.append("1 = 0")
+        else:
+            clauses.append(f"video_speaker_id IN ({_int_list(filters.video_speaker_ids)})")
     return " AND ".join(clauses)
 
 
@@ -1009,13 +1072,18 @@ def _row(record: sqlite3.Row) -> WordRow:
     )
 
 
-def find_occurrences(db: Database, token: str, filters: MatchFilters) -> list[WordRow]:
-    """Every eligible place ``token`` was said, best-anchored first.
+def occurrence_query(
+    filters: MatchFilters, token: str = ""
+) -> tuple[str, dict[str, object]]:
+    """The hot lookup, as SQL and parameters.
 
-    Two caps apply, and the per-video one is applied *inside* the query.
-    Applying it afterwards would be useless: a single talkative video
-    would fill the overall limit before any other source was seen, and
-    the consistency knob would then have nothing to choose between.
+    Separated from :func:`find_occurrences` so a test can run
+    ``EXPLAIN QUERY PLAN`` over the real statement. The inner ``WHERE`` is
+    written to sit directly on contracts §3's partial index
+    ``words_alignable ON words(normalized_text) WHERE source = 'aligned'``:
+    most of the corpus is caption-tier (design §6), so a plan that matched
+    the token first and filtered by tier afterwards would scale with the
+    whole archive instead of the cuttable part of it.
     """
     sql = (
         f"{_SELECT}FROM (SELECT *, ROW_NUMBER() OVER ("
@@ -1027,17 +1095,25 @@ def find_occurrences(db: Database, token: str, filters: MatchFilters) -> list[Wo
         " ORDER BY align_score DESC, video_id, ord"
         " LIMIT :max_occurrences"
     )
-    cursor = db.conn.execute(
-        sql,
-        {
-            "token": token,
-            "default_align": C.ASSEMBLE_DEFAULT_ALIGN_SCORE,
-            "min_align": filters.min_align_score,
-            "max_seeds": filters.max_seeds_per_video,
-            "max_occurrences": filters.max_occurrences,
-        },
-    )
-    return [_row(record) for record in cursor]
+    return sql, {
+        "token": token,
+        "default_align": C.ASSEMBLE_DEFAULT_ALIGN_SCORE,
+        "min_align": filters.min_align_score,
+        "max_seeds": filters.max_seeds_per_video,
+        "max_occurrences": filters.max_occurrences,
+    }
+
+
+def find_occurrences(db: Database, token: str, filters: MatchFilters) -> list[WordRow]:
+    """Every eligible place ``token`` was said, best-anchored first.
+
+    Two caps apply, and the per-video one is applied *inside* the query.
+    Applying it afterwards would be useless: a single talkative video
+    would fill the overall limit before any other source was seen, and
+    the consistency knob would then have nothing to choose between.
+    """
+    sql, params = occurrence_query(filters, token)
+    return [_row(record) for record in db.conn.execute(sql, params)]
 
 
 def _fetch_next(
@@ -3892,9 +3968,21 @@ One function that a command, a test, or a future TUI screen can call: target tex
   - `speaker_labels(db, video_speaker_ids) -> dict[int, str]`
   - Re-exports: `CutList`, `CutlistError`, `CutlistParams`, `Slot`, `Alternative`, `Substitution`, `load_cutlist`, `read_cutlist`, `write_cutlist`, `dumps_cutlist`, `cutlist_name`, `cutlist_path`, `validate_name`, `suggest_substitutions`, `tokenize`, `MatchFilters`, `Plan`, `SLOT_FRAGMENT`, `SLOT_GAP`.
 
-**Speaker resolution is Part 1's, not ours.** Contracts §5 "Speaker filters": "One shared resolver in `rytp/commands/__init__.py` serves every command that filters by speaker; no part may roll its own." Part 5 consumes it as
-`resolve_speaker_filter(db, *, speaker: str = "", video_local_speaker: str = "", video: str = "") -> SpeakerScope | None`,
-where `SpeakerScope` exposes `video_speaker_ids: frozenset[int]` and a human-readable `description`, `None` means no speaker filter was asked for, and an unresolvable `--speaker` raises naming the closest roster entries. **If Part 1 lands a different name or shape, adopt Part 1's verbatim and change nothing else here** — the one thing that must not happen is a second resolver.
+**Speaker resolution is Part 1's, not ours,** and contracts §5 now pins its exact shape:
+
+```python
+@dataclass(frozen=True)
+class SpeakerFilter:
+    video_speaker_ids: frozenset[int]   # already expanded, ready to filter on
+    description: str
+
+def resolve_speaker_filter(
+    db: Database, *, speaker: str | None = None,
+    video_local_speaker: str | None = None, video_id: int | None = None,
+) -> SpeakerFilter | None: ...
+```
+
+Part 5 calls it with `speaker=` only and reads `.video_speaker_ids`. Three of the four caller rules bite here. `None` means no filter was requested — show everything. An **empty** `video_speaker_ids` means the filter resolved but matches nothing, and "must return nothing, never everything": contracts calls that "the classic silent-wrong-answer bug in a SQL `IN` clause", so `_eligibility_sql` emits `1 = 0` for an empty set rather than relying on SQLite's non-standard empty `IN ()`, and Task 2 pins it. Unresolvable input raises inside the resolver, naming the closest roster entries — Part 5 never converts that into an empty result.
 
 **Part 5 offers `--speaker` only, not `--video-local-speaker`.** A raw diarizer label is scoped to one video, and contracts §5 requires `--video` alongside it; for assembly, "only this video" is already `--exclude` for everything else, and inspecting one video's raw labels is a `rytp speakers` concern. Offering the flag would add a `--video` parameter to `assemble.plan` that means something different from every other use of the word here.
 
@@ -4209,8 +4297,8 @@ def _filters(db: Database, controls: AssembleControls) -> MatchFilters:
         # contracts §5: one shared resolver, and it matches speakers.label
         # then speakers.aliases_json. A raw SPEAKER_00 is not accepted here
         # and resolution failure raises, naming the closest roster entries.
-        scope = resolve_speaker_filter(db, speaker=controls.speaker)
-        labels = None if scope is None else scope.video_speaker_ids
+        speaker_filter = resolve_speaker_filter(db, speaker=controls.speaker)
+        labels = None if speaker_filter is None else speaker_filter.video_speaker_ids
         if not labels:
             raise NotFoundError(
                 f"speaker {controls.speaker!r} is not mapped to any video yet, so "
@@ -4698,10 +4786,12 @@ def assemble_suggest(
     exclude: str = "",
 ) -> CommandResult:
     """Ranked stand-ins for a word: same stem first, then closest spelling."""
-    scope = resolve_speaker_filter(db, speaker=speaker) if speaker else None
+    speaker_filter = resolve_speaker_filter(db, speaker=speaker) if speaker else None
     filters = MatchFilters(
         exclude_video_ids=frozenset(parse_ids(exclude)),
-        video_speaker_ids=None if scope is None else scope.video_speaker_ids,
+        video_speaker_ids=(
+            None if speaker_filter is None else speaker_filter.video_speaker_ids
+        ),
     )
     hits = suggest_substitutions(db, word.strip().lower(), filters, limit=limit)
     return CommandResult(
@@ -5125,6 +5215,8 @@ Two properties that no earlier test can prove on its own, and the gate that says
 
 **The query budget is what makes the design's own claim true.** Design §7 says assembly needs "no n-gram table" because the walk is a pointer walk. That is only true if the number of queries is bounded by the length of the target rather than by how often its words were said — otherwise the corpus would need an index this part deliberately does not build. `sqlite3.Connection.set_trace_callback` counts statements without touching the code under test.
 
+**The fixture here is deliberately caption-heavy, and that is the point of it.** A fixture that is 100% aligned-tier cannot detect the failure this test exists to catch. Design §6 makes captions the whole corpus and aligned words the small part of it you actually cut from, so the hot lookup's cost must scale with the *alignable* rows, not with every row matching the token. Contracts §3 adds `words_alignable ON words(normalized_text) WHERE source = 'aligned'` for exactly this, and Part 1 creates it. `build()` below is nine caption videos to every one aligned video, and a test asserts that ratio so the fixture cannot quietly drift back to being uniform. A second test reads `EXPLAIN QUERY PLAN` and requires the partial index by name — statement counting alone would not notice a rewrite that still issued one query but read the whole caption corpus inside it.
+
 **Files:**
 - Create: `tests/test_assemble_determinism.py`
 - Test: itself, plus the whole suite
@@ -5143,7 +5235,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from rytp.assemble import AssembleControls, assemble_target, dumps_cutlist, write_cutlist
+from rytp.assemble.match import MatchFilters, occurrence_query
 from rytp.db import Database
 from tests.assembly_corpus import add_video, add_words
 
@@ -5151,13 +5246,41 @@ CREATED = "2026-09-21T09:00:00+00:00"
 TARGET = "мы все понимаем что это неизбежно"
 
 
-def build(db: Database, videos: int) -> None:
-    """A corpus of ``videos`` videos that between them say the target."""
-    for index in range(videos):
+#: Caption videos per aligned video. Design §6 pulls captions for the whole
+#: catalogue and aligns only what you mean to cut from, so a realistic
+#: corpus is mostly uncuttable — and a fixture that is not cannot show
+#: whether the hot lookup scales with the cuttable part.
+CAPTION_RATIO = 9
+
+
+def build(db: Database, aligned_videos: int) -> None:
+    """A caption-heavy corpus whose aligned minority says the target.
+
+    Every video says the same words. Only the aligned ones are eligible,
+    so if the occurrence lookup ever scans by token before filtering by
+    tier, its cost rises with CAPTION_RATIO while the answer does not.
+    """
+    for index in range(aligned_videos):
         first = add_video(db, external_id=f"VIDEO_A{index}", title=f"A{index}")
         add_words(db, first, "мы все понимаем что это")
         second = add_video(db, external_id=f"VIDEO_B{index}", title=f"B{index}")
         add_words(db, second, "все понимаем что это неизбежно")
+        for caption in range(CAPTION_RATIO):
+            noise = add_video(db, external_id=f"VIDEO_C{index}_{caption}")
+            add_words(db, noise, TARGET, source="caption")
+            muffled = add_video(db, external_id=f"VIDEO_D{index}_{caption}")
+            add_words(db, muffled, TARGET, source="timed")
+
+
+def test_the_fixture_is_mostly_uncuttable(db: Database) -> None:
+    """Guards the guard: if this fixture goes uniform, the budget test below
+    stops measuring what it claims to."""
+    build(db, 2)
+    counts = dict(
+        db.conn.execute("SELECT source, COUNT(*) FROM words GROUP BY source").fetchall()
+    )
+    assert counts["caption"] > counts["aligned"] * 4
+    assert counts["timed"] > counts["aligned"] * 4
 
 
 def test_two_runs_write_the_same_bytes(db: Database, tmp_path: Path) -> None:
@@ -5233,10 +5356,44 @@ def test_the_query_count_follows_the_target_and_not_the_corpus(tmp_path: Path) -
     assert small < 40, f"{small} statements for a six-word target is too many"
 
 
-def test_a_caption_only_corpus_assembles_nothing_at_all(db: Database) -> None:
-    """The one rule that must never leak: design §8, captions are not cuttable."""
+def test_the_occurrence_lookup_uses_the_partial_index(db: Database) -> None:
+    """contracts §3: words_alignable exists so this lookup reads only the
+    cuttable rows. Counting statements cannot see a rewrite that keeps one
+    query and scans the caption corpus inside it; the query plan can."""
+    build(db, 2)
+    db.conn.execute("ANALYZE")
+    sql, params = occurrence_query(MatchFilters())
+    plan = " ".join(
+        str(row["detail"]) for row in db.conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+    )
+    assert "words_alignable" in plan, plan
+
+
+def test_the_caption_corpus_does_not_change_the_answer(db: Database) -> None:
+    """Whatever the captions say, only the aligned minority is cut."""
+    build(db, 1)
+    cutlist = assemble_target(db, TARGET, name="демо", created_at=CREATED)
+    sources = {slot.video_id for slot in cutlist.fragments}
+    aligned = {
+        int(row["video_id"])
+        for row in db.conn.execute(
+            "SELECT DISTINCT video_id FROM words WHERE source = 'aligned'"
+        )
+    }
+    assert sources
+    assert sources <= aligned
+
+
+@pytest.mark.parametrize("tier", ["caption", "timed"])
+def test_an_uncuttable_corpus_assembles_nothing_at_all(db: Database, tier: str) -> None:
+    """The one rule that must never leak: contracts §3, only `aligned` is cut.
+
+    `timed` is the dangerous half. A caption row has no end_ms and would
+    fail loudly downstream; a timed row has plausible-looking timings that
+    simply are not cuttable, so nothing but the tier filter stops it.
+    """
     video_id = add_video(db, external_id="VIDEO_A")
-    add_words(db, video_id, TARGET, source="caption")
+    add_words(db, video_id, TARGET, source=tier)
     cutlist = assemble_target(db, TARGET, name="демо", created_at=CREATED)
     assert cutlist.fragments == ()
     assert len(cutlist.gaps) == len(TARGET.split())
@@ -5335,7 +5492,7 @@ Run against the spec after finishing the plan, as the writing-plans skill requir
 | "one knob from fewest seams to most consistent sound, defaulting toward fewer seams" | Task 3 `weights_for`; `ASSEMBLE_DEFAULT_CONSISTENCY = 0.25` |
 | "Consistency is judged from `video_acoustics`" | Task 3 `load_acoustics`, `acoustic_distance` |
 | "preferring few distinct source videos is a strong and cheap proxy" | Task 3 `transition_cost`; Task 4 carries the last source in the DP state |
-| "Only cuttable words are eligible" | Task 2 `_eligibility_sql`; Task 11 end-to-end guard |
+| "Only cuttable words are eligible" | Task 2 `_eligibility_sql` (contracts §3 three tiers: `aligned` only, with `timed` explicitly excluded); Task 12 end-to-end guard over both uncuttable tiers |
 | "Determinism. Same input gives the same output." | Task 3 `rounded`; Task 4 `_step_key`; Task 11 byte comparison |
 | "A user-supplied seed shakes up choices among near-equal candidates." | Task 3 `jitter`; Task 4 tests both directions |
 | "Controls: exclude specific videos, restrict to a speaker, set the seed, add padding" | Task 2 `MatchFilters`, Task 5 `pad_fragments`, Task 9 `AssembleControls`, Task 10 flags |

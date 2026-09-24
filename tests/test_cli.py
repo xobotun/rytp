@@ -1,428 +1,266 @@
-"""Tests for ``rytp.cli`` and the HF_TOKEN pre-launch gate (DESIGN §12)."""
+"""The CLI is generated; this checks the generator, not any one command."""
+
 from __future__ import annotations
 
-from typing import Iterable
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
-from rytp import cli, engines
-from rytp.cli import app
+from rytp.commands import Command, CommandResult, Param
+from rytp.db import Database, schema
+from rytp.models import NotFoundError
+from tests.test_config import child_env
 
 runner = CliRunner()
 
+seen: dict[str, object] = {}
 
-# --- help / tree ----------------------------------------------------------
+
+def record(db: Database, **kwargs: object) -> CommandResult:
+    seen.clear()
+    seen.update(kwargs)
+    seen["db_type"] = type(db).__name__
+    return CommandResult(message="recorded")
 
 
-def test_help_lists_every_subcommand() -> None:
-    result = runner.invoke(app, ["--help"], catch_exceptions=False)
+def explode(db: Database, **kwargs: object) -> CommandResult:
+    raise NotFoundError("channel 7 is not in the catalog")
+
+
+def crash(db: Database, **kwargs: object) -> CommandResult:
+    raise ZeroDivisionError("this is a bug, not a user error")
+
+
+def tabulate(db: Database, **kwargs: object) -> CommandResult:
+    return CommandResult(
+        columns=("id", "title"),
+        rows=(("1", "Утренний эфир"), ("2", "Короткое")),
+        message="2 videos",
+    )
+
+
+SAMPLE = {
+    "videos.add": Command(
+        name="videos.add",
+        group="videos",
+        summary="Register one video.",
+        params=(
+            Param("target", str, "URL or local path.", positional=True),
+            Param("kind", str, "Kind.", default=None, choices=("video", "short")),
+            Param("limit", int, "Rows.", default=10, short="-n"),
+            Param("ratio", float, "A ratio.", default=1.0),
+            Param("force", bool, "Overwrite.", default=False),
+            Param("out", Path, "Where to write.", default=None),
+            Param("speaker", str, "Roster name.", default=None),
+        ),
+        handler=record,
+    ),
+    "videos.boom": Command(
+        name="videos.boom",
+        group="videos",
+        summary="Raise a domain error.",
+        params=(),
+        handler=explode,
+    ),
+    "videos.crash": Command(
+        name="videos.crash",
+        group="videos",
+        summary="Raise a bug.",
+        params=(),
+        handler=crash,
+    ),
+    "videos.table": Command(
+        name="videos.table",
+        group="videos",
+        summary="Return a table.",
+        params=(),
+        handler=tabulate,
+    ),
+    "doctor": Command(
+        name="doctor",
+        group="",
+        summary="A top-level command.",
+        params=(),
+        handler=record,
+    ),
+}
+
+
+@pytest.fixture()
+def app(data_dir: Path):
+    from rytp.cli import build_app
+
+    return build_app(SAMPLE)
+
+
+def test_a_grouped_command_is_reachable_at_group_then_leaf(app) -> None:
+    result = runner.invoke(app, ["videos", "add", "https://example.invalid/w/VIDEO_A"])
+    assert result.exit_code == 0, result.output
+    assert seen["target"] == "https://example.invalid/w/VIDEO_A"
+    assert seen["db_type"] == "Database"
+
+
+def test_a_top_level_command_is_reachable_directly(app) -> None:
+    assert runner.invoke(app, ["doctor"]).exit_code == 0
+
+
+def test_defaults_are_applied_and_types_converted(app) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "videos",
+            "add",
+            "https://example.invalid/w/VIDEO_A",
+            "-n",
+            "3",
+            "--ratio",
+            "2.5",
+            "--force",
+            "--out",
+            "somewhere.mp4",
+            "--kind",
+            "short",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["limit"] == 3
+    assert seen["ratio"] == 2.5
+    assert seen["force"] is True
+    assert seen["out"] == Path("somewhere.mp4")
+    assert seen["kind"] == "short"
+
+
+def test_an_omitted_optional_arrives_as_none(app) -> None:
+    runner.invoke(app, ["videos", "add", "https://example.invalid/w/VIDEO_A"])
+    assert seen["kind"] is None
+    assert seen["out"] is None
+    assert seen["force"] is False
+    assert seen["limit"] == 10
+
+
+def test_a_missing_required_argument_is_a_usage_error(app) -> None:
+    result = runner.invoke(app, ["videos", "add"])
+    assert result.exit_code == 2
+    assert "Missing argument" in result.stderr
+
+
+def test_a_value_outside_choices_is_rejected_before_the_handler(app) -> None:
+    seen.clear()
+    result = runner.invoke(
+        app, ["videos", "add", "https://example.invalid/w/VIDEO_A", "--kind", "opera"]
+    )
+    assert result.exit_code == 2
+    assert "must be one of" in result.stderr
+    assert seen == {}
+
+
+def test_a_parameter_alias_is_accepted_under_both_spellings(app) -> None:
+    """Contracts §5: `--global-speaker` is another spelling of `--speaker`."""
+    assert (
+        runner.invoke(app, ["videos", "add", "x", "--speaker", "Ведущий"]).exit_code == 0
+    )
+    assert seen["speaker"] == "Ведущий"
+    assert (
+        runner.invoke(
+            app, ["videos", "add", "x", "--global-speaker", "Ведущий"]
+        ).exit_code
+        == 0
+    )
+    assert seen["speaker"] == "Ведущий"
+
+
+def test_help_lists_the_summary_and_every_parameter(app) -> None:
+    result = runner.invoke(app, ["videos", "add", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    out = result.stdout
-    # Top-level singletons
-    for cmd in ("download", "transcribe", "mine", "splice", "tui"):
-        assert cmd in out, f"missing top-level command: {cmd}"
-    # Subcommand groups
-    for group in ("channel", "videos", "queue", "speakers"):
-        assert group in out, f"missing subcommand group: {group}"
+    assert "Register one video." in result.stdout
+    for flag in ("--kind", "--limit", "--ratio", "--force", "--out", "--global-speaker"):
+        assert flag in result.stdout
 
 
-def test_each_group_help_lists_its_subcommands() -> None:
-    expected = {
-        "channel": ["add", "sync", "list"],
-        "videos": ["add", "list"],
-        "queue": ["add", "worker", "pause", "resume", "list"],
-        "speakers": ["add", "list", "recompute-pauses", "map"],
-    }
-    for group, subs in expected.items():
-        result = runner.invoke(app, [group, "--help"], catch_exceptions=False)
-        assert result.exit_code == 0, result.stdout
-        for sub in subs:
-            assert sub in result.stdout, f"{group} {sub} missing"
+def test_a_domain_error_is_one_line_on_stderr_and_exit_one(app) -> None:
+    result = runner.invoke(app, ["videos", "boom"])
+    assert result.exit_code == 1
+    assert result.stderr.strip() == "channel 7 is not in the catalog"
+    assert "Traceback" not in result.stderr
 
 
-def test_no_stubs_remain() -> None:
-    """All subcommands are wired in v1.
+def test_an_unexpected_error_is_not_swallowed(app) -> None:
+    result = runner.invoke(app, ["videos", "crash"])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, ZeroDivisionError)
 
-    The actual behavior of each heavy-lift command is covered by
-    its own test below. This test only confirms the v1 wiring is
-    complete: every command group has a real body, not the
-    ``_not_implemented`` stub. We check by inspecting the source of
-    :mod:`rytp.cli` for the marker string.
-    """
-    import inspect
 
-    src = inspect.getsource(cli)
-    # There should be no calls to _not_implemented still in the file
-    # (only the function definition itself).
-    function_def_count = src.count("def _not_implemented(")
-    call_count = src.count("_not_implemented(")
-    # One occurrence is the def itself; the rest would be calls.
-    assert call_count <= function_def_count, (
-        f"unexpected _not_implemented calls left in cli.py: "
-        f"{call_count - function_def_count}"
+def test_a_table_result_is_rendered_with_headers(app) -> None:
+    result = runner.invoke(app, ["videos", "table"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    lines = result.stdout.splitlines()
+    assert lines[0] == "2 videos"
+    assert lines[1].split() == ["id", "title"]
+    assert "Утренний эфир" in lines[3]
+
+
+def test_render_result_handles_each_shape() -> None:
+    from rytp.cli import render_result
+
+    assert render_result(CommandResult()) == ""
+    assert render_result(CommandResult(message="done")) == "done"
+    rendered = render_result(
+        CommandResult(columns=("a", "bb"), rows=(("1", "2"), ("333", "4")))
     )
+    assert rendered.splitlines() == ["a    bb", "---  --", "1    2", "333  4"]
 
 
-# --- wired v1 subcommands (CRUD) ------------------------------------------
-
-
-def test_videos_add_registers_local_path(tmp_path, monkeypatch):
-    """The exact scenario from the bug report: ``python -m rytp videos add <local-file>`` should succeed."""
-    import sqlite3
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    # Use a fresh data dir so we don't touch the user's DB.
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    # Create a fake local video file.
-    fake = tmp_path / "fake.mp4"
-    fake.write_bytes(b"\x00" * 16)
-
-    result = _CR().invoke(app, ["videos", "add", str(fake)])
-    assert result.exit_code == 0, result.stdout
-    assert "video 1" in result.stdout
-
-    # Verify the row landed in the DB.
-    db = Database(config.paths.db)
+def test_the_database_is_created_and_migrated_on_first_use(app, data_dir: Path) -> None:
+    assert not (data_dir / "rytp.db").exists()
+    assert runner.invoke(app, ["doctor"]).exit_code == 0
+    assert (data_dir / "rytp.db").exists()
+    database = Database(data_dir / "rytp.db")
     try:
-        row = db.conn.execute("SELECT * FROM videos WHERE id = 1").fetchone()
+        assert database.schema_version() == schema.LATEST_VERSION
     finally:
-        db.close()
-    assert row is not None
-    assert row["source"] == "local"
-    assert row["downloaded"] == 1
-    assert row["local_path"].endswith("fake.mp4")
+        database.close()
 
 
-def test_speakers_add_then_list(tmp_path, monkeypatch):
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["speakers", "add", "Alice", "--alias", "Al"])
-    assert r.exit_code == 0, r.stdout
-    assert "Alice" in r.stdout
-
-    r = _CR().invoke(app, ["speakers", "list"])
-    assert r.exit_code == 0, r.stdout
-    assert "Alice" in r.stdout
-    assert "Al" in r.stdout
+def test_the_data_flag_overrides_rytp_data_for_this_run(app, tmp_path: Path) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    result = runner.invoke(app, ["--data", str(elsewhere), "doctor"])
+    assert result.exit_code == 0, result.output
+    assert (elsewhere / "rytp.db").exists()
 
 
-def test_speakers_add_idempotent_warns_on_alias_drop(tmp_path, monkeypatch):
-    """Re-running ``speakers add`` for an existing label must warn
-    that --alias / --notes were ignored, instead of silently dropping
-    the user's input.
+def test_the_cli_exposes_exactly_the_registered_commands(app) -> None:
+    """The generator adds nothing of its own — `tui` is a registry entry too."""
+    from rytp.cli import command_paths
 
-    Regression test for ANALYSIS-2.md issue A: the previous behavior
-    was a silent no-op.
-    """
-    from typer.testing import CliRunner as _CR
+    assert command_paths(app) == set(SAMPLE)
 
-    from rytp import config
-    from rytp.db import Database
 
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    cr = _CR()
-    r1 = cr.invoke(app, ["speakers", "add", "Liam", "--alias", "L1"])
-    assert r1.exit_code == 0, r1.stdout
-
-    # Re-add the same label with a fresh alias. The CLI must
-    # explicitly tell the user the alias was dropped, otherwise the
-    # "idempotent" promise is misleading.
-    r2 = cr.invoke(app, ["speakers", "add", "Liam", "--alias", "L2"])
-    assert r2.exit_code == 0, r2.stdout
-    combined = (r2.stdout or "") + (r2.output or "")
-    assert "already exists" in combined.lower(), (
-        f"expected a 'already exists' warning; got: {combined!r}"
+def test_importing_the_cli_creates_no_directories(tmp_path: Path) -> None:
+    proc = subprocess.run(
+        [sys.executable, "-c", "import rytp.cli"],
+        cwd=str(tmp_path),
+        env=child_env(),
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    assert "--alias" in combined
-    assert "L2" not in combined or "not applied" in combined
-
-    # The alias really is not in the DB.
-    db = Database(config.paths.db)
-    try:
-        row = db.conn.execute(
-            "SELECT aliases_json FROM speakers WHERE label = ?", ("Liam",)
-        ).fetchone()
-    finally:
-        db.close()
-    import json as _json
-    assert _json.loads(row["aliases_json"]) == ["L1"]
-
-
-def test_queue_pause_resume_round_trip(tmp_path, monkeypatch):
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["queue", "pause"])
-    assert r.exit_code == 0, r.stdout
-    r = _CR().invoke(app, ["queue", "resume"])
-    assert r.exit_code == 0, r.stdout
-
-
-def test_channel_list_on_empty_db_says_no_channels(tmp_path, monkeypatch):
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["channel", "list"])
-    assert r.exit_code == 0, r.stdout
-    assert "no channels yet" in r.stdout.lower() or "no channels" in r.stdout.lower()
-
-
-def test_videos_list_unknown_channel_exits_nonzero(tmp_path, monkeypatch):
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["videos", "list", "--channel", "nope"])
-    assert r.exit_code == 1, r.stdout
-    assert "channel not found" in r.stdout.lower() or "channel not found" in (r.stderr or "").lower()
-
-
-def test_videos_list_invalid_source_errors(tmp_path, monkeypatch) -> None:
-    """``videos list --source <unknown>`` should fail fast with the list
-    of allowed sources -- not silently return an empty result.
-
-    Regression test for ANALYSIS-2.md observation C-2.
-    """
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["videos", "list", "--source", "bogus"])
-    assert r.exit_code == 2, r.stdout  # Typer BadParameter exits 2.
-    combined = (r.stdout or "") + (r.output or "")
-    assert "bogus" in combined
-    assert "youtube" in combined  # the allowed list
-
-
-def test_videos_list_invalid_kind_errors(tmp_path, monkeypatch) -> None:
-    """Same as ``--source`` above, but for ``--kind``."""
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["videos", "list", "--kind", "bogus"])
-    assert r.exit_code == 2, r.stdout
-    combined = (r.stdout or "") + (r.output or "")
-    assert "bogus" in combined
-    assert "video" in combined  # the allowed list mentions "video"
-
-
-# --- HF_TOKEN gate -------------------------------------------------------
-
-
-@pytest.fixture()
-def gated_stt(monkeypatch: pytest.MonkeyPatch) -> Iterable[type]:
-    """Register a fake STT engine that requires HF_TOKEN."""
-
-    class _Gated:
-        name = "gated-test"
-        requires_hf_token = True
-        help_url = "https://huggingface.co/gated/test"
-        token_env_var = "HF_TOKEN"
-
-        def transcribe(self, audio_path, *, language=None):
-            return iter(())
-
-    engines.register_stt(_Gated)
-    try:
-        yield _Gated
-    finally:
-        engines.STTS.pop("gated-test", None)
-
-
-@pytest.fixture()
-def no_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("HF_TOKEN", raising=False)
-    monkeypatch.delenv("HUGGINGFACE_TOKEN", raising=False)
-
-
-def test_gate_fails_loudly_without_token(gated_stt: type, no_token: None) -> None:
-    # The gate is invoked via top-level --stt/--diarizer/--combined flags
-    # (DESIGN §12: pre-launch callback). Pick a gated STT engine at the top
-    # level; the gate must exit 2 with an HF_TOKEN paragraph before any
-    # subcommand body runs.
-    result = runner.invoke(app, ["--stt", "gated-test", "transcribe", "1"])
-    assert result.exit_code == 2, result.stdout
-    # typer.echo(..., err=True) writes to stderr — CliRunner mixes both into
-    # output but exposes only .stdout. Combine to be safe.
-    combined = (result.stdout or "") + (result.output or "")
-    # The help paragraph must mention the env var name.
-    assert "HF_TOKEN" in combined
-
-
-def test_gate_passes_silently_with_token(gated_stt: type, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HF_TOKEN", "hf_test")
-    result = runner.invoke(app, ["--stt", "gated-test", "transcribe", "1"])
-    # Token set → gate silent, command body runs. v1's body fails
-    # with a "no media" or "video not found" error (exit 1) because
-    # no real video row exists. The point is: not exit 2, and no
-    # HF_TOKEN paragraph.
-    assert result.exit_code != 2, result.stdout
-    assert "HF_TOKEN is required" not in ((result.stdout or "") + (result.output or ""))
-
-
-def test_gate_ignores_unnamed_engine(no_token: None) -> None:
-    # Without naming an engine on the command line, the gate doesn't run
-    # even if the default would need a token (we don't know defaults here
-    # because no engine is named).
-    result = runner.invoke(app, ["videos", "list"])
-    # Not a gate failure — just a stub exit code.
-    assert result.exit_code != 2
-
-
-def test_gate_skips_unknown_engine_silently(no_token: None) -> None:
-    # An unknown engine name should NOT trigger the gate (we can't check
-    # an unknown class). The subcommand body will raise later — that's
-    # the right place for that error.
-    result = runner.invoke(app, ["transcribe", "1", "--stt", "nonexistent"])
-    # Either the body fails (1) or the resolve_stt in the gate raises (2).
-    # The point is the *paragraph* is not printed.
-    assert "HF_TOKEN is required" not in (result.stdout or "")
-
-
-# --- heavy-lift subcommands (v1 wired) ------------------------------------
-
-
-def test_download_unknown_id_exits_nonzero(tmp_path, monkeypatch) -> None:
-    """`rytp download 9999` should exit 1 with a clear message."""
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["download", "9999"])
-    assert r.exit_code == 1, r.stdout
-    combined = (r.stdout or "") + (r.output or "")
-    assert "not found" in combined.lower() or "9999" in combined
-
-
-def test_transcribe_unknown_id_exits_nonzero(tmp_path, monkeypatch) -> None:
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["transcribe", "9999"])
-    assert r.exit_code == 1, r.stdout
-
-
-def test_mine_no_matches_says_so(tmp_path, monkeypatch) -> None:
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["mine", "no-such-string-xyz"])
-    assert r.exit_code == 0, r.stdout
-    assert "no matches" in r.stdout.lower() or "0" in r.stdout
-
-
-def test_speakers_map_lists_empty(tmp_path, monkeypatch) -> None:
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    # Insert a video so the video_id lookup doesn't bail early.
-    db.conn.execute(
-        "INSERT INTO videos (source, kind, title, duration) "
-        "VALUES ('local', 'video', 'v', 1000)"
+    assert proc.returncode == 0, proc.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_bare_python_m_rytp_prints_help_and_exits_zero(tmp_path: Path) -> None:
+    """Click exits 2 for a group with no arguments; `python -m rytp` must not."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "rytp"],
+        cwd=str(tmp_path),
+        env=child_env(),
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    db.conn.commit()
-    db.close()
-
-    r = _CR().invoke(app, ["speakers", "map", "1"])
-    assert r.exit_code == 0, r.stdout
-    assert "no diarizer labels" in r.stdout.lower() or "video 1 has no" in r.stdout.lower()
-
-
-def test_speakers_map_unknown_video_errors(tmp_path, monkeypatch) -> None:
-    """``speakers map <unknown-id>`` must error out, not silently dump
-    the global roster. Regression test for ANALYSIS-2.md issue D: the
-    previous implementation ignored the video_id and printed the
-    entire roster as if every label belonged to the requested video.
-    """
-    from typer.testing import CliRunner as _CR
-
-    from rytp import config
-    from rytp.db import Database
-
-    monkeypatch.setattr(config, "paths", config.Paths.from_root(tmp_path / "data").ensure())
-    db = Database(config.paths.db)
-    db.migrate()
-    db.close()
-
-    r = _CR().invoke(app, ["speakers", "map", "999"])
-    assert r.exit_code == 1, r.stdout
-    combined = (r.stdout or "") + (r.output or "")
-    assert "not found" in combined.lower()
+    assert proc.returncode == 0, proc.stderr
+    assert "Usage" in proc.stdout
+    assert list(tmp_path.iterdir()) == []

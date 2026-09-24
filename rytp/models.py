@@ -1,165 +1,189 @@
-"""Plain-data dataclasses used across the codebase.
+"""The types every stage shares, and the error every surface catches.
 
-Two layers of types live here:
+Contracts §4 fixes the dataclasses below; do not add or rename fields
+without changing the contracts document first. ``ChannelEntry`` is the
+one addition: it is what ``rytp/acquire/ytdlp.py`` (plan part 2) returns
+from ``enumerate_channel`` and ``probe_video``, and it lives here so the
+catalog commands can be written and tested before that module exists.
 
-* **Engine I/O shapes** (``Word``, ``DiarSegment``, ``DiarizedWord``) —
-  re-exported from :mod:`rytp.engines` so the rest of the codebase has
-  one canonical place to import them. They are protocol shapes: the
-  STT, Diarizer, and combined engine interfaces return them.
-
-* **Domain dataclasses** (``Video``, ``Speaker``, ``Clip``) — what we
-  build up in the DB layer. Each has a ``from_row`` classmethod for
-  cheap construction from ``sqlite3.Row``.
-
-A small helper, :func:`normalize_text`, is the canonical normalizer for
-``words.normalized_text`` and the FTS5 shadow.
+Both text functions are implemented here, not stubbed. Contracts §4 keeps
+them in this module on purpose: ``words.stem`` is written by part 3 as
+words are created, so putting the stemmer under ``rytp/index/`` would
+invert the dependency. There is no ``rytp/index/stem.py``.
 """
+
 from __future__ import annotations
 
-import json
 import re
-import sqlite3
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
-
-# Re-export engine I/O shapes for a single canonical import path.
-from rytp.engines import DiarSegment, DiarizedWord, Word  # noqa: F401
+import threading
+import unicodedata
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
 __all__ = [
-    "Word",
+    "ChannelEntry",
     "DiarSegment",
-    "DiarizedWord",
-    "Video",
-    "Speaker",
-    "Clip",
+    "Fragment",
+    "InvalidInputError",
+    "NotFoundError",
+    "RawWord",
+    "RytpError",
+    "Span",
     "normalize_text",
+    "stem_text",
+    "utc_now_iso",
 ]
 
 
-_WHITESPACE_RE = re.compile(r"\s+", flags=re.UNICODE)
-_PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
+class RytpError(Exception):
+    """An expected failure with a message a user can act on.
+
+    Contracts §8: the surface catches this, prints ``str(exc)`` as one
+    line on stderr and exits 1. Never a traceback. Anything that is not
+    a ``RytpError`` is a bug and is allowed to propagate.
+    """
+
+
+class NotFoundError(RytpError):
+    """A referenced row, command or file does not exist."""
+
+
+class InvalidInputError(RytpError):
+    """Arguments were well-formed but wrong (bad enum value, empty id)."""
+
+
+@dataclass(frozen=True)
+class RawWord:
+    """What a transcriber emits, before alignment.
+
+    Both timings are optional: a transcriber may emit text only, leaving
+    every boundary to the aligner. Timings, when present, are absolute
+    against the source audio, never relative to a chunk.
+    """
+
+    text: str
+    start_ms: int | None = None
+    end_ms: int | None = None
+    confidence: float | None = None
+
+
+@dataclass(frozen=True)
+class Span:
+    """A refined time range for one word."""
+
+    start_ms: int
+    end_ms: int
+    score: float | None
+
+
+@dataclass(frozen=True)
+class DiarSegment:
+    """One diarizer segment, labelled per video, not globally."""
+
+    start_ms: int
+    end_ms: int
+    local_label: str
+
+
+@dataclass(frozen=True)
+class Fragment:
+    """One contiguous run taken from one video. The unit of a cut list."""
+
+    video_id: int
+    first_word_ord: int
+    last_word_ord: int
+    start_ms: int
+    end_ms: int
+    text: str
+
+
+@dataclass(frozen=True)
+class ChannelEntry:
+    """One video as a channel listing or a metadata probe describes it.
+
+    ``kind`` is one of ``constants.VIDEO_KINDS``; a channel listing
+    derives it from the tab it came from (design §13). There is no
+    ``source`` field: everything reached through yt-dlp is recorded as
+    ``constants.REMOTE_SOURCE``.
+    """
+
+    external_id: str
+    title: str
+    url: str
+    duration_ms: int | None
+    kind: str
+    published_at: str | None
+
+
+# ``\w`` under re.UNICODE keeps Cyrillic letters and digits; everything
+# else becomes a space so "кто-то" splits into two searchable tokens.
+_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_WHITESPACE_RE = re.compile(r"\s+", re.UNICODE)
+
+# ё/Ё → е/Е. Russian sources spell these interchangeably and a search for
+# "еще" must find "ещё". The FTS5 tokenizer cannot do this for us: it is
+# configured `remove_diacritics 0` (contracts §3) because the alternative
+# also folds й into и, which is a different letter.
+_YO_FOLD = str.maketrans({"ё": "е", "Ё": "Е"})
 
 
 def normalize_text(text: str) -> str:
-    """Canonical text normalizer used by ``words.normalized_text`` and FTS5.
+    """Canonical form used by ``normalized_text`` columns and the FTS index.
 
-    Steps (in order):
-
-    1. ``str.lower()`` — case-fold.
-    2. ``str.strip()`` — drop leading/trailing whitespace.
-    3. Drop punctuation (anything outside ``\\w`` or ``\\s`` under
-       ``re.UNICODE``).
-    4. Collapse runs of whitespace into a single ASCII space.
-
-    Unicode is preserved through every step (no ``encode`` / ``decode``
-    round-trip). Empty input yields empty output.
+    NFC-normalize, fold ё to е, lowercase, replace punctuation with a
+    space, collapse whitespace, strip. Idempotent.
     """
-    text = text.lower().strip()
-    text = _PUNCT_RE.sub("", text)
-    text = _WHITESPACE_RE.sub(" ", text)
-    return text
+    text = unicodedata.normalize("NFC", text).translate(_YO_FOLD).lower()
+    text = _PUNCT_RE.sub(" ", text)
+    return _WHITESPACE_RE.sub(" ", text).strip()
 
 
-# ---------------------------------------------------------------------------
-# Domain dataclasses
-# ---------------------------------------------------------------------------
+_stemmer_local = threading.local()
 
 
-@dataclass(frozen=True)
-class Video:
-    """One row of the ``videos`` table."""
+def _russian_stemmer() -> Any:
+    """The snowball stemmer, built once per thread.
 
-    id: int
-    source: str  # "youtube" | "ytdlp" | "local"
-    kind: str  # "video" | "short" | "livestream" | "other"
-    channel_id: int | None
-    youtube_id: str | None
-    url: str | None
-    local_path: str | None
-    title: str
-    duration: int | None
-    published_at: str | None
-    downloaded: bool
-    downloaded_path: str | None
-    downloaded_audio_path: str | None
-    metadata_json: str = "{}"
+    snowballstemmer's stemmer instance keeps mutable working state on
+    ``self`` across the calls inside ``stemWords``, so one instance
+    shared between threads (a module-level singleton, as this used to
+    be) corrupts under concurrent use — Part 2's worker runs the cpu and
+    gpu pools as threads in one process, and the index job stems on one
+    while transcription stems on the other. A thread-local instance costs
+    one construction per worker thread rather than per call, which is
+    the same "not free but rare" trade the old singleton made, just
+    scoped per thread instead of per process.
+    """
+    stemmer = getattr(_stemmer_local, "value", None)
+    if stemmer is None:
+        import snowballstemmer
 
-    @classmethod
-    def from_row(cls, row: sqlite3.Row) -> Video:
-        """Construct a Video from a sqlite3.Row from the ``videos`` table."""
-        # Handle missing downloaded_audio_path column for backward compatibility
-        downloaded_audio_path = row["downloaded_audio_path"] if "downloaded_audio_path" in row.keys() else None
-        return cls(
-            id=row["id"],
-            source=row["source"],
-            kind=row["kind"],
-            channel_id=row["channel_id"],
-            youtube_id=row["youtube_id"],
-            url=row["url"],
-            local_path=row["local_path"],
-            title=row["title"],
-            duration=row["duration"],
-            published_at=row["published_at"],
-            downloaded=bool(row["downloaded"]),
-            downloaded_path=row["downloaded_path"],
-            downloaded_audio_path=downloaded_audio_path,
-            metadata_json=row["metadata_json"],
-        )
+        stemmer = snowballstemmer.stemmer("russian")
+        _stemmer_local.value = stemmer
+    return stemmer
 
 
-@dataclass(frozen=True)
-class Speaker:
-    """One row of the global ``speakers`` roster."""
+def stem_text(normalized: str) -> str:
+    """Reduce every token of an already-normalized string to its Russian stem.
 
-    id: int
-    label: str
-    aliases: list[str] = field(default_factory=list)
-    notes: str | None = None
-    created_at: str = ""
+    Token for token: ``stem_text(s).split()`` is as long as ``s.split()``,
+    which is what lets an utterance's ``stem_text`` be assembled by
+    joining per-word ``words.stem`` values.
 
-    @classmethod
-    def from_row(cls, row: sqlite3.Row) -> Speaker:
-        """Construct a Speaker from a sqlite3.Row from the ``speakers`` table.
+    **Not idempotent.** ``сказали`` stems to ``сказа``, which stems again
+    to ``сказ``. Never re-stem an already-stemmed string (contracts §4).
 
-        ``aliases_json`` is decoded from JSON into ``list[str]``.
-        """
-        raw = row["aliases_json"]
-        try:
-            aliases = json.loads(raw) if raw else []
-        except json.JSONDecodeError:
-            aliases = []
-        if not isinstance(aliases, list):
-            aliases = []
-        return cls(
-            id=row["id"],
-            label=row["label"],
-            aliases=[str(a) for a in aliases],
-            notes=row["notes"],
-            created_at=row["created_at"],
-        )
+    Pass the output of :func:`normalize_text`, not raw text: the ё fold
+    and the punctuation split have to happen first or the two columns
+    stop agreeing.
+    """
+    tokens = normalized.split()
+    if not tokens:
+        return ""
+    return " ".join(_russian_stemmer().stemWords(tokens))
 
 
-@dataclass(frozen=True)
-class Clip:
-    """One row of the ``clips`` table — output of the mine stage."""
-
-    id: int
-    video_id: int
-    start_ms: int
-    end_ms: int
-    source_query: str
-    created_at: str
-
-    @classmethod
-    def from_row(cls, row: sqlite3.Row) -> Clip:
-        return cls(
-            id=row["id"],
-            video_id=row["video_id"],
-            start_ms=row["start_ms"],
-            end_ms=row["end_ms"],
-            source_query=row["source_query"],
-            created_at=row["created_at"],
-        )
+def utc_now_iso() -> str:
+    """Now, as the ISO-8601 UTC string every timestamp column stores (contracts §8)."""
+    return datetime.now(UTC).isoformat()

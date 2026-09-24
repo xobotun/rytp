@@ -43,7 +43,9 @@ rytp/
   render/      ffmpeg.py  canvas.py  report.py
 ```
 
-Ownership by plan part: 1 = `config, constants, models, db/, commands/__init__, cli, tui skeleton, commands/catalog`. 2 = `jobs/, acquire/, audio/extract`. 3 = `transcribe/, audio/{vad,energy,acoustics}`. 4 = `index/`. 5 = `assemble/`. 6 = `render/`. 7 = `diarize/, tui/screens/speakers`.
+Ownership by plan part: 1 = `config, constants, models, db/, commands/__init__, cli, tui skeleton, commands/catalog`. 2 = `jobs/, acquire/, audio/extract`. 3 = `transcribe/, audio/{vad,energy,acoustics}`. 4 = `index/, tui/screens/{search,transcript}`. 5 = `assemble/`. 6 = `render/`. 7 = `diarize/, tui/screens/speakers`. 8 = the TUI app shell, the remaining screens (`tui/screens/{cutlist,jobs}`), end-to-end integration and the cross-part consistency suite.
+
+Part 8 exists because parts 1–7 each own a domain and nobody owns the whole. Every cross-part defect found so far — three parts inventing three speaker resolvers, one flag spelled two ways, a job kind with no producer, a hardcoded list that went stale before any code existed — was caught by a human reading all seven plans side by side. Part 8's job is to turn that reading into tests.
 
 ## 3. Schema
 
@@ -125,7 +127,7 @@ CREATE TABLE words (
     stem             TEXT NOT NULL,
     confidence       REAL,
     align_score      REAL,
-    source           TEXT NOT NULL CHECK (source IN ('caption','aligned')),
+    source           TEXT NOT NULL CHECK (source IN ('caption','timed','aligned')),
     engine           TEXT NOT NULL,
     video_speaker_id INTEGER REFERENCES video_speakers(id) ON DELETE SET NULL,
     UNIQUE (video_id, ord),
@@ -133,6 +135,11 @@ CREATE TABLE words (
 );
 CREATE INDEX words_video_ord  ON words(video_id, ord);
 CREATE INDEX words_normalized ON words(normalized_text);
+-- The assembler only ever looks at cuttable words, and most of the corpus
+-- will be caption-tier. Without this the hot lookup reads every row matching
+-- a token and filters afterwards, so its cost scales with the whole corpus
+-- rather than with the alignable part of it.
+CREATE INDEX words_alignable ON words(normalized_text) WHERE source = 'aligned';
 CREATE INDEX words_stem       ON words(stem);
 CREATE INDEX words_speaker    ON words(video_speaker_id);
 
@@ -192,6 +199,7 @@ CREATE TABLE jobs (
     attempts     INTEGER NOT NULL DEFAULT 0,
     not_before   TEXT,
     last_error   TEXT,
+    note         TEXT,          -- non-fatal finding returned by the handler
     payload_json TEXT NOT NULL DEFAULT '{}',
     created_at   TEXT NOT NULL,
     started_at   TEXT,
@@ -218,11 +226,49 @@ CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- `default_aligner` names the aligner that `ingest --transcribe` stamps onto
+-- the `align` jobs it creates. Empty means no alignment: ingest enqueues no
+-- `align` job at all and the words stay `timed` until you align them by hand.
+--
+-- `default_transcriber` names the transcriber, and defaults to 'gigaam'.
+-- Unlike the aligner, empty is not meaningful here: `--transcribe` with no
+-- transcriber would do nothing.
+--
+-- Both are resolved ONCE, before any loop, and an unregistered name is
+-- rejected at enqueue time rather than after five failed retries.
 ```
 
 `tokenize` is `unicode61`, **never `porter`** — the Porter stemmer is English-only. Russian stemming is done in Python at write time into the `stem` / `stem_text` columns.
 
-`words.end_ms` is null exactly for caption-sourced rows. **Cuttable is defined as `source = 'aligned'`** and nothing else may be cut.
+`words.end_ms` is null exactly for caption-sourced rows.
+
+### Choosing a transcriber
+
+`settings.default_transcriber` defaults to `gigaam`, the Russian-specific engine, because the corpus is Russian and published benchmarks put it at roughly half Whisper's word error rate there. That default is a starting point, not a verdict — the one published test on *noisy YouTube* audio reversed the ranking against a Russian-finetuned Whisper, and this corpus is exactly noisy YouTube audio. `transcribe.compare` exists to revisit it against real material.
+
+Two rules follow from the default being a real choice rather than an accident:
+
+**When a run uses the default rather than an explicitly named engine, say which engine it picked.** Silently transcribing 1,600 hours with an engine nobody chose is the failure this replaces, and it costs 35–90 GPU-hours to discover late.
+
+**If the configured transcriber is not installed, fail with the install hint. Never fall back to another engine.** A silent substitution is the same bug wearing a different hat — worse, because the corpus would then hold rows from two engines with no indication which. `words.engine` records what actually ran, so a mixed corpus stays interpretable, but only if nothing lies about what it used.
+
+### Three transcript tiers
+
+`words.source` says how a row's timings were produced, and that is what decides whether it can be cut.
+
+| `source` | Timings from | Searchable | Cuttable |
+|---|---|---|---|
+| `caption` | Downloaded auto-captions: word starts only, 40 ms grid, no ends | yes | **no** |
+| `timed` | A transcriber's own word timestamps, energy-refined | yes | **no** |
+| `aligned` | Forced alignment, energy-refined | yes | **yes** |
+
+**Cuttable is `source = 'aligned'` and nothing else may be cut.**
+
+The `timed` tier exists because a transcriber's own word timestamps are not good enough to cut on — measured on the owner's real data, 78.7% of Whisper's word gaps are exactly zero, because it assigns `word[i].end == word[i+1].start` and absorbs every pause into an adjacent word. Energy refinement relocates a boundary within a window; it cannot place one that was never there.
+
+But such a transcript is still far better *text* than captions, so it is worth having and worth searching. Marking it `timed` rather than `aligned` states the truth: you can find the words, you cannot yet cut them. Running the `align` job upgrades those rows in place from `timed` to `aligned`.
+
+The alternative — writing these rows as `aligned` and hoping — is what the design was built to avoid, and nothing downstream could have detected it: `words.engine` records the difference but no consumer reads it, and `align_score` is null without an aligner.
 
 ## 4. Core types
 
@@ -352,6 +398,30 @@ There are two kinds of speaker identity and conflating them is a bug. One shared
 
 `--video-local-speaker` **requires a video to be named as well**, via `--video`. A bare `SPEAKER_00` is meaningless across the corpus — it would match the first-detected voice of every diarized video, which is not a person and not a useful answer. Reject the combination rather than returning that.
 
+Part 1 owns the resolver. Its signature is fixed, because naming the responsibility without naming the signature is how three parts came to assume three different ones:
+
+```python
+@dataclass(frozen=True)
+class SpeakerFilter:
+    video_speaker_ids: frozenset[int]   # already expanded, ready to filter on
+    description: str                    # for display, e.g. 'speaker "Иванов Иван Иванович"'
+
+def resolve_speaker_filter(
+    db: Database,
+    *,
+    speaker: str | None = None,
+    video_local_speaker: str | None = None,
+    video_id: int | None = None,
+) -> SpeakerFilter | None: ...
+```
+
+Four rules callers depend on:
+
+1. **Returns `None` when no speaker filter was requested** — neither argument given. That is the "show everything" case and it is distinct from the next one.
+2. **`video_speaker_ids` may be empty**, meaning the filter resolved but matches no rows — a real person who has not been mapped to any video yet. An empty set must return **nothing**, never everything. This is the classic silent-wrong-answer bug in a SQL `IN` clause and it is pinned by tests in more than one part.
+3. **The expansion happens here.** Every consumer filters `words.video_speaker_id` or `utterances.video_speaker_id`, so this function resolves a roster name all the way to `video_speakers.id` values. A resolver that stopped at `speakers.id` would push the same join into every caller, which is what §5 forbids them from writing.
+4. **Unresolvable input raises**, naming the closest roster entries. It never degrades to an empty result, because "no such person" and "that person said nothing" are different answers.
+
 ### Deletion — every entity gets a `remove`
 
 Each group exposes a `<group>.remove`, so there is no entity you can create but not get rid of. Owners:
@@ -408,7 +478,13 @@ Keeping those two ideas apart matters: the alternative is reporting a missing op
 
 ### Job handlers
 
-Long-running work is reached from two directions — a command run by hand, and the worker draining the queue — so the mapping from job kind to callable is itself a contract. `rytp/jobs/__init__.py` holds `JOB_HANDLERS: dict[str, Callable[[Database, int, dict], None]]`, keyed by job kind, taking the database, the `target_id`, and the decoded `payload_json`. Each part registers its own kinds:
+Long-running work is reached from two directions — a command run by hand, and the worker draining the queue — so the mapping from job kind to callable is itself a contract. `rytp/jobs/__init__.py` holds `JOB_HANDLERS: dict[str, Callable[[Database, int, dict], str | None]]`, keyed by job kind, taking the database, the `target_id`, and the decoded `payload_json`.
+
+A handler may **return a short note** — a non-fatal finding worth surfacing, such as "discarded 4 speaker labels". The worker stores it in `jobs.note`, and `jobs.list` shows it. Returning `None` means nothing to report, which is the normal case and what most handlers do.
+
+This exists because the worker is the bulk path. A handler that can only raise or stay silent has nowhere to put "this succeeded, and there is something you should know" — so an advisory would reach a user running one video by hand and vanish for the same operation across sixteen hundred, which is exactly backwards. Notes are informational: they never affect job state, and a job carrying one is `done`, not `failed`.
+
+Each part registers its own kinds:
 
 | Kind | Owner | Handler |
 |---|---|---|

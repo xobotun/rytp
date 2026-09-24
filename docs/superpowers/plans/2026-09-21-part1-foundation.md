@@ -248,10 +248,11 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 
 # `rytp/commands/catalog.py` imports these lazily inside a try/except, so a
-# missing yt-dlp extra becomes a one-line hint instead of a traceback. Plan
-# part 2 supplies the module; until then its absence is not an error.
+# missing yt-dlp extra becomes a one-line hint and a missing job registry
+# becomes an empty tuple, instead of a traceback. Plan part 2 supplies both
+# modules; until then their absence is not an error.
 [[tool.mypy.overrides]]
-module = ["rytp.acquire.*"]
+module = ["rytp.acquire.*", "rytp.jobs", "rytp.jobs.*"]
 ignore_missing_imports = true
 
 # snowballstemmer ships neither stubs nor a py.typed marker.
@@ -764,20 +765,12 @@ DEFAULT_VIDEO_KIND: Final = "video"
 # Deletion (contracts §5 "Deletion")
 # ---------------------------------------------------------------------------
 
-#: Job kinds whose `jobs.target_id` is a `videos.id`. `jobs` has no
-#: foreign key — contracts §5 says target_id is namespaced by the job
-#: kind — so removing a video has to find its jobs by kind. `render`
-#: is absent on purpose: it targets a `renders` row, not a video.
-VIDEO_JOB_KINDS: Final = (
-    "download",
-    "captions",
-    "extract_wav",
-    "transcribe",
-    "align",
-    "diarize",
-    "fingerprint",
-    "index",
-)
+#: The `JobKind.target_kind` value meaning "this job's target_id is a
+#: videos.id". Removal derives the kinds to cancel from part 2's
+#: registry rather than listing them (contracts §5): a hardcoded list
+#: went stale before any code existed, because part 3 registers
+#: `caption_words` on top of the eight that were obvious.
+VIDEO_TARGET_KIND: Final = "video"
 
 #: Tables that lose their rows by `ON DELETE CASCADE` when a video goes
 #: (contracts §3). Counted before a removal so the report can say what
@@ -1724,7 +1717,7 @@ git commit -m "feat: add the Database wrapper and the migration runner"
 
 ### Task 6: The rest of the schema, including FTS5 and its triggers
 
-Every remaining table in contracts §3, which is explicit that **part 1 creates every table in that section**, including ones only later parts read or write. `renders` is the clearest case: nothing in part 1 touches it, but part 6 builds `create_render`, a readiness predicate and `render.list` on top of it, and a missing table would surface as `no such table: renders` at render time. Later parts consume the schema; none of them add DDL. Note the two partial unique indexes on `assets` (one audio and one captions per video, renditions unconstrained) and `video_speakers.engine`, which records which diarizer produced a label. Two more details carry real weight and get their own tests: the FTS5 tokenizer must be `unicode61`, **never `porter`** (the Porter stemmer is English-only; Russian stemming happens in Python at write time), and `words.end_ms` may be NULL only for caption-sourced rows, because **cuttable is defined as `source = 'aligned'`** and nothing else may be cut.
+Every remaining table in contracts §3, which is explicit that **part 1 creates every table in that section**, including ones only later parts read or write. That includes columns part 1 never writes — `jobs.note`, which part 2's worker fills with a handler's non-fatal finding, and `video_speakers.engine`. `renders` is the clearest case: nothing in part 1 touches it, but part 6 builds `create_render`, a readiness predicate and `render.list` on top of it, and a missing table would surface as `no such table: renders` at render time. Later parts consume the schema; none of them add DDL. Note the two partial unique indexes on `assets` (one audio and one captions per video, renditions unconstrained) and `video_speakers.engine`, which records which diarizer produced a label. Two more details carry real weight and get their own tests: the FTS5 tokenizer must be `unicode61`, **never `porter`** (the Porter stemmer is English-only; Russian stemming happens in Python at write time), and `words.end_ms` may be NULL only for caption-sourced rows, because **cuttable is defined as `source = 'aligned'`** and nothing else may be cut.
 
 **Files:**
 - Modify: `rytp/db/schema.py`
@@ -1777,6 +1770,7 @@ CONTRACT_INDEXES = {
     "words_normalized",
     "words_stem",
     "words_speaker",
+    "words_alignable",
     "utterances_video",
     "jobs_claim",
     "renders_cutlist",
@@ -1850,6 +1844,40 @@ def test_aligned_words_must_have_an_end_time(db: Database) -> None:
             " source, engine) VALUES (?, 0, 0, NULL, 'да', 'да', 'да', 'aligned', 'mfa')",
             (video_id,),
         )
+
+
+def test_the_three_transcript_tiers_are_accepted_and_nothing_else(db: Database) -> None:
+    """Contracts §3: caption, timed, aligned. `timed` is searchable, not cuttable."""
+    video_id = seed_video(db)
+    for ord_, source in enumerate(("caption", "timed", "aligned")):
+        db.conn.execute(
+            "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text,"
+            " stem, source, engine) VALUES (?, ?, 0, 100, 'да', 'да', 'да', ?, 'e')",
+            (video_id, ord_, source),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        db.conn.execute(
+            "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text,"
+            " stem, source, engine) VALUES (?, 9, 0, 100, 'да', 'да', 'да', 'guessed', 'e')",
+            (video_id,),
+        )
+
+
+def test_the_alignable_index_covers_only_cuttable_words(db: Database) -> None:
+    """The assembler reads cuttable words only; a full index would scale with captions."""
+    sql = db.conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'words_alignable'"
+    ).fetchone()[0]
+    assert "WHERE source = 'aligned'" in sql
+
+
+def test_the_default_aligner_setting_ships_empty(db: Database) -> None:
+    """Contracts §3: empty means ingest enqueues no align job at all."""
+    row = db.conn.execute(
+        "SELECT value FROM settings WHERE key = 'default_aligner'"
+    ).fetchone()
+    assert row is not None
+    assert row["value"] == ""
 
 
 def test_word_ordinals_are_unique_per_video(db: Database) -> None:
@@ -2009,6 +2037,33 @@ def test_a_job_is_unique_per_kind_and_target(db: Database) -> None:
         )
 
 
+def test_a_job_can_carry_a_non_fatal_note(db: Database) -> None:
+    """Contracts §3: a handler's finding, recorded by the worker. `done`, not `failed`.
+
+    Part 1 only creates the column; part 2's worker writes it and shows it
+    in `jobs.list`. Without it a warning like "re-transcribing discarded
+    this video's speaker mapping" reaches someone running the command by
+    hand and nobody running the worker, which is the bulk path.
+    """
+    db.conn.execute(
+        "INSERT INTO jobs (kind, target_id, state, pool, note, created_at)"
+        " VALUES ('transcribe', 1, 'done', 'gpu', 'discarded 2 speaker labels', ?)",
+        (NOW,),
+    )
+    row = db.conn.execute("SELECT state, note FROM jobs").fetchone()
+    assert row["state"] == "done"
+    assert row["note"] == "discarded 2 speaker labels"
+
+
+def test_a_job_note_is_optional(db: Database) -> None:
+    db.conn.execute(
+        "INSERT INTO jobs (kind, target_id, state, pool, created_at)"
+        " VALUES ('download', 1, 'pending', 'network', ?)",
+        (NOW,),
+    )
+    assert db.conn.execute("SELECT note FROM jobs").fetchone()["note"] is None
+
+
 def test_job_state_and_pool_are_constrained(db: Database) -> None:
     with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
         db.conn.execute(
@@ -2130,7 +2185,7 @@ Append these tuples to `MIGRATIONS`, after the `videos` tuple and before the clo
             stem             TEXT NOT NULL,
             confidence       REAL,
             align_score      REAL,
-            source           TEXT NOT NULL CHECK (source IN ('caption','aligned')),
+            source           TEXT NOT NULL CHECK (source IN ('caption','timed','aligned')),
             engine           TEXT NOT NULL,
             video_speaker_id INTEGER REFERENCES video_speakers(id) ON DELETE SET NULL,
             UNIQUE (video_id, ord),
@@ -2138,6 +2193,11 @@ Append these tuples to `MIGRATIONS`, after the `videos` tuple and before the clo
         );
         CREATE INDEX words_video_ord  ON words(video_id, ord);
         CREATE INDEX words_normalized ON words(normalized_text);
+        -- The assembler only ever looks at cuttable words, and most of the corpus
+        -- will be caption-tier. Without this the hot lookup reads every row matching
+        -- a token and filters afterwards, so its cost scales with the whole corpus
+        -- rather than with the alignable part of it.
+        CREATE INDEX words_alignable ON words(normalized_text) WHERE source = 'aligned';
         CREATE INDEX words_stem       ON words(stem);
         CREATE INDEX words_speaker    ON words(video_speaker_id);
         """,
@@ -2213,6 +2273,7 @@ Append these tuples to `MIGRATIONS`, after the `videos` tuple and before the clo
             attempts     INTEGER NOT NULL DEFAULT 0,
             not_before   TEXT,
             last_error   TEXT,
+            note         TEXT,          -- non-fatal finding returned by the handler
             payload_json TEXT NOT NULL DEFAULT '{}',
             created_at   TEXT NOT NULL,
             started_at   TEXT,
@@ -2229,6 +2290,12 @@ Append these tuples to `MIGRATIONS`, after the `videos` tuple and before the clo
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        -- `default_aligner` names the aligner that `ingest --transcribe` stamps onto
+        -- the `align` jobs it creates. Empty means no alignment: ingest enqueues no
+        -- `align` job at all and the words stay `timed` until you align them by hand.
+        -- A job enqueued with an unregistered aligner name is rejected at enqueue
+        -- time, not after five failed retries.
+        INSERT INTO settings (key, value) VALUES ('default_aligner', '');
         """,
     ),
     (
@@ -2749,7 +2816,7 @@ Contracts §5 fixes the four types below, `Command.cli_only` included. Do not re
 **Interfaces:**
 - Consumes: `rytp.models` (`InvalidInputError`, `NotFoundError`), `rytp.db.Database`.
 - Produces: `REQUIRED`, `Param`, `CommandResult`, `Command` (with `long_running` and `cli_only`), `COMMANDS`, `register(cmd) -> Command`, `resolve(name) -> Command`, `leaf_name(cmd) -> str`, `cli_path(cmd) -> tuple[str, ...]`, `PARAM_TYPES`.
-- Also produces the shared speaker machinery (contracts §5): `PARAM_ALIASES`, `SPEAKER_PARAMS`, `SpeakerFilter(speaker_id, video_speaker_id, video_id)`, `resolve_speaker_filter(db, *, speaker=None, global_speaker=None, video_local_speaker=None, video=None) -> SpeakerFilter`. Parts 4, 5 and 7 splice `SPEAKER_PARAMS` into their commands and call the resolver; none of them define their own.
+- Also produces the shared speaker machinery, whose signature contracts §5 pins because three parts had assumed three different ones: `PARAM_ALIASES`, `SPEAKER_PARAMS`, `SpeakerFilter(video_speaker_ids: frozenset[int], description: str)`, `resolve_speaker_filter(db, *, speaker=None, video_local_speaker=None, video_id=None) -> SpeakerFilter | None`. Parts 4, 5 and 7 splice `SPEAKER_PARAMS` into their commands and call the resolver; none of them define their own, and none of them write the join from `speakers.id` to `video_speakers.id` — this function has already done it.
 - A handler's contract: `handler(db: Database, **kwargs) -> CommandResult`, keyword names matching `Param.name`. Handlers never print and never call `sys.exit`; they raise `RytpError` and the surface formats it.
 
 - [ ] **Step 1: Write the failing test**
@@ -2982,89 +3049,129 @@ NOW = "2026-01-01T00:00:00+00:00"
 
 @pytest.fixture()
 def roster(db: Database) -> Database:
-    """One video, two diarized labels, two named people, one with an alias."""
-    db.conn.execute(
-        "INSERT INTO videos (source, kind, external_id, title, created_at)"
-        " VALUES ('ytdlp', 'video', 'VIDEO_A', 'A', ?)",
-        (NOW,),
-    )
+    """Two videos, four diarized labels, three named people, one with aliases.
+
+    `Ведущий` is mapped in both videos, `Гость` in one, `Призрак` in none
+    — the roster entry that resolves but matches nothing.
+    """
+    for external_id in ("VIDEO_A", "VIDEO_B"):
+        db.conn.execute(
+            "INSERT INTO videos (source, kind, external_id, title, created_at)"
+            " VALUES ('ytdlp', 'video', ?, ?, ?)",
+            (external_id, external_id, NOW),
+        )
     db.conn.execute(
         "INSERT INTO speakers (label, aliases_json, created_at)"
         " VALUES ('Ведущий', '[\"Host\", \"ведущий канала\"]', ?)",
         (NOW,),
     )
-    db.conn.execute(
-        "INSERT INTO speakers (label, created_at) VALUES ('Гость', ?)", (NOW,)
-    )
-    db.conn.execute(
-        "INSERT INTO video_speakers (video_id, local_label, speaker_id, engine)"
-        " VALUES (1, 'SPEAKER_00', 1, 'pyannote')"
-    )
-    db.conn.execute(
-        "INSERT INTO video_speakers (video_id, local_label, engine)"
-        " VALUES (1, 'SPEAKER_01', 'pyannote')"
-    )
+    db.conn.execute("INSERT INTO speakers (label, created_at) VALUES ('Гость', ?)", (NOW,))
+    db.conn.execute("INSERT INTO speakers (label, created_at) VALUES ('Призрак', ?)", (NOW,))
+    rows = [
+        (1, "SPEAKER_00", 1),  # video_speakers.id 1
+        (1, "SPEAKER_01", 2),  # 2
+        (1, "SPEAKER_02", None),  # 3 — an unnamed voice
+        (2, "SPEAKER_00", 1),  # 4 — the host again, in the other video
+    ]
+    for video_id, label, speaker_id in rows:
+        db.conn.execute(
+            "INSERT INTO video_speakers (video_id, local_label, speaker_id, engine)"
+            " VALUES (?, ?, ?, 'pyannote')",
+            (video_id, label, speaker_id),
+        )
     return db
 
 
-def test_no_flags_resolves_to_an_empty_filter(roster: Database) -> None:
-    result = resolve_speaker_filter(roster)
-    assert result == SpeakerFilter()
-    assert result.is_empty is True
+# -- rule 1: nothing asked for means no filter ------------------------
 
 
-def test_speaker_matches_a_roster_label(roster: Database) -> None:
-    assert resolve_speaker_filter(roster, speaker="Ведущий").speaker_id == 1
-    assert resolve_speaker_filter(roster, speaker="Гость").speaker_id == 2
+def test_no_speaker_named_returns_none(roster: Database) -> None:
+    """Contracts §5 rule 1: the "show everything" case, distinct from a miss."""
+    assert resolve_speaker_filter(roster) is None
 
 
-def test_speaker_matches_an_alias(roster: Database) -> None:
-    assert resolve_speaker_filter(roster, speaker="Host").speaker_id == 1
-    assert resolve_speaker_filter(roster, speaker="ведущий канала").speaker_id == 1
+def test_a_video_alone_is_not_a_speaker_filter(roster: Database) -> None:
+    assert resolve_speaker_filter(roster, video_id=1) is None
 
 
-def test_global_speaker_is_the_same_flag(roster: Database) -> None:
-    assert resolve_speaker_filter(roster, global_speaker="Ведущий").speaker_id == 1
-    # Both spellings, same value, is harmless.
-    assert (
-        resolve_speaker_filter(roster, speaker="Гость", global_speaker="Гость").speaker_id == 2
-    )
+# -- rule 3: the expansion happens here -------------------------------
 
 
-def test_the_two_spellings_may_not_disagree(roster: Database) -> None:
-    with pytest.raises(InvalidInputError, match="same flag"):
-        resolve_speaker_filter(roster, speaker="Ведущий", global_speaker="Гость")
+def test_a_roster_name_expands_to_every_video_speaker_row(roster: Database) -> None:
+    """Consumers filter words.video_speaker_id; the join belongs here, not there."""
+    result = resolve_speaker_filter(roster, speaker="Ведущий")
+    assert result is not None
+    assert result.video_speaker_ids == frozenset({1, 4})
+    assert result.description == 'speaker "Ведущий"'
 
 
-def test_speaker_never_accepts_a_raw_diarizer_label(roster: Database) -> None:
-    """SPEAKER_00 is a per-video label, not a person."""
-    with pytest.raises(NotFoundError, match="no speaker matches"):
-        resolve_speaker_filter(roster, speaker="SPEAKER_00")
+def test_an_alias_resolves_to_the_same_rows_and_the_canonical_label(
+    roster: Database,
+) -> None:
+    by_alias = resolve_speaker_filter(roster, speaker="Host")
+    by_label = resolve_speaker_filter(roster, speaker="Ведущий")
+    assert by_alias is not None and by_label is not None
+    assert by_alias.video_speaker_ids == by_label.video_speaker_ids
+    assert by_alias.description == 'speaker "Ведущий"'
 
 
-def test_an_unknown_speaker_names_the_nearest_roster_entries(roster: Database) -> None:
-    with pytest.raises(NotFoundError) as excinfo:
-        resolve_speaker_filter(roster, speaker="Ведущй")
-    assert "Ведущий" in str(excinfo.value)
+def test_a_roster_name_can_be_narrowed_to_one_video(roster: Database) -> None:
+    result = resolve_speaker_filter(roster, speaker="Ведущий", video_id=2)
+    assert result is not None
+    assert result.video_speaker_ids == frozenset({4})
+    assert "in video 2" in result.description
 
 
-def test_an_unknown_speaker_against_an_empty_roster_says_so(db: Database) -> None:
-    with pytest.raises(NotFoundError, match="roster is empty"):
-        resolve_speaker_filter(db, speaker="Ведущий")
+# -- rule 2: empty means nothing, not everything ----------------------
+
+
+def test_an_unmapped_person_resolves_to_an_empty_set(roster: Database) -> None:
+    """Contracts §5 rule 2: a real person nobody has mapped to a video yet."""
+    result = resolve_speaker_filter(roster, speaker="Призрак")
+    assert result is not None
+    assert result.video_speaker_ids == frozenset()
+    assert result.description == 'speaker "Призрак"'
+
+
+def test_an_empty_result_is_distinguishable_from_no_filter(roster: Database) -> None:
+    """The bug this guards: `IN ()` silently matching everything."""
+    unmapped = resolve_speaker_filter(roster, speaker="Призрак")
+    assert unmapped is not None  # not None: a filter WAS requested
+    assert not unmapped.video_speaker_ids  # and it matches nothing
+    assert resolve_speaker_filter(roster) is None  # this is "everything"
+
+
+def test_narrowing_to_the_wrong_video_is_also_empty(roster: Database) -> None:
+    result = resolve_speaker_filter(roster, speaker="Гость", video_id=2)
+    assert result is not None
+    assert result.video_speaker_ids == frozenset()
+
+
+# -- the local-label space --------------------------------------------
 
 
 def test_a_local_label_resolves_within_its_video(roster: Database) -> None:
-    result = resolve_speaker_filter(roster, video_local_speaker="SPEAKER_01", video="1")
-    assert result.video_speaker_id == 2
-    assert result.video_id == 1
-    assert result.speaker_id is None
+    result = resolve_speaker_filter(roster, video_local_speaker="SPEAKER_01", video_id=1)
+    assert result is not None
+    assert result.video_speaker_ids == frozenset({2})
+    assert result.description == "local label SPEAKER_01 in video 1"
 
 
-def test_a_video_may_be_named_by_external_id(roster: Database) -> None:
-    result = resolve_speaker_filter(
-        roster, video_local_speaker="SPEAKER_00", video="VIDEO_A"
-    )
-    assert result.video_speaker_id == 1
+def test_the_same_local_label_in_another_video_is_another_row(
+    roster: Database,
+) -> None:
+    """SPEAKER_00 exists in both videos and they are different voices."""
+    first = resolve_speaker_filter(roster, video_local_speaker="SPEAKER_00", video_id=1)
+    second = resolve_speaker_filter(roster, video_local_speaker="SPEAKER_00", video_id=2)
+    assert first is not None and second is not None
+    assert first.video_speaker_ids == frozenset({1})
+    assert second.video_speaker_ids == frozenset({4})
+
+
+def test_an_unnamed_voice_still_resolves_by_its_local_label(roster: Database) -> None:
+    result = resolve_speaker_filter(roster, video_local_speaker="SPEAKER_02", video_id=1)
+    assert result is not None
+    assert result.video_speaker_ids == frozenset({3})
 
 
 def test_a_local_label_without_a_video_is_rejected(roster: Database) -> None:
@@ -3076,23 +3183,45 @@ def test_a_local_label_without_a_video_is_rejected(roster: Database) -> None:
 def test_the_two_identifier_spaces_cannot_be_combined(roster: Database) -> None:
     with pytest.raises(InvalidInputError, match="one or the other"):
         resolve_speaker_filter(
-            roster, speaker="Ведущий", video_local_speaker="SPEAKER_00", video="1"
+            roster, speaker="Ведущий", video_local_speaker="SPEAKER_00", video_id=1
         )
+
+
+# -- rule 4: unresolvable input raises --------------------------------
+
+
+def test_speaker_never_accepts_a_raw_diarizer_label(roster: Database) -> None:
+    with pytest.raises(NotFoundError, match="no speaker matches"):
+        resolve_speaker_filter(roster, speaker="SPEAKER_00")
+
+
+def test_an_unknown_speaker_names_the_nearest_roster_entries(roster: Database) -> None:
+    """Rule 4: "no such person" and "that person said nothing" are different answers."""
+    with pytest.raises(NotFoundError) as excinfo:
+        resolve_speaker_filter(roster, speaker="Ведущй")
+    assert "Ведущий" in str(excinfo.value)
+
+
+def test_an_unknown_speaker_against_an_empty_roster_says_so(db: Database) -> None:
+    with pytest.raises(NotFoundError, match="roster is empty"):
+        resolve_speaker_filter(db, speaker="Ведущий")
 
 
 def test_an_unknown_local_label_lists_the_labels_that_video_has(
     roster: Database,
 ) -> None:
     with pytest.raises(NotFoundError) as excinfo:
-        resolve_speaker_filter(roster, video_local_speaker="SPEAKER_09", video="1")
+        resolve_speaker_filter(roster, video_local_speaker="SPEAKER_09", video_id=1)
     message = str(excinfo.value)
     assert "SPEAKER_00" in message
-    assert "SPEAKER_01" in message
+    assert "SPEAKER_02" in message
 
 
-def test_an_unknown_video_is_an_error(roster: Database) -> None:
-    with pytest.raises(NotFoundError, match="no video matches"):
-        resolve_speaker_filter(roster, video_local_speaker="SPEAKER_00", video="VIDEO_Z")
+def test_the_result_is_frozen_and_hashable(roster: Database) -> None:
+    result = resolve_speaker_filter(roster, speaker="Ведущий")
+    assert result is not None
+    assert isinstance(result.video_speaker_ids, frozenset)
+    assert hash(result)
 
 
 def test_the_shared_params_are_what_later_parts_splice_in() -> None:
@@ -3102,6 +3231,18 @@ def test_the_shared_params_are_what_later_parts_splice_in() -> None:
         "video",
     ]
     assert all(param.default is None for param in SPEAKER_PARAMS)
+
+
+def test_the_pinned_signature_has_not_drifted() -> None:
+    """Parts 4, 5 and 7 call this; contracts §5 fixes the keywords."""
+    import inspect
+
+    parameters = inspect.signature(resolve_speaker_filter).parameters
+    assert list(parameters) == ["db", "speaker", "video_local_speaker", "video_id"]
+    assert [f.name for f in SpeakerFilter.__dataclass_fields__.values()] == [
+        "video_speaker_ids",
+        "description",
+    ]
 ```
 
 - [ ] **Step 3: Run both and watch them fail**
@@ -3328,24 +3469,24 @@ def resolve(name: str) -> Command:
 
 @dataclass(frozen=True)
 class SpeakerFilter:
-    """A resolved speaker selection, in whichever identifier space was used.
+    """A speaker selection, already expanded to the ids consumers filter on.
 
-    At most one of the two ids is set. ``video_id`` is filled in whenever
-    a video was named, and is mandatory for a local-label filter.
+    Contracts §5 pins this shape. ``video_speaker_ids`` is **empty when
+    the filter resolved but matches nothing** — a real person nobody has
+    mapped to a video yet. An empty set must return no rows, never every
+    row: that is the classic silent-wrong-answer bug in a SQL ``IN``
+    clause, and it is what "show everything" (a ``None`` filter) is for.
     """
 
-    speaker_id: int | None = None
-    video_speaker_id: int | None = None
-    video_id: int | None = None
-
-    @property
-    def is_empty(self) -> bool:
-        return self.speaker_id is None and self.video_speaker_id is None
+    video_speaker_ids: frozenset[int]  # already expanded, ready to filter on
+    description: str  # for display, e.g. 'speaker "Иванов Иван Иванович"'
 
 
 #: The three flags every speaker-filtering command shares. Splice these
 #: into a command's ``params`` rather than restating them, so ``--speaker``
-#: means the same thing everywhere.
+#: means the same thing everywhere. A handler converts its `video` string
+#: with `resolve_video_id` before calling the resolver, whose signature is
+#: fixed by contracts §5 and takes an int.
 SPEAKER_PARAMS: Final[tuple[Param, ...]] = (
     Param(
         "speaker",
@@ -3372,46 +3513,52 @@ def resolve_speaker_filter(
     db: Database,
     *,
     speaker: str | None = None,
-    global_speaker: str | None = None,
     video_local_speaker: str | None = None,
-    video: str | None = None,
-) -> SpeakerFilter:
-    """Turn the speaker flags into row ids, or raise.
+    video_id: int | None = None,
+) -> SpeakerFilter | None:
+    """Turn the speaker flags into the ``video_speakers.id`` set to filter on.
 
-    Contracts §5. There are two identifier spaces and conflating them is
-    a bug:
+    Contracts §5 fixes this signature. There are two identifier spaces
+    and conflating them is a bug:
 
-    * ``--speaker`` (alias ``--global-speaker``) names a person in the
-      global roster, matched against ``speakers.label`` and then against
-      ``speakers.aliases_json``. It never accepts a raw diarizer label.
-    * ``--video-local-speaker`` names one diarized voice inside one
-      video and **requires** ``--video``. A bare ``SPEAKER_00`` would
-      otherwise match the first-detected voice of every diarized video,
-      which is not a person and not a useful answer.
+    * ``--speaker`` (alias ``--global-speaker``, handled by
+      :data:`PARAM_ALIASES`) names a person in the global roster, matched
+      against ``speakers.label`` and then against ``speakers.aliases_json``.
+      It never accepts a raw diarizer label.
+    * ``--video-local-speaker`` names one diarized voice inside one video
+      and **requires** a video. A bare ``SPEAKER_00`` would otherwise
+      match the first-detected voice of every diarized video, which is
+      not a person and not a useful answer.
 
-    A lookup that finds nothing raises, naming the nearest roster
-    entries. It never returns a silently empty result.
+    The expansion to ``video_speakers.id`` happens here, not in the
+    caller: every consumer filters ``words.video_speaker_id`` or
+    ``utterances.video_speaker_id``, and a resolver that stopped at
+    ``speakers.id`` would push the same join into all of them.
+
+    Returns:
+        ``None`` when no speaker was named at all — the "show everything"
+        case, which is distinct from a filter that matched nothing.
+
+    Raises:
+        InvalidInputError: if both identifier spaces are used at once, or
+            a local label is given without a video.
+        NotFoundError: if a name does not resolve. "No such person" and
+            "that person said nothing" are different answers, so this
+            never degrades to an empty result.
     """
-    if speaker is not None and global_speaker is not None and speaker != global_speaker:
-        raise InvalidInputError(
-            "--speaker and --global-speaker are the same flag; give only one"
-        )
-    wanted = speaker if speaker is not None else global_speaker
-
-    if wanted is not None and video_local_speaker is not None:
+    if speaker is not None and video_local_speaker is not None:
         raise InvalidInputError(
             "--speaker names a person and --video-local-speaker names one "
             "video's diarizer label; filter by one or the other"
         )
 
     if video_local_speaker is not None:
-        if video is None:
+        if video_id is None:
             raise InvalidInputError(
                 "--video-local-speaker requires --video: a label like "
                 f"{video_local_speaker!r} is only meaningful inside one video, "
                 "and alone it would match the first voice of every diarized one"
             )
-        video_id = resolve_video_id(db, video)
         row = db.conn.execute(
             "SELECT id FROM video_speakers WHERE video_id = ? AND local_label = ?",
             (video_id, video_local_speaker),
@@ -3430,21 +3577,43 @@ def resolve_speaker_filter(
                 f"video {video_id} has no speaker label {video_local_speaker!r}; "
                 f"it has: {listed}"
             )
-        return SpeakerFilter(video_speaker_id=int(row["id"]), video_id=video_id)
+        return SpeakerFilter(
+            video_speaker_ids=frozenset({int(row["id"])}),
+            description=f"local label {video_local_speaker} in video {video_id}",
+        )
 
-    resolved_video = resolve_video_id(db, video) if video is not None else None
-    if wanted is None:
-        return SpeakerFilter(video_id=resolved_video)
+    if speaker is None:
+        return None
+
+    speaker_id, label = _resolve_roster_speaker(db, speaker)
+    sql = "SELECT id FROM video_speakers WHERE speaker_id = ?"
+    params: list[Any] = [speaker_id]
+    description = f'speaker "{label}"'
+    if video_id is not None:
+        sql += " AND video_id = ?"
+        params.append(video_id)
+        description += f" in video {video_id}"
+    # May legitimately come back empty: a roster entry nobody has mapped
+    # to a video yet. Rule 2 — the caller must then return nothing.
     return SpeakerFilter(
-        speaker_id=_resolve_roster_speaker(db, wanted), video_id=resolved_video
+        video_speaker_ids=frozenset(
+            int(row["id"]) for row in db.conn.execute(sql, params)
+        ),
+        description=description,
     )
 
 
-def _resolve_roster_speaker(db: Database, wanted: str) -> int:
-    """Match a roster entry by label, then by alias. Raise, naming near misses."""
-    row = db.conn.execute("SELECT id FROM speakers WHERE label = ?", (wanted,)).fetchone()
+def _resolve_roster_speaker(db: Database, wanted: str) -> tuple[int, str]:
+    """Match a roster entry by label, then by alias. Returns ``(id, label)``.
+
+    The label comes back so a filter found through an alias still
+    describes itself by the person's canonical name.
+    """
+    row = db.conn.execute(
+        "SELECT id, label FROM speakers WHERE label = ?", (wanted,)
+    ).fetchone()
     if row is not None:
-        return int(row["id"])
+        return int(row["id"]), str(row["label"])
 
     labels: list[str] = []
     for candidate in db.conn.execute("SELECT id, label, aliases_json FROM speakers"):
@@ -3454,7 +3623,7 @@ def _resolve_roster_speaker(db: Database, wanted: str) -> int:
         except json.JSONDecodeError:
             aliases = []
         if isinstance(aliases, list) and wanted in [str(alias) for alias in aliases]:
-            return int(candidate["id"])
+            return int(candidate["id"]), str(candidate["label"])
 
     near = difflib.get_close_matches(wanted, labels, n=_SPEAKER_SUGGESTIONS)
     if near:
@@ -3488,7 +3657,7 @@ def resolve_video_id(db: Database, ref: str) -> int:
 - [ ] **Step 5: Run the tests and watch them pass**
 
 Run: `python -m pytest tests/test_registry.py tests/test_speaker_filter.py -v`
-Expected: 33 passed.
+Expected: 38 passed.
 
 - [ ] **Step 6: Lint the new module**
 
@@ -5417,6 +5586,30 @@ Extend `__all__` to `["channel_add", "channel_list", "format_duration", "looks_l
 # -- seams part 2 fills in --------------------------------------------
 
 
+def _video_job_kinds() -> tuple[str, ...]:
+    """Job kinds whose `jobs.target_id` is a `videos.id`.
+
+    Derived from part 2's registry, never listed here: `target_kind` is a
+    Python attribute of the registration (contracts §5), and the obvious
+    eight kinds already miss part 3's `caption_words`.
+
+    Part 1 ships before `rytp.jobs` exists. With no registry there are no
+    job kinds and nothing creates job rows, so an empty tuple is the
+    correct answer rather than a guess.
+    """
+    try:
+        from rytp.jobs import JOB_KINDS
+    except ImportError:
+        return ()
+    return tuple(
+        sorted(
+            name
+            for name, kind in JOB_KINDS.items()
+            if kind.target_kind == C.VIDEO_TARGET_KIND
+        )
+    )
+
+
 def _probe_video(url: str) -> ChannelEntry:
     """Ask yt-dlp what a URL is. One metadata request, no download.
 
@@ -6002,7 +6195,7 @@ Contracts §5 "Deletion": every entity gets a `remove`, so there is nothing you 
 `videos.remove` is the consequential one, and three things make it harder than it looks:
 
 - **Cascades cover rows, not files.** `words`, `utterances`, `video_speakers`, `assets` and `video_acoustics` go by `ON DELETE CASCADE`. `media/{video_id}/`, `cache/wav/{video_id}.wav` and `transcripts/{video_id}.md` must be removed by hand.
-- **`jobs` has no foreign key.** `jobs.target_id` is namespaced by the job kind, so a `transcribe` job for video 7 survives video 7 and a worker would later run it against nothing. Its jobs go in the same transaction as the row.
+- **`jobs` has no foreign key.** `jobs.target_id` is disambiguated by the row's `kind`, so a `transcribe` job for video 7 survives video 7 and a worker would later run it against nothing. Its jobs go in the same transaction as the row — and the *set* of kinds to cancel is derived from part 2's `JOB_KINDS` registry, never listed here. A hardcoded list went stale before any code existed: the eight obvious kinds miss part 3's `caption_words`.
 - **A cut list on disk may name the video.** Parts 5 and 6 treat a dangling `video_id` as corrupt input and refuse to render, which is right, but the owner should hear about it now rather than at render time. So removal *warns*, naming the cut lists — it never blocks and never edits them.
 
 Per contracts: `--dry-run` prints what would go, counting rows and bytes; `--yes` is required because files are deleted; removal is synchronous, never a job.
@@ -6012,8 +6205,9 @@ Per contracts: `--dry-run` prints what would go, counting rows and bytes; `--yes
 - Test: `tests/test_remove.py`
 
 **Interfaces:**
-- Consumes: `rytp.commands.resolve_video_id`, `rytp.config` (`paths`), `rytp.constants` (`VIDEO_JOB_KINDS`, `VIDEO_CASCADE_TABLES`, `CUTLISTS_DIRNAME`).
-- Produces: `channel_remove(db, *, channel)`, `videos_remove(db, *, video, dry_run=False, yes=False)`, `video_files(video_id) -> list[Path]`, `cutlists_naming_video(video_id) -> list[str]`, `directory_bytes(path) -> int`; registered commands `channel.remove`, `videos.remove`.
+- Consumes: `rytp.commands.resolve_video_id`, `rytp.config` (`paths`), `rytp.constants` (`VIDEO_TARGET_KIND`, `VIDEO_CASCADE_TABLES`, `CUTLISTS_DIRNAME`).
+- Produces: `channel_remove(db, *, channel)`, `videos_remove(db, *, video, dry_run=False, yes=False)`, `video_files(video_id) -> list[Path]`, `cutlists_naming_video(video_id) -> list[str]`, `directory_bytes(path) -> int`, `_video_job_kinds() -> tuple[str, ...]`; registered commands `channel.remove`, `videos.remove`.
+- Part 2 must expose `rytp.jobs.JOB_KINDS`, whose values carry `target_kind`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6053,7 +6247,20 @@ def fake_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture()
-def video(db: Database, data_dir: Path, fake_probe: None) -> int:
+def job_kinds(monkeypatch: pytest.MonkeyPatch) -> tuple[str, ...]:
+    """Stand in for part 2's JOB_KINDS registry.
+
+    `caption_words` is here on purpose: it is the kind that a hardcoded
+    list of the obvious eight would have missed, and the reason removal
+    derives this set instead of listing it.
+    """
+    kinds = ("caption_words", "download", "transcribe")
+    monkeypatch.setattr(catalog, "_video_job_kinds", lambda: kinds)
+    return kinds
+
+
+@pytest.fixture()
+def video(db: Database, data_dir: Path, fake_probe: None, job_kinds: tuple[str, ...]) -> int:
     """One catalogued video with rows, files and a queued job."""
     catalog.channel_add(db, url=CHANNEL_URL, title="Channel One")
     catalog.videos_add(db, target=VIDEO_URL, channel="1")
@@ -6081,6 +6288,11 @@ def video(db: Database, data_dir: Path, fake_probe: None) -> int:
     db.conn.execute(
         "INSERT INTO jobs (kind, target_id, state, pool, created_at)"
         " VALUES ('transcribe', 1, 'pending', 'gpu', ?)",
+        (NOW,),
+    )
+    db.conn.execute(
+        "INSERT INTO jobs (kind, target_id, state, pool, created_at)"
+        " VALUES ('caption_words', 1, 'pending', 'cpu', ?)",
         (NOW,),
     )
     layout = config.paths()
@@ -6138,7 +6350,7 @@ def test_a_dry_run_deletes_nothing_and_counts_everything(
     assert counts["video_speakers"] == "1"
     assert counts["assets"] == "1"
     assert counts["video_acoustics"] == "1"
-    assert counts["jobs"] == "1"
+    assert counts["jobs"] == "2"
     assert counts["files"] == "3"
     # 10 bytes of audio + 5 of wav + the transcript.
     assert "bytes" in (result.message or "")
@@ -6166,16 +6378,48 @@ def test_removal_takes_the_row_the_cascades_and_the_files(
     assert not layout.transcript(1).exists()
 
 
-def test_removal_cancels_the_jobs_that_targeted_the_video(
+def test_removal_cancels_every_kind_of_job_that_targeted_the_video(
     db: Database, video: int, data_dir: Path
 ) -> None:
-    """`jobs` has no foreign key, so a worker would otherwise run against nothing."""
+    """`jobs` has no foreign key, so a worker would otherwise run against nothing.
+
+    `caption_words` is part 3's, and is cancelled because the kinds come
+    from the registry rather than from a list written here.
+    """
     catalog.videos_remove(db, video="1", yes=True)
     assert db.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
 
+def test_the_video_job_kinds_come_from_part_twos_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contracts §5: `target_kind` is an attribute of the registration."""
+    import sys
+    import types
+
+    registry = types.SimpleNamespace(
+        JOB_KINDS={
+            "download": types.SimpleNamespace(target_kind="video"),
+            "caption_words": types.SimpleNamespace(target_kind="video"),
+            "render": types.SimpleNamespace(target_kind="render"),
+        }
+    )
+    monkeypatch.setitem(sys.modules, "rytp.jobs", registry)
+    assert catalog._video_job_kinds() == ("caption_words", "download")
+
+
+def test_with_no_job_registry_there_are_no_job_kinds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Part 1 ships before rytp.jobs; nothing creates job rows either."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "rytp.jobs", None)
+    assert catalog._video_job_kinds() == ()
+
+
 def test_removal_leaves_another_videos_jobs_alone(
-    db: Database, video: int, data_dir: Path
+    db: Database, video: int, data_dir: Path, job_kinds: tuple[str, ...]
 ) -> None:
     db.conn.execute(
         "INSERT INTO jobs (kind, target_id, state, pool, created_at)"
@@ -6192,7 +6436,8 @@ def test_removal_leaves_another_videos_jobs_alone(
         (row["kind"], row["target_id"])
         for row in db.conn.execute("SELECT kind, target_id FROM jobs")
     }
-    # `render` targets a renders row, not a video, so it is not ours to cancel.
+    # `render` targets a renders row, not a video, so its target_kind keeps
+    # it out of the derived set and it is not ours to cancel.
     assert remaining == {("transcribe", 2), ("render", 1)}
 
 
@@ -6228,7 +6473,7 @@ def test_an_unreadable_cut_list_is_skipped_not_fatal(
 
 
 def test_removal_works_when_the_files_were_never_downloaded(
-    db: Database, data_dir: Path, fake_probe: None
+    db: Database, data_dir: Path, fake_probe: None, job_kinds: tuple[str, ...]
 ) -> None:
     catalog.videos_add(db, target=VIDEO_URL)
     catalog.videos_remove(db, video="1", yes=True)
@@ -6242,7 +6487,9 @@ def test_a_video_may_be_named_by_external_id(
     assert db.conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0] == 0
 
 
-def test_removing_an_unknown_video_is_an_error(db: Database, data_dir: Path) -> None:
+def test_removing_an_unknown_video_is_an_error(
+    db: Database, data_dir: Path, job_kinds: tuple[str, ...]
+) -> None:
     with pytest.raises(NotFoundError, match="no video matches"):
         catalog.videos_remove(db, video="404", yes=True)
 
@@ -6402,12 +6649,18 @@ def videos_remove(
         )
         for table in C.VIDEO_CASCADE_TABLES
     }
-    placeholders = ", ".join("?" for _ in C.VIDEO_JOB_KINDS)
-    counts["jobs"] = int(
-        db.conn.execute(
-            f"SELECT COUNT(*) FROM jobs WHERE target_id = ? AND kind IN ({placeholders})",
-            (video_id, *C.VIDEO_JOB_KINDS),
-        ).fetchone()[0]
+    job_kinds = _video_job_kinds()
+    placeholders = ", ".join("?" for _ in job_kinds)
+    counts["jobs"] = (
+        int(
+            db.conn.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE target_id = ? AND kind IN"
+                f" ({placeholders})",
+                (video_id, *job_kinds),
+            ).fetchone()[0]
+        )
+        if job_kinds
+        else 0
     )
     files = video_files(video_id)
     total_bytes = sum(directory_bytes(path) for path in files)
@@ -6440,10 +6693,11 @@ def videos_remove(
     # The database first, in one transaction: if a file then refuses to
     # go, the catalog is still consistent and the leftover is named.
     with db.transaction():
-        db.conn.execute(
-            f"DELETE FROM jobs WHERE target_id = ? AND kind IN ({placeholders})",
-            (video_id, *C.VIDEO_JOB_KINDS),
-        )
+        if job_kinds:
+            db.conn.execute(
+                f"DELETE FROM jobs WHERE target_id = ? AND kind IN ({placeholders})",
+                (video_id, *job_kinds),
+            )
         db.conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
 
     stubborn: list[str] = []
@@ -6509,7 +6763,7 @@ register(
 - [ ] **Step 4: Run the test and watch it pass**
 
 Run: `python -m pytest tests/test_remove.py -v`
-Expected: 17 passed.
+Expected: 19 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -7317,7 +7571,7 @@ git commit -m "test: assert both surfaces expose exactly the registered commands
 
 ## Notes for whoever executes this
 
-**The code in this plan was run, not just written.** Every module and test block was extracted verbatim into a scratch package and checked against the dev venv (Python 3.14.6, typer 0.27.2, textual 8.2.8, ruff 0.16.8, mypy 2.3.1): 246 tests pass, `ruff check rytp tests` reports `All checks passed!`, `mypy rytp` reports `Success: no issues found`, and the Task 16 Step 6 command sequence produces exactly the output described there. The per-task "Expected: N passed" counts are measured, not estimated. If a step does not behave as written, suspect a transcription slip before suspecting the plan.
+**The code in this plan was run, not just written.** Every module and test block was extracted verbatim into a scratch package and checked against the dev venv (Python 3.14.6, typer 0.27.2, textual 8.2.8, ruff 0.16.8, mypy 2.3.1): 258 tests pass, `ruff check rytp tests` reports `All checks passed!`, `mypy rytp` reports `Success: no issues found`, and the Task 16 Step 6 command sequence produces exactly the output described there. The per-task "Expected: N passed" counts are measured, not estimated. If a step does not behave as written, suspect a transcription slip before suspecting the plan.
 
 **Where the old code went.** Task 2 deletes it. Anything worth cribbing is at `git show 44fc214c:rytp/<path>` — the yt-dlp fake-runner split in `download/ytdlp.py`, the ffmpeg wrapper in `transcribe/extract.py`, the loudness normalizer, the migration runner. Design §12 lists what is worth keeping, and in every case it is the pattern, not the file.
 

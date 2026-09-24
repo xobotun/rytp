@@ -1682,7 +1682,7 @@ Scoping follows the design: pooled across the corpus for a named speaker, per di
 - Produces:
   - `PauseStats(scope: str, key: str, n_samples: int, median_ms: int, zero_fraction: float, degenerate: bool, reason: str)` with `.description`
   - `summarize_gaps(samples: Sequence[int], *, scope: str, key: str) -> PauseStats`
-  - `gaps_for_video(db, video_id) -> list[int]`, `gaps_for_video_speaker(db, video_speaker_id) -> list[int]`, `gaps_for_speaker_label(db, label) -> list[int]`
+  - `gaps_for_video(db, video_id) -> list[int]`, `gaps_for_speaker_ids(db, video_speaker_ids: Collection[int]) -> list[int]`, `gaps_for_video_speaker(db, video_speaker_id) -> list[int]`, `gaps_for_speaker_label(db, label) -> list[int]`
   - `measure_pause_stats(db, *, video_id: int, video_speaker_id: int | None = None, speaker_label: str | None = None) -> PauseStats`
   - `applied_gap_ms(stats: PauseStats) -> int`
 
@@ -1864,6 +1864,13 @@ def test_an_unknown_speaker_falls_back_to_the_video(db: Database) -> None:
     assert stats.median_ms == 210
 
 
+def test_no_labels_means_no_gaps_not_every_gap(db: Database) -> None:
+    """An unmapped speaker matches nothing; an `IN ()` must not match all."""
+    vid = make_video(db)
+    add_words(db, vid, evenly_spaced(100, gap_ms=200))
+    assert P.gaps_for_speaker_ids(db, ()) == []
+
+
 def test_the_applied_gap_is_clamped_both_ways() -> None:
     tiny = P.PauseStats(
         scope="video", key="1", n_samples=999, median_ms=3,
@@ -1913,7 +1920,7 @@ from __future__ import annotations
 
 import sqlite3
 import statistics
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
 from rytp import constants as C
@@ -1984,14 +1991,31 @@ def gaps_for_video(db: Database, video_id: int) -> list[int]:
     return _pairwise_gaps(rows)
 
 
-def gaps_for_video_speaker(db: Database, video_speaker_id: int) -> list[int]:
-    """Gaps for one diarized label of one video."""
+def gaps_for_speaker_ids(db: Database, video_speaker_ids: Collection[int]) -> list[int]:
+    """Gaps pooled over a set of diarized labels — the primitive.
+
+    An empty set means "a speaker who is mapped to no video yet", which
+    is no gaps rather than every gap. Contracts §5 pins that distinction
+    for :func:`rytp.commands.resolve_speaker_filter`, and it holds here
+    for the same reason: an ``IN ()`` that quietly matched everything is
+    the classic silent-wrong-answer bug.
+    """
+    ids = tuple(video_speaker_ids)
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
     rows = db.conn.execute(
         f"SELECT {_COLUMNS} FROM words "
-        "WHERE video_speaker_id = ? AND source = ? ORDER BY video_id, ord LIMIT ?",
-        (video_speaker_id, C.ALIGNED_WORD_SOURCE, C.PAUSE_SAMPLE_LIMIT),
+        f"WHERE video_speaker_id IN ({placeholders}) AND source = ? "
+        "ORDER BY video_id, ord LIMIT ?",
+        (*ids, C.ALIGNED_WORD_SOURCE, C.PAUSE_SAMPLE_LIMIT),
     ).fetchall()
     return _pairwise_gaps(rows)
+
+
+def gaps_for_video_speaker(db: Database, video_speaker_id: int) -> list[int]:
+    """Gaps for one diarized label of one video."""
+    return gaps_for_speaker_ids(db, (video_speaker_id,))
 
 
 def gaps_for_speaker_label(db: Database, label: str) -> list[int]:
@@ -2001,17 +2025,25 @@ def gaps_for_speaker_label(db: Database, label: str) -> list[int]:
     enough aligned words for a speaker to clear
     :data:`C.PAUSE_MIN_SAMPLES`, and a person's speaking rhythm is more
     theirs than the recording's.
+
+    This is the *render-time* lookup, reached from a cut list's
+    ``speaker_label``, and it is deliberately forgiving: an unknown
+    label yields no samples and the caller falls back to per-video
+    statistics (design §9). A command taking ``--speaker`` from a human
+    must instead go through ``rytp.commands.resolve_speaker_filter``,
+    which raises on an unresolvable name — a stale cut list should not
+    abort a render, but a typed name that matches nobody must not
+    silently widen to the whole video.
     """
-    rows = db.conn.execute(
-        "SELECT w.video_id, w.ord, w.start_ms, w.end_ms, w.video_speaker_id "
-        "FROM words w "
-        "JOIN video_speakers vs ON vs.id = w.video_speaker_id "
-        "JOIN speakers s ON s.id = vs.speaker_id "
-        "WHERE s.label = ? AND w.source = ? "
-        "ORDER BY w.video_id, w.ord LIMIT ?",
-        (label, C.ALIGNED_WORD_SOURCE, C.PAUSE_SAMPLE_LIMIT),
-    ).fetchall()
-    return _pairwise_gaps(rows)
+    ids = [
+        int(row["id"])
+        for row in db.conn.execute(
+            "SELECT vs.id FROM video_speakers vs "
+            "JOIN speakers s ON s.id = vs.speaker_id WHERE s.label = ?",
+            (label,),
+        ).fetchall()
+    ]
+    return gaps_for_speaker_ids(db, ids)
 
 
 def summarize_gaps(samples: Sequence[int], *, scope: str, key: str) -> PauseStats:
@@ -2082,7 +2114,7 @@ def applied_gap_ms(stats: PauseStats) -> int:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_render_pauses.py -q`
-Expected: PASS, 11 passed.
+Expected: PASS, 12 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -2600,7 +2632,9 @@ def source_video(db: Database, tmp_path: Path, name: str, **kw: object) -> int:
 
 
 def tools(**kw: object) -> tuple[Tools, RecordingRunner]:
-    runner = RecordingRunner(geometry=WIDE, loudness=loudnorm_json(-23.0), **kw)  # type: ignore[arg-type]
+    runner = RecordingRunner(  # type: ignore[arg-type]
+        geometry=WIDE, loudness=loudnorm_json(-23.0), **kw
+    )
     return Tools.faked(runner), runner
 
 
@@ -3514,7 +3548,9 @@ WIDE = probe_json(1280, 720)
 
 
 def kit(**kw: object) -> tuple[Tools, RecordingRunner]:
-    runner = RecordingRunner(geometry=WIDE, loudness=loudnorm_json(-23.0), **kw)  # type: ignore[arg-type]
+    runner = RecordingRunner(  # type: ignore[arg-type]
+        geometry=WIDE, loudness=loudnorm_json(-23.0), **kw
+    )
     return Tools.faked(runner), runner
 
 
@@ -4567,7 +4603,7 @@ Contracts §5: one definition, both surfaces. Handlers take an open `Database` f
 - Test: `tests/test_commands_render.py`
 
 **Interfaces:**
-- Consumes: `rytp.commands.{REQUIRED, Param, Command, CommandResult, register}`; `rytp.config.paths`; `rytp.models.{InvalidInputError, NotFoundError}`; `rytp.render.run.*`; `rytp.render.pauses.*`; `rytp.jobs.queue.enqueue`.
+- Consumes: `rytp.commands.{REQUIRED, Param, Command, CommandResult, register, resolve_speaker_filter}` — contracts §5 forbids a part from rolling its own speaker resolution; `rytp.config.paths`; `rytp.models.{InvalidInputError, NotFoundError}`; `rytp.render.run.*`; `rytp.render.pauses.*`; `rytp.jobs.queue.enqueue`.
 - Consumes also: `rytp.db.queries.clamp_limit`; `rytp.render.run.{create_render, payload_for, remove_render}`.
 - Produces: registered commands `render.run`, `render.pauses`, `render.list` and `render.remove`; `rytp.commands.render._load_request(name) -> RenderRequest` (the second and last Part 5 import site).
 
@@ -4691,7 +4727,7 @@ def test_render_pauses_reports_per_speaker_and_per_video(
     vid = source_video(db, tmp_path, "VIDEO_A")
     label = add_speaker(db, vid, label="host")
     add_words(db, vid, evenly_spaced(80, gap_ms=220), video_speaker_id=label)
-    result = resolve("render.pauses").handler(db, video_id=vid)
+    result = resolve("render.pauses").handler(db, video=vid)
     flat = [" ".join(row) for row in result.rows]
     assert any("host" in row for row in flat)
     assert any("220" in row for row in flat)
@@ -4703,12 +4739,12 @@ def test_render_pauses_flags_a_degenerate_distribution(
 ) -> None:
     vid = source_video(db, tmp_path, "VIDEO_A")
     add_words(db, vid, [(i * 300, (i + 1) * 300) for i in range(120)])
-    result = resolve("render.pauses").handler(db, video_id=vid)
+    result = resolve("render.pauses").handler(db, video=vid)
     assert any("zero" in " ".join(row) for row in result.rows)
 
 
 def test_render_pauses_needs_something_to_look_at(db: Database) -> None:
-    with pytest.raises(RytpError, match="video-id"):
+    with pytest.raises(RytpError, match="--video"):
         resolve("render.pauses").handler(db)
 
 
@@ -4779,7 +4815,14 @@ from __future__ import annotations
 
 from rytp import config
 from rytp import constants as C
-from rytp.commands import REQUIRED, Command, CommandResult, Param, register
+from rytp.commands import (
+    REQUIRED,
+    Command,
+    CommandResult,
+    Param,
+    register,
+    resolve_speaker_filter,
+)
 from rytp.db import Database
 from rytp.db.queries import clamp_limit
 from rytp.models import InvalidInputError, RytpError
@@ -4787,7 +4830,7 @@ from rytp.render.ffmpeg import Tools
 from rytp.render.pauses import (
     PauseStats,
     applied_gap_ms,
-    gaps_for_speaker_label,
+    gaps_for_speaker_ids,
     gaps_for_video,
     gaps_for_video_speaker,
     summarize_gaps,
@@ -4914,20 +4957,27 @@ def _pause_row(stats: PauseStats) -> tuple[str, ...]:
     )
 
 
-def _pauses_handler(
-    db: Database, *, video_id: int = 0, speaker: str = ""
-) -> CommandResult:
-    if not video_id and not speaker:
-        raise InvalidInputError("pass --video-id, --speaker, or both")
+def _pauses_handler(db: Database, *, video: int = 0, speaker: str = "") -> CommandResult:
+    if not video and not speaker:
+        raise InvalidInputError("pass --video, --speaker, or both")
     rows: list[tuple[str, ...]] = []
     if speaker:
+        # Contracts §5: one shared resolver, never a local one. It matches
+        # a roster label or alias, never a raw diarizer label, expands to
+        # video_speakers ids, and raises rather than quietly returning
+        # nothing when the name matches nobody.
+        speaker_filter = resolve_speaker_filter(db, speaker=speaker, video_id=video or None)
+        assert speaker_filter is not None  # a non-empty --speaker always resolves
         rows.append(
             _pause_row(
                 summarize_gaps(
-                    gaps_for_speaker_label(db, speaker), scope="speaker", key=speaker
+                    gaps_for_speaker_ids(db, speaker_filter.video_speaker_ids),
+                    scope="speaker",
+                    key=speaker_filter.description,
                 )
             )
         )
+    video_id = video
     if video_id:
         labels = db.conn.execute(
             "SELECT vs.id, vs.local_label, s.label AS roster "
@@ -5075,7 +5125,7 @@ register(
         summary="Show the measured between-word pauses a render would insert.",
         params=(
             Param(
-                name="video_id",
+                name="video",
                 type=int,
                 help="Show every diarized label of this video, plus the video itself.",
                 default=0,
@@ -5083,7 +5133,7 @@ register(
             Param(
                 name="speaker",
                 type=str,
-                help="Show one roster speaker, pooled across every video.",
+                help="Show one roster speaker or alias, pooled across every video.",
                 default="",
             ),
         ),
@@ -5429,7 +5479,7 @@ git commit -m "test: run the render pipeline against a real ffmpeg"
 - The output has one canvas, one frame rate, hard cuts, freeze-frame gaps, and no volume step between sources.
 - `report.md` contains the assembled text, a row per fragment with source video, source in/out and output in/out, a row per source with its measured loudness and applied gain, every word that could not be found with its ranked substitutions, any notes about measurements that failed, and a fenced description block.
 - A fragment whose rendition is missing fails with `video N has no video rendition on disk — run: rytp fetch-video N`, before anything is encoded, listing every such fragment at once.
-- `python -m rytp render pauses --video-id N` shows, per speaker and for the video, how many gaps were measured, their median, the share that are exactly zero, what the render would insert, and whether the distribution is usable.
+- `python -m rytp render pauses --video N` shows, per speaker and for the video, how many gaps were measured, their median, the share that are exactly zero, what the render would insert, and whether the distribution is usable.
 - `--gap-ms 0` renders with no gaps; `--gap-ms 250` uses 250 ms everywhere; a `gap_before_ms` in the cut list overrides the measurement for that seam.
 - `--canvas bbox` changes the output shape only when the sources are not all 16:9.
 - `--no-loudnorm` skips both measuring passes and the filter, and the report says the loudness was left alone.

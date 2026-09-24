@@ -51,7 +51,7 @@ overrides that root but nothing in this plan requires setting it.
 Part 1 owns `config`, `constants`, `models`, `db/`, `commands/__init__`, `cli` and `commands/catalog`. Part 2 assumes all of it exists, exactly as follows. Nothing in this plan re-implements any of it.
 
 - `rytp/db/__init__.py::Database` — `Database(path: Path)`, `.conn` (`sqlite3.Connection`, `row_factory = sqlite3.Row`, `isolation_level=None` so a bare `execute` autocommits), `.migrate() -> int`, `.schema_version() -> int`, `.close()`, `.transaction()` context manager, `.migrate_to(target)`, `__enter__`/`__exit__`. Connection setup issues `PRAGMA foreign_keys = ON`, `PRAGMA journal_mode = WAL`, `PRAGMA busy_timeout = SQLITE_BUSY_TIMEOUT_MS`. **`transaction()` is re-entrant** — an inner `with db.transaction()` joins the outer one rather than issuing a second `BEGIN`, so Part 2's helpers may wrap freely.
-- `rytp/db/schema.py::MIGRATIONS` — Part 1 writes migrations 1..11 (channels, videos, assets, speakers, video_speakers, words, utterances, utterances_fts and its three triggers, video_acoustics, jobs, settings), which create **all** of contracts §3. `LATEST_VERSION` is derived from `MIGRATIONS[-1][0]` and a Part 1 test asserts the versions are contiguous. **Part 2 adds no migration**; anything a later part needs appends from 12, never renumbering.
+- `rytp/db/schema.py::MIGRATIONS` — Part 1 writes migrations 1..12 (channels, videos, assets, speakers, video_speakers, words, utterances, utterances_fts and its three triggers, video_acoustics, jobs, settings, renders), which create **all** of contracts §3. `LATEST_VERSION` is derived from `MIGRATIONS[-1][0]` and a Part 1 test asserts the versions are contiguous. Part 1 also ships `renders` at migration 12 and the `jobs.note` column (contracts §3) in the migration after it, so `LATEST_VERSION` is Part 1's last. **Part 2 adds no migration**; anything a later part needs appends after Part 1's last migration, never renumbering. Contracts §3 is explicit that Part 1 creates every table in the section and later parts add no DDL at all.
 - `rytp/db/queries.py` — Part 1 defines `clamp_limit`, `insert_channel`, `get_channel`, `find_channel`, `list_channels`, `mark_channel_synced`, `upsert_video`, `get_video`, `list_videos`, `get_setting(db, key, default=None) -> str | None`, `set_setting(db, key, value: str) -> None`. Part 1 defines **no** asset helpers; Task 2 appends them to the same file under its own banner.
 - `rytp/config.py` — `data_root() -> Path`, `paths() -> Paths` (a *function*, resolved per call from `RYTP_DATA`; there is no module-level singleton), `ensure_dir(path: Path) -> Path`. `Paths` is frozen with `.root`, `.db`, `.media_dir(video_id: int)`, `.cache_wav(video_id: int)`, `.output_dir(render_id: str)`, `.transcript(video_id: int)`, `.cutlist(name: str)`. **None of these touch the filesystem** — call `config.ensure_dir(p.parent)` immediately before writing.
 - `rytp/models.py` — `RytpError`, `NotFoundError(RytpError)`, `InvalidInputError(RytpError)`, and the frozen dataclass `ChannelEntry(external_id: str, title: str, url: str, duration_ms: int | None, kind: str, published_at: str | None)`. Part 2 imports `ChannelEntry`, never redefines it.
@@ -104,13 +104,23 @@ register_job_kind(
 ```
 
 `register_job_kind` writes both `JOB_KINDS` and the contracted flat
-`JOB_HANDLERS`, so they cannot drift. Two fields exist for kinds that are not
+`JOB_HANDLERS`, so they cannot drift.
+
+**A handler may return a short note** (contracts §5) and the worker stores it on
+the job's row, where `rytp jobs list` shows it and `rytp jobs stats` counts it.
+Return `None` for a routine success — that is the common case and must stay
+cheap. A note is for work that *succeeded* while doing something the operator
+would want to know about, such as re-transcribing discarding a video's speaker
+mapping. It never changes the job's state: a job carrying a note is `done`, not
+`failed`. It is also replaced, not accumulated — the column reflects the last
+run. On the worker path nobody is reading stdout, so this is the only channel a
+warning from a several-hundred-video batch has. Two fields exist for kinds that are not
 shaped like Part 2's:
 
 - **`target_kind`** (default `"video"`) names the namespace `jobs.target_id`
-  lives in. `render` targets a cut list, whose integer id is derived from its
-  name, so it sets `target_kind="cutlist"` and the queue will never re-evaluate
-  it alongside a video that happens to share the number.
+  lives in. `render` targets a `renders` row rather than a video, so it sets
+  `target_kind="render"` and the queue will never re-evaluate it alongside a
+  video that happens to share the number.
 - **`reopenable`** (default `True`) says whether a full `reconcile` may turn a
   `done` job back into work when its output disappears. True for everything
   derived from the corpus. `render` sets `reopenable=False`: it is a one-shot
@@ -310,6 +320,29 @@ SETTING_CAPTION_FORMAT: str = "captions.format"
 SETTING_THROTTLE_STREAK: str = "network.throttle_streak"
 SETTING_COOLDOWN_UNTIL: str = "network.cooldown_until"
 SETTING_WORKER_LEASE: str = "worker.lease"
+#: contracts §3: names the aligner `ingest --transcribe` stamps onto the
+#: `align` jobs it creates. Empty (the default) means no alignment at all —
+#: ingest enqueues no `align` job and the words stay in the `timed` tier.
+SETTING_DEFAULT_ALIGNER: str = "default_aligner"
+#: contracts §3 "Choosing a transcriber": names the transcriber `ingest
+#: --transcribe` stamps onto the `transcribe` jobs it creates, and that
+#: `rytp transcribe run` falls back to when no `--transcriber` is given.
+#: Unlike the aligner, **empty is not meaningful here** — an empty aligner
+#: reads coherently as "no alignment, the words stay `timed`", but an empty
+#: transcriber would make `--transcribe` do nothing. So there is no unset
+#: path: this setting always names an engine.
+SETTING_DEFAULT_TRANSCRIBER: str = "default_transcriber"
+
+#: What SETTING_DEFAULT_TRANSCRIBER reads as when the row was never written.
+#: Part 1's migration 11 seeds `default_aligner` and not this key, so this
+#: fallback is what makes contracts §3's "defaults to gigaam" true.
+#: `gigaam` is the Russian-specific engine and published benchmarks put it at
+#: roughly half Whisper's Russian word error rate, which matters because
+#: transcribing the corpus costs 35-90 GPU-hours. **A starting point, not a
+#: verdict:** the one published test on *noisy YouTube* audio — which is
+#: exactly this corpus — reversed the ranking in favour of a Russian-finetuned
+#: Whisper. `rytp transcribe compare` exists to revisit it on real material.
+DEFAULT_TRANSCRIBER_FALLBACK: str = "gigaam"
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +371,11 @@ INGEST_CHAIN_LOCAL: tuple[str, ...] = ("extract_wav", "fingerprint")
 #: design §6 makes tier 2 opt-in per video — "for videos you actually want to
 #: cut from" — and design §13 puts full-corpus transcription at 130-200 GPU
 #: hours. So `rytp ingest --transcribe` adds these; nothing else does.
+#: `align` is additionally gated on SETTING_DEFAULT_ALIGNER being set — see
+#: `_aligner_payload` in rytp/commands/ingest.py. `transcribe` is never
+#: gated, but it is always *stamped*: SETTING_DEFAULT_TRANSCRIBER names the
+#: engine and `_transcriber_payload` puts it in the payload, so no job is
+#: enqueued without one.
 INGEST_CHAIN_TRANSCRIBE: tuple[str, ...] = ("transcribe", "align")
 
 #: Videos touched by one bulk `rytp ingest` when no limit is given. design
@@ -1068,7 +1106,7 @@ Prune a cached WAV and `extract_wav` flips from SATISFIED back to READY with nob
   - `rytp.jobs.JobKind(name, pool, readiness, handler, summary, target_kind="video", reopenable=True)` frozen dataclass
   - `rytp.jobs.JOB_KINDS: dict[str, JobKind]` and `rytp.jobs.JOB_HANDLERS: dict[str, Callable[[Database, int, dict], None]]` — the flat view contracts §5 requires, written only by `register_job_kind`
   - `register_job_kind(kind) -> JobKind`, `resolve_job_kind(name) -> JobKind`, `kinds_for_pool(pool) -> tuple[str, ...]`
-  - `Predicate = Callable[[Database, int], Readiness]` and `Handler = Callable[[Database, int, dict[str, Any]], None]`
+  - `Predicate = Callable[[Database, int], Readiness]` and `Handler = Callable[[Database, int, dict[str, Any]], str | None]` — the optional return is a short note the worker stores on the job row
   - `rytp.jobs.readiness.download_readiness / captions_readiness / extract_wav_readiness`
   - Registered kinds: `download` (network), `captions` (network), `extract_wav` (cpu)
 
@@ -1290,9 +1328,15 @@ class Readiness(Enum):
 Predicate = Callable[[Database, int], Readiness]
 
 #: The handler signature is fixed by contracts §5: database, ``target_id``,
-#: decoded ``payload_json``, returning nothing. Stage functions may return a
-#: descriptive string for the CLI; the thunk below throws it away.
-Handler = Callable[[Database, int, dict[str, Any]], None]
+#: decoded ``payload_json``, returning an optional short note.
+#:
+#: ``None`` is the normal case and must stay cheap. A note is for something
+#: the operator needs to know about work that nonetheless *succeeded* — Part
+#: 3 returns one when re-transcribing discards a video's speaker mapping.
+#: The worker stores it on the job row, which is the only way such a warning
+#: survives a batch of hundreds of videos: on the bulk path there is nobody
+#: reading stdout.
+Handler = Callable[[Database, int, dict[str, Any]], str | None]
 
 
 @dataclass(frozen=True)
@@ -1305,9 +1349,9 @@ class JobKind:
     handler: Handler
     summary: str
     #: What namespace ``jobs.target_id`` lives in for this kind. Every Part 2
-    #: kind targets a ``videos.id``; ``render`` targets a cut list, whose
-    #: integer id is derived from its name. The queue never mixes namespaces
-    #: when it re-evaluates jobs by target.
+    #: kind targets a ``videos.id``; ``render`` targets a ``renders`` row and
+    #: sets ``target_kind="render"``. The queue never mixes namespaces when it
+    #: re-evaluates jobs by target.
     target_kind: str = "video"
     #: Whether a full :func:`rytp.jobs.queue.reconcile` may turn this kind's
     #: ``done`` jobs back into work when its output disappears. True for
@@ -1353,22 +1397,31 @@ def kinds_for_pool(pool: str) -> tuple[str, ...]:
     return tuple(sorted(n for n, k in JOB_KINDS.items() if k.pool == pool))
 
 
-def _run_download(db: Database, video_id: int, payload: dict[str, Any]) -> None:
+# Part 2's stages return None on a routine success. A note on every job
+# would be noise, and noise is precisely what defeats the mechanism: the
+# point is that forty videos quietly losing their speaker labels stands out.
+def _run_download(db: Database, video_id: int, payload: dict[str, Any]) -> str | None:
     from rytp.acquire import acquire_media
 
     acquire_media(db, video_id)
+    return None
 
 
-def _run_captions(db: Database, video_id: int, payload: dict[str, Any]) -> None:
+def _run_captions(db: Database, video_id: int, payload: dict[str, Any]) -> str | None:
     from rytp.acquire.captions import acquire_captions
 
-    acquire_captions(db, video_id)
+    # The one Part 2 case worth a note: the preferred caption language was
+    # not available and a fallback was taken.
+    return acquire_captions(db, video_id).fallback_note
 
 
-def _run_extract_wav(db: Database, video_id: int, payload: dict[str, Any]) -> None:
+def _run_extract_wav(
+    db: Database, video_id: int, payload: dict[str, Any]
+) -> str | None:
     from rytp.audio.extract import ensure_wav
 
     ensure_wav(db, video_id)
+    return None
 
 
 # Imported last: readiness.py imports Readiness back out of this module, so
@@ -1529,7 +1582,7 @@ Everything that touches the `jobs` table. Two properties matter more than the re
   - `Job` frozen dataclass: `id, kind, target_id, state, pool, priority, attempts, not_before, last_error, payload` and `Job.from_row(row)`
   - `enqueue(db, kind, target_id, *, priority=0, payload=None, now=None) -> int`
   - `claim(db, pool, *, now=None) -> Job | None`
-  - `finish(db, job_id, *, now=None) -> None`
+  - `finish(db, job_id, *, note=None, now=None) -> None` — writes `jobs.note` unconditionally, so it reflects the last run rather than a history
   - `block(db, job_id, *, reason, now=None) -> None`
   - `defer(db, job_id, *, not_before, error=None, refund_attempt=False) -> None`
   - `fail(db, job_id, *, error, now=None) -> None`
@@ -1539,7 +1592,7 @@ Everything that touches the `jobs` table. Two properties matter more than the re
   - `retry(db, *, job_id=None, kind=None, state="failed", now=None) -> int`
   - `get_job(db, job_id) -> Job` (raises `NotFoundError`)
   - `list_jobs(db, *, state=None, pool=None, kind=None, limit=C.JOB_LIST_LIMIT) -> list[Job]`
-  - `JobStats` and `stats(db, *, now=None) -> JobStats`
+  - `JobStats` (with `noted`, the count of jobs carrying a note) and `stats(db, *, now=None) -> JobStats`
   - `pause(db)`, `resume(db)`, `is_paused(db) -> bool`
 
 - [ ] **Step 1: Write the failing tests**
@@ -1733,17 +1786,17 @@ def test_reconcile_can_be_scoped_to_one_video(db: Database, tmp_path: Path) -> N
 
 
 def test_unblock_never_crosses_a_target_namespace(db: Database, tmp_path: Path) -> None:
-    # A render's target_id is derived from a cut-list name, so it shares no
-    # numbering with videos.id. Finishing one must not re-evaluate the other.
+    # A render's target_id is a renders.id, so it shares no numbering with
+    # videos.id. Finishing one must not re-evaluate the other.
     vid = make_video(db)
     Q.enqueue(db, "extract_wav", vid, now=NOW)          # blocked: no audio yet
     with temp_job_kind(
         "t_render", "cpu", lambda db_, t, p: None,
-        readiness=lambda db_, t: Readiness.BLOCKED, target_kind="cutlist",
+        readiness=lambda db_, t: Readiness.BLOCKED, target_kind="render",
     ):
         Q.enqueue(db, "t_render", vid, now=NOW)         # same integer, other namespace
         insert_asset(db, video_id=vid, role="audio", path=str(touch(tmp_path / "a.m4a")))
-        assert Q.unblock(db, target_id=vid, target_kind="cutlist", now=NOW) == 0
+        assert Q.unblock(db, target_id=vid, target_kind="render", now=NOW) == 0
         assert Q.unblock(db, target_id=vid, target_kind="video", now=NOW) == 1
     states = {j.kind: j.state for j in Q.list_jobs(db)}
     assert states["extract_wav"] == "pending"
@@ -1755,7 +1808,7 @@ def test_reconcile_never_reopens_a_kind_marked_not_reopenable(db: Database) -> N
     # worker start because its output file is gone would be a nasty surprise.
     vid = make_video(db)
     with temp_job_kind(
-        "t_render", "cpu", lambda db_, t, p: None, target_kind="cutlist",
+        "t_render", "cpu", lambda db_, t, p: None, target_kind="render",
         reopenable=False,
     ):
         job_id = Q.enqueue(db, "t_render", vid, now=NOW)
@@ -1805,6 +1858,30 @@ def test_list_jobs_filters(db: Database, tmp_path: Path) -> None:
     assert [j.kind for j in Q.list_jobs(db, pool="cpu")] == ["extract_wav"]
     assert [j.kind for j in Q.list_jobs(db, kind="download")] == ["download"]
     assert Q.list_jobs(db, state="failed") == []
+
+
+def test_a_handlers_note_is_stored_and_replaced_not_accumulated(
+    db: Database,
+) -> None:
+    vid = make_video(db)
+    job_id = Q.enqueue(db, "download", vid, now=NOW)
+    Q.finish(db, job_id, note="discarded the speaker mapping", now=NOW)
+    job = Q.get_job(db, job_id)
+    # A note never affects state: this job succeeded.
+    assert job.state == "done"
+    assert job.note == "discarded the speaker mapping"
+
+    Q.finish(db, job_id, note=None, now=NOW)
+    assert Q.get_job(db, job_id).note is None
+
+
+def test_stats_counts_jobs_carrying_a_note(db: Database) -> None:
+    for i in range(3):
+        vid = make_video(db, external_id=f"VIDEO_{i}",
+                         url=f"https://example.invalid/{i}")
+        job_id = Q.enqueue(db, "download", vid, now=NOW)
+        Q.finish(db, job_id, note="lost speaker labels" if i < 2 else None, now=NOW)
+    assert Q.stats(db, now=NOW).noted == 2
 
 
 def test_get_job_round_trips_and_complains_about_a_bad_id(db: Database) -> None:
@@ -1889,6 +1966,7 @@ class Job:
     attempts: int
     not_before: str | None
     last_error: str | None
+    note: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -1903,6 +1981,7 @@ class Job:
             attempts=int(row["attempts"]),
             not_before=row["not_before"],
             last_error=row["last_error"],
+            note=row["note"],
             payload=json.loads(row["payload_json"] or "{}"),
         )
 
@@ -1916,6 +1995,10 @@ class JobStats:
     throttled: int
     next_not_before: str | None
     paused: bool
+    #: Jobs that succeeded but left a warning. A batch that quietly discarded
+    #: speaker labels on forty videos has to be visible without reading every
+    #: row, which is the whole reason notes exist.
+    noted: int = 0
 
 
 def _now(now: datetime | None) -> str:
@@ -2011,12 +2094,23 @@ def claim(db: Database, pool: str, *, now: datetime | None = None) -> Job | None
     return None
 
 
-def finish(db: Database, job_id: int, *, now: datetime | None = None) -> None:
-    """Mark a job done."""
+def finish(
+    db: Database,
+    job_id: int,
+    *,
+    note: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Mark a job done, recording the handler's note if it left one.
+
+    ``note`` is written unconditionally, so a job that succeeds cleanly after
+    a run that left a warning clears it: the column reflects the last run,
+    not a history.
+    """
     db.conn.execute(
-        "UPDATE jobs SET state = 'done', finished_at = ?, last_error = NULL "
-        "WHERE id = ?",
-        (_now(now), job_id),
+        "UPDATE jobs SET state = 'done', finished_at = ?, last_error = NULL, "
+        "note = ? WHERE id = ?",
+        (_now(now), (note or None) and note[: C.JOB_NOTE_MAX_CHARS], job_id),
     )
 
 
@@ -2093,7 +2187,7 @@ def _reevaluate(
     wanted = tuple(kinds) if kinds else tuple(JOB_KINDS)
     if target_kind is not None:
         # ``target_id`` means different things to different kinds — a video
-        # for everything Part 2 owns, a cut list for ``render`` — so
+        # for everything Part 2 owns, a ``renders`` row for ``render`` — so
         # re-evaluating "everything with this target_id" must never cross
         # the namespace boundary.
         wanted = tuple(k for k in wanted if JOB_KINDS[k].target_kind == target_kind)
@@ -2189,7 +2283,7 @@ def retry(
         params.append(kind)
     cur = db.conn.execute(
         "UPDATE jobs SET state = 'pending', attempts = 0, not_before = NULL, "  # noqa: S608
-        "last_error = NULL, started_at = NULL, finished_at = NULL "
+        "last_error = NULL, note = NULL, started_at = NULL, finished_at = NULL "
         f"WHERE {' AND '.join(where)}",
         params,
     )
@@ -2248,6 +2342,9 @@ def stats(db: Database, *, now: datetime | None = None) -> JobStats:
         "WHERE state = 'pending' AND not_before IS NOT NULL AND not_before > ?",
         (stamp,),
     ).fetchone()
+    noted_row = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM jobs WHERE note IS NOT NULL AND note != ''"
+    ).fetchone()
     return JobStats(
         by_state={s: by_state.get(s, 0) for s in
                   ("pending", "running", "done", "failed", "blocked", "cancelled")},
@@ -2255,6 +2352,7 @@ def stats(db: Database, *, now: datetime | None = None) -> JobStats:
         throttled=int(throttled_row["n"]),
         next_not_before=throttled_row["next"],
         paused=is_paused(db),
+        noted=int(noted_row["n"]),
     )
 
 
@@ -2280,15 +2378,19 @@ def is_paused(db: Database) -> bool:
 #: run to kilobytes and the tail is never the informative part.
 JOB_ERROR_MAX_CHARS: int = 500
 
-#: How much of an error to show in one ``rytp jobs list`` cell. Wider than
-#: this and the table stops fitting in a terminal.
+#: How much of an error or note to show in one ``rytp jobs list`` cell.
+#: Wider than this and the table stops fitting in a terminal.
 JOB_ERROR_PREVIEW_CHARS: int = 80
+
+#: Longest note stored in ``jobs.note``. A note is a warning a human reads in
+#: a table cell, not a log line.
+JOB_NOTE_MAX_CHARS: int = 300
 ```
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_jobs_queue.py -q`
-Expected: PASS, 25 passed.
+Expected: PASS, 27 passed.
 
 - [ ] **Step 6: Prove the claim really is atomic across connections**
 
@@ -2309,7 +2411,7 @@ def test_two_connections_cannot_claim_the_same_job(db: Database) -> None:
 ```
 
 Run: `python -m pytest tests/test_jobs_queue.py -q`
-Expected: PASS, 26 passed.
+Expected: PASS, 28 passed.
 
 - [ ] **Step 7: Commit**
 
@@ -3270,7 +3372,7 @@ Design §6: *"Captions are pulled early and always. They are tiny, they cost no 
 
 **Interfaces:**
 - Consumes: Task 6's `fetchable_video`, Task 5's runner, Task 2's `insert_asset`.
-- Produces: `rytp.acquire.captions.acquire_captions(db, video_id, *, runner=None, policy=None) -> str`
+- Produces: `rytp.acquire.captions.CaptionResult(message, fallback_note=None)` and `acquire_captions(db, video_id, *, runner=None, policy=None) -> CaptionResult`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3295,7 +3397,7 @@ from tests.fakes import CAPTION_FILE_SPEC, FakeYtDlpRunner, make_video
 
 def test_the_track_becomes_a_captions_asset(db: Database) -> None:
     vid = make_video(db)
-    message = acquire_captions(db, vid, runner=FakeYtDlpRunner())
+    message = acquire_captions(db, vid, runner=FakeYtDlpRunner()).message
     row = asset_for(db, vid, "captions")
     assert row is not None
     assert row["path"] == str(config.paths().media_dir(vid) / "captions.json3")
@@ -3317,8 +3419,18 @@ def test_the_most_preferred_language_wins(db: Database) -> None:
     plain_ru = dict(CAPTION_FILE_SPEC, name="captions.ru.json3",
                     format_id="ru", language="ru")
     runner = FakeYtDlpRunner(captions=[plain_ru, dict(CAPTION_FILE_SPEC)])
-    acquire_captions(db, vid, runner=runner)
+    result = acquire_captions(db, vid, runner=runner)
     assert asset_for(db, vid, "captions")["format_id"] == "ru-orig"
+    assert result.fallback_note is None
+
+
+def test_a_fallback_language_leaves_a_note_for_the_job_row(db: Database) -> None:
+    vid = make_video(db)
+    plain_ru = dict(CAPTION_FILE_SPEC, name="captions.ru.json3",
+                    format_id="ru", language="ru")
+    result = acquire_captions(db, vid, runner=FakeYtDlpRunner(captions=[plain_ru]))
+    assert asset_for(db, vid, "captions")["format_id"] == "ru"
+    assert result.fallback_note and "ru-orig" in result.fallback_note
 
 
 def test_a_video_with_no_track_fails_permanently(db: Database) -> None:
@@ -3362,6 +3474,7 @@ turning json3 into ``words`` rows is Part 3's job.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 from rytp import config
 from rytp.acquire import fetchable_video
@@ -3371,13 +3484,26 @@ from rytp.db import Database
 from rytp.db.queries import insert_asset
 
 
+@dataclass(frozen=True)
+class CaptionResult:
+    """What the caption stage did, and anything the operator should know.
+
+    ``fallback_note`` is what the job handler returns as the job's note: on a
+    bulk run nobody sees stdout, so "this video only had a translated track"
+    has to live on the job row or it is lost.
+    """
+
+    message: str
+    fallback_note: str | None = None
+
+
 def acquire_captions(
     db: Database,
     video_id: int,
     *,
     runner: YtDlpRunner | None = None,
     policy: DownloadPolicy | None = None,
-) -> str:
+) -> CaptionResult:
     """Fetch the caption track and record it as the video's captions asset."""
     row = fetchable_video(db, video_id)
     policy = policy or DownloadPolicy.from_settings(db)
@@ -3403,6 +3529,12 @@ def acquire_captions(
 
     order = {lang: i for i, lang in enumerate(policy.caption_langs)}
     chosen = min(tracks, key=lambda t: order.get(t.format_id or "", len(order)))
+    preferred = policy.caption_langs[0] if policy.caption_langs else ""
+    fallback_note = (
+        None if chosen.format_id == preferred
+        else f"caption language {chosen.format_id!r}, not the preferred "
+             f"{preferred!r}; these words may be a translation"
+    )
 
     # Contracts §7 names the file captions.json3 regardless of which language
     # tag won, so downstream never has to guess at the suffix.
@@ -3417,13 +3549,16 @@ def acquire_captions(
         format_id=chosen.format_id,
         size_bytes=chosen.size_bytes or dest.stat().st_size,
     )
-    return f"video {video_id}: {dest.name} ({chosen.format_id})"
+    return CaptionResult(
+        message=f"video {video_id}: {dest.name} ({chosen.format_id})",
+        fallback_note=fallback_note,
+    )
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_acquire_captions.py -q`
-Expected: PASS, 6 passed.
+Expected: PASS, 7 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -4104,6 +4239,26 @@ def _tick(db: Database, pool: str, *, report=None, sleeps=None, now=NOW):
     return did, report, sleeps
 
 
+def test_a_handlers_note_lands_on_the_job_row(db: Database) -> None:
+    # Part 3's "re-transcribing discarded this video's speaker mapping" only
+    # reaches a bulk operator this way; on the worker path nobody reads stdout.
+    with temp_job_kind("t_note", "cpu", lambda db_, t, p: "labels discarded"):
+        vid = make_video(db)
+        Q.enqueue(db, "t_note", vid, now=NOW)
+        did, report, _ = _tick(db, "cpu")
+    assert did is True and report.done == 1
+    job = Q.list_jobs(db)[0]
+    assert job.state == "done"          # a note is not a failure
+    assert job.note == "labels discarded"
+
+
+def test_a_routine_success_leaves_no_note(db: Database) -> None:
+    with temp_job_kind("t_quiet", "cpu", lambda db_, t, p: None):
+        Q.enqueue(db, "t_quiet", make_video(db), now=NOW)
+        _tick(db, "cpu")
+    assert Q.list_jobs(db)[0].note is None
+
+
 def test_a_successful_job_is_marked_done(db: Database) -> None:
     calls: list[int] = []
 
@@ -4600,13 +4755,16 @@ def run_pool_once(
         return True
 
     try:
-        spec.handler(db, job.target_id, job.payload)
+        note = spec.handler(db, job.target_id, job.payload)
     except Exception as exc:  # noqa: BLE001 - the worker classifies, never crashes
         _handle_failure(db, job, exc, policy=policy, report=report, now=now_fn())
     else:
         if pool == "network":
             P.clear_throttle(db)
-        Q.finish(db, job.id, now=now_fn())
+        # A note never changes the outcome: this job is done, not failed.
+        # It is how a warning from a bulk run survives at all — on the worker
+        # path there is nobody watching stdout.
+        Q.finish(db, job.id, note=note, now=now_fn())
         # This is what closes the pipeline. `ingest` parks extract_wav as
         # blocked because there is no audio yet; finishing the download has
         # to be what turns it into work, or --once exits with no WAV and the
@@ -4751,7 +4909,7 @@ WORKER_JOIN_TIMEOUT_S: float = 30.0
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_jobs_worker.py -q`
-Expected: PASS, 20 passed.
+Expected: PASS, 22 passed.
 
 - [ ] **Step 7: Add one real threaded test**
 
@@ -4773,7 +4931,7 @@ def test_the_threaded_worker_starts_works_and_stops(db: Database) -> None:
 Add `import threading` to the test module's imports.
 
 Run: `python -m pytest tests/test_jobs_worker.py -q`
-Expected: PASS, 21 passed, and the run finishes in well under ten seconds. If it hangs, the pool threads are not seeing `max_jobs` — check `_budget_spent`.
+Expected: PASS, 23 passed, and the run finishes in well under ten seconds. If it hangs, the pool threads are not seeing `max_jobs` — check `_budget_spent`.
 
 - [ ] **Step 8: Commit**
 
@@ -4790,7 +4948,7 @@ Contracts §5: both surfaces are generated from the registry and neither may def
 
 Design §5 fixes what `ingest` does: *"`rytp videos add <url>` catalogs only. `rytp ingest <id>` enqueues the chain, pulling audio, a video rendition and captions together. Local files register as assets and never get download jobs."*
 
-**The chain runs past Part 2.** `download → captions → caption_words → extract_wav → fingerprint`, plus `transcribe → align` behind `--transcribe`. Three of those belong to Part 3 (names, pools and flags agreed with its author): `caption_words` (cpu) turns the downloaded json3 into tier-1 words, without which design §6's "searchable within hours of cataloguing it" never happens; `fingerprint` (cpu) fills `video_acoustics`, which design §8's consistency knob reads — with the table empty that knob silently degrades to counting fragments, and nothing fails to tell you. `transcribe` and `align` (gpu) stay behind a flag because design §6 makes tier 2 opt-in per video and design §13 prices the corpus at 130-200 GPU hours. `ingest` enqueues only the kinds **registered at run time**, so Part 2 ships and tests on its own and the chain completes itself as each part lands.
+**The chain runs past Part 2.** `download → captions → caption_words → extract_wav → fingerprint`, plus `transcribe → align` behind `--transcribe`. Three of those belong to Part 3 (names, pools and flags agreed with its author): `caption_words` (cpu) turns the downloaded json3 into tier-1 words, without which design §6's "searchable within hours of cataloguing it" never happens; `fingerprint` (cpu) fills `video_acoustics`, which design §8's consistency knob reads — with the table empty that knob silently degrades to counting fragments, and nothing fails to tell you. `transcribe` and `align` (gpu) stay behind a flag because design §6 makes tier 2 opt-in per video and design §13 prices the corpus at 130-200 GPU hours. Both carry a payload gate, and it is the same mechanism twice. `transcribe` needs an engine: contracts §3 "Choosing a transcriber" makes `settings.default_transcriber` the answer — ingest resolves it once, stamps `{"transcriber": ...}` onto every job, and **says which engine it chose whenever the value came from the setting rather than an explicit `--transcriber`**, because silently spending 35-90 GPU-hours on an engine nobody picked is the failure this replaces. `align` needs an aligner: contracts §3 gives it a required `payload["aligner"]`, so ingest reads `settings.default_aligner`, stamps it onto the job, and **enqueues no `align` job at all when that setting is empty** — which is the out-of-the-box state. The two settings differ in exactly one way: empty is meaningful for the aligner (no alignment, words stay `timed`) and meaningless for the transcriber (`--transcribe` would do nothing), so the transcriber has no unset path and always resolves to a name. Alignment needs MFA installed; nobody should discover that through five silent retries. An unregistered aligner name is rejected before anything is enqueued, not after the fifth attempt. Without alignment the words stay in contracts §3's `timed` tier: searchable, honestly not cuttable. `ingest` enqueues only the kinds **registered at run time**, so Part 2 ships and tests on its own and the chain completes itself as each part lands.
 
 **And it takes more than one video.** Design §11's M2 is "catalog the channel, pull captions for everything" — roughly 1,600 videos. `rytp ingest --pending --limit 2000` is that milestone; 1,600 invocations is not a command.
 
@@ -4819,10 +4977,11 @@ import pytest
 from rytp import constants as C
 from rytp.commands import resolve
 from rytp.db import Database
-from rytp.db.queries import asset_for, insert_asset
+from rytp.commands import ingest as I
+from rytp.db.queries import asset_for, insert_asset, set_setting
 from rytp.jobs import JOB_KINDS, Readiness
 from rytp.jobs import queue as Q
-from rytp.models import NotFoundError
+from rytp.models import InvalidInputError, NotFoundError
 
 from tests.fakes import (
     CHANNEL_ONE_URL,
@@ -4837,6 +4996,7 @@ def _ingest(db: Database, **kwargs: object):
     """Call the ingest handler with the defaults its Params declare."""
     args: dict[str, object] = {
         "video_id": 0, "channel_id": 0, "pending": False, "transcribe": False,
+        "transcriber": "",
         "limit": C.INGEST_DEFAULT_LIMIT, "priority": 0, "dry_run": False,
     }
     args.update(kwargs)
@@ -4893,8 +5053,12 @@ def test_ingest_is_idempotent(db: Database) -> None:
     assert len(Q.list_jobs(db)) == 3
 
 
-def test_transcribe_flag_adds_the_tier_two_kinds(db: Database) -> None:
-    # design §6: tier 2 is opt-in per video, so this must be off by default.
+def test_transcribe_flag_adds_transcription_but_not_alignment_by_default(
+    db: Database,
+) -> None:
+    # design §6: tier 2 is opt-in per video, so --transcribe is off by
+    # default. And with no default_aligner set, contracts §3 says enqueue no
+    # align job at all rather than one that fails five times.
     with temp_job_kind("transcribe", "gpu", lambda db_, t, p: None), temp_job_kind(
         "align", "gpu", lambda db_, t, p: None, reopenable=False
     ):
@@ -4902,9 +5066,142 @@ def test_transcribe_flag_adds_the_tier_two_kinds(db: Database) -> None:
         b = make_video(db, external_id="VIDEO_B", url="https://example.invalid/b")
         _ingest(db, video_id=a)
         assert Q.list_jobs(db, kind="transcribe") == []
-        _ingest(db, video_id=b, transcribe=True)
+        result = _ingest(db, video_id=b, transcribe=True)
         assert [j.target_id for j in Q.list_jobs(db, kind="transcribe")] == [b]
-        assert [j.target_id for j in Q.list_jobs(db, kind="align")] == [b]
+        assert Q.list_jobs(db, kind="align") == []
+        assert "timed" in (result.message or "")
+
+
+def test_a_default_aligner_stamps_the_payload_every_align_job_needs(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Part 3's align handler raises without payload["aligner"], so an align
+    # job enqueued without one dies after JOB_MAX_ATTEMPTS retries.
+    monkeypatch.setattr(I, "_reject_unknown_aligner", lambda name: None)
+    set_setting(db, C.SETTING_DEFAULT_ALIGNER, "mfa")
+    with temp_job_kind("transcribe", "gpu", lambda db_, t, p: None), temp_job_kind(
+        "align", "gpu", lambda db_, t, p: None, reopenable=False
+    ):
+        vid = make_video(db)
+        _ingest(db, video_id=vid, transcribe=True)
+        jobs = Q.list_jobs(db, kind="align")
+        assert [j.target_id for j in jobs] == [vid]
+        assert jobs[0].payload == {"aligner": "mfa"}
+
+
+def test_a_misspelled_aligner_is_rejected_before_anything_is_enqueued(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # contracts §3: rejected at enqueue time, not after five failed retries.
+    def explode(name: str) -> None:
+        raise InvalidInputError(f"{name} is not a registered aligner")
+
+    monkeypatch.setattr(I, "_reject_unknown_aligner", explode)
+    set_setting(db, C.SETTING_DEFAULT_ALIGNER, "mfaa")
+    with temp_job_kind("transcribe", "gpu", lambda db_, t, p: None), temp_job_kind(
+        "align", "gpu", lambda db_, t, p: None, reopenable=False
+    ):
+        make_video(db)
+        with pytest.raises(InvalidInputError, match="mfaa"):
+            _ingest(db, transcribe=True)
+    # Nothing at all was enqueued: the check runs before the loop.
+    assert Q.list_jobs(db) == []
+
+
+def test_the_aligner_check_is_skipped_when_part_three_is_absent(
+    db: Database,
+) -> None:
+    # No rytp.transcribe.registry yet, so there is nothing to validate
+    # against and no align kind registered either.
+    set_setting(db, C.SETTING_DEFAULT_ALIGNER, "mfa")
+    I._reject_unknown_aligner("mfa")   # must not raise
+
+
+def test_every_transcribe_job_carries_the_engine_that_will_run_it(
+    db: Database,
+) -> None:
+    # contracts §3: a transcribe job with no engine named is a job that
+    # resolves one at run time, where nothing announces the choice.
+    with temp_job_kind("transcribe", "gpu", lambda db_, t, p: None):
+        vid = make_video(db)
+        _ingest(db, video_id=vid, transcribe=True)
+        jobs = Q.list_jobs(db, kind="transcribe")
+        assert [j.target_id for j in jobs] == [vid]
+        assert jobs[0].payload == {"transcriber": C.DEFAULT_TRANSCRIBER_FALLBACK}
+
+
+def test_the_setting_overrides_the_shipped_fallback(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(I, "_reject_unknown_transcriber", lambda name: None)
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "whisper")
+    with temp_job_kind("transcribe", "gpu", lambda db_, t, p: None):
+        vid = make_video(db)
+        _ingest(db, video_id=vid, transcribe=True)
+        assert Q.list_jobs(db, kind="transcribe")[0].payload == {
+            "transcriber": "whisper"
+        }
+
+
+def test_a_transcriber_taken_from_the_setting_is_announced(db: Database) -> None:
+    # The whole mechanism keeping the choice visible instead of accidental:
+    # the owner chose "set a default and inform" over "refuse until
+    # configured", so this message is what makes 35-90 GPU-hours deliberate.
+    with temp_job_kind("transcribe", "gpu", lambda db_, t, p: None):
+        make_video(db)
+        result = _ingest(db, transcribe=True)
+    message = result.message or ""
+    assert C.DEFAULT_TRANSCRIBER_FALLBACK in message
+    assert C.SETTING_DEFAULT_TRANSCRIBER in message
+
+
+def test_an_explicitly_named_transcriber_is_not_announced(db: Database) -> None:
+    # Nothing was chosen on the owner's behalf, so there is nothing to report.
+    named = C.DEFAULT_TRANSCRIBER_FALLBACK
+    with temp_job_kind("transcribe", "gpu", lambda db_, t, p: None):
+        make_video(db)
+        result = _ingest(db, transcribe=True, transcriber=named)
+    assert C.SETTING_DEFAULT_TRANSCRIBER not in (result.message or "")
+    assert Q.list_jobs(db, kind="transcribe")[0].payload == {"transcriber": named}
+
+
+def test_a_misspelled_transcriber_is_rejected_before_anything_is_enqueued(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # contracts §3: rejected at enqueue time, not after five failed retries.
+    def explode(name: str) -> None:
+        raise InvalidInputError(f"{name} is not a registered transcriber")
+
+    monkeypatch.setattr(I, "_reject_unknown_transcriber", explode)
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "gigaamm")
+    with temp_job_kind("transcribe", "gpu", lambda db_, t, p: None):
+        make_video(db)
+        with pytest.raises(InvalidInputError, match="gigaamm"):
+            _ingest(db, transcribe=True)
+    # Resolved once, before the loop, so 1,600 jobs are not stamped with it.
+    assert Q.list_jobs(db) == []
+
+
+def test_an_empty_setting_falls_back_rather_than_disabling_transcription(
+    db: Database,
+) -> None:
+    # Empty is meaningful for default_aligner and meaningless here: a
+    # transcribe job with no engine does nothing, so there is no unset path.
+    set_setting(db, C.SETTING_DEFAULT_TRANSCRIBER, "   ")
+    with temp_job_kind("transcribe", "gpu", lambda db_, t, p: None):
+        vid = make_video(db)
+        _ingest(db, video_id=vid, transcribe=True)
+        assert Q.list_jobs(db, kind="transcribe")[0].payload == {
+            "transcriber": C.DEFAULT_TRANSCRIBER_FALLBACK
+        }
+
+
+def test_the_transcriber_check_is_skipped_when_part_three_is_absent(
+    db: Database,
+) -> None:
+    # Same shape as the aligner's: no rytp.transcribe.registry yet, so there
+    # is nothing to validate against and no transcribe kind registered either.
+    I._reject_unknown_transcriber(C.DEFAULT_TRANSCRIBER_FALLBACK)   # must not raise
 
 
 def test_bulk_ingest_covers_a_whole_channel(db: Database) -> None:
@@ -5085,10 +5382,11 @@ from rytp.acquire.local import register_local_container
 from rytp.audio.extract import ensure_wav
 from rytp.commands import REQUIRED, Command, CommandResult, Param, register
 from rytp.db import Database
+from rytp.db.queries import get_setting
 from rytp.jobs import JOB_KINDS
 from rytp.jobs import queue as Q
 from rytp.jobs import worker as W
-from rytp.models import NotFoundError, RytpError
+from rytp.models import InvalidInputError, NotFoundError, RytpError
 
 
 
@@ -5134,6 +5432,95 @@ def _select_videos(
     return [(int(r["id"]), str(r["source"])) for r in rows]
 
 
+def _reject_unknown_aligner(name: str) -> None:
+    """Refuse a misspelled aligner now, not after five failed retries.
+
+    contracts §3: "a job enqueued with an unregistered aligner name is
+    rejected at enqueue time". If Part 3 is not installed there is no
+    registry to check against and no `align` kind registered either, so
+    there is nothing to reject.
+    """
+    try:
+        from rytp.transcribe.registry import ALIGNERS
+    except ImportError:
+        return
+    if name not in ALIGNERS:
+        raise InvalidInputError(
+            f"setting {C.SETTING_DEFAULT_ALIGNER}={name!r} is not a registered "
+            f"aligner; available: {', '.join(sorted(ALIGNERS)) or '(none)'}"
+        )
+
+
+def _reject_unknown_transcriber(name: str) -> None:
+    """Refuse a misspelled transcriber now, not after five failed retries.
+
+    contracts §3 "Choosing a transcriber" applies the same enqueue-time rule
+    the aligner gets. If Part 3 is not installed there is no registry to
+    check against and no `transcribe` kind registered either, so there is
+    nothing to reject.
+
+    **The adapter package is imported here on purpose.** A Part 3 engine
+    registers itself at import time and every Part 3 import of the adapter
+    packages is deferred into a function body, so reading `TRANSCRIBERS`
+    without importing them first sees an empty dict — which would reject
+    every name, including the configured default, on every ingest.
+    """
+    try:
+        import rytp.transcribe.engines  # noqa: F401 - importing is registering
+
+        from rytp.transcribe.registry import TRANSCRIBERS
+    except ImportError:
+        return
+    if name not in TRANSCRIBERS:
+        raise InvalidInputError(
+            f"setting {C.SETTING_DEFAULT_TRANSCRIBER}={name!r} is not a registered "
+            f"transcriber; available: {', '.join(sorted(TRANSCRIBERS)) or '(none)'}"
+        )
+
+
+def _transcriber_payload(db: Database, explicit: str) -> tuple[dict[str, str], bool]:
+    """The engine every `transcribe` job is stamped with, and where it came from.
+
+    contracts §3: a `transcribe` job that names no engine resolves one at run
+    time, where nothing announces the choice — and the corpus is Russian,
+    the Russian-specific engine roughly halves Whisper's word error rate
+    there, and the whole archive is 35-90 GPU-hours. Getting that wrong
+    silently is expensive to discover late.
+
+    Unlike :func:`_aligner_payload` this never returns "do not enqueue":
+    an empty aligner reads coherently as "no alignment, the words stay
+    `timed`", but an empty transcriber would make `--transcribe` do nothing.
+    So the setting always resolves to a name.
+
+    The second element is True when the name came from the setting rather
+    than from an explicit `--transcriber`, which is what the caller reports.
+    """
+    name = explicit.strip()
+    from_setting = not name
+    if from_setting:
+        name = (
+            get_setting(db, C.SETTING_DEFAULT_TRANSCRIBER) or ""
+        ).strip() or C.DEFAULT_TRANSCRIBER_FALLBACK
+    _reject_unknown_transcriber(name)
+    return {"transcriber": name}, from_setting
+
+
+def _aligner_payload(db: Database) -> dict[str, str] | None:
+    """The payload every `align` job needs, or None meaning "do not enqueue".
+
+    Part 3's align handler raises without `payload["aligner"]`, so an align
+    job created without one is a job that fails five times and dies. The
+    answer is a configurable default that is empty out of the box:
+    alignment needs MFA installed, and nobody should discover that through
+    five silent retries.
+    """
+    name = (get_setting(db, C.SETTING_DEFAULT_ALIGNER) or "").strip()
+    if not name:
+        return None
+    _reject_unknown_aligner(name)
+    return {"aligner": name}
+
+
 def ingest(
     db: Database,
     *,
@@ -5141,6 +5528,7 @@ def ingest(
     channel_id: int = 0,
     pending: bool = False,
     transcribe: bool = False,
+    transcriber: str = "",
     limit: int = C.INGEST_DEFAULT_LIMIT,
     priority: int = 0,
     dry_run: bool = False,
@@ -5160,6 +5548,16 @@ def ingest(
             rows=tuple((str(v), src) for v, src in targets),
             message=f"would ingest {len(targets)} video(s)",
         )
+
+    # Both resolved once, before anything is enqueued, so a misspelled name
+    # fails the whole command instead of poisoning 1,600 jobs.
+    engine: dict[str, str] | None = None
+    engine_from_setting = False
+    if transcribe:
+        engine, engine_from_setting = _transcriber_payload(db, transcriber)
+    aligner = _aligner_payload(db) if transcribe else None
+    unaligned = transcribe and aligner is None
+    payloads = {"transcribe": engine, "align": aligner}
 
     states = ("pending", "blocked", "done")
     tally: dict[str, dict[str, int]] = {}
@@ -5190,16 +5588,35 @@ def ingest(
             if kind not in JOB_KINDS:
                 missing.add(kind)
                 continue
+            if kind == "align" and aligner is None:
+                continue
             if kind not in tally:
                 tally[kind] = dict.fromkeys(("queued", *states), 0)
                 order.append(kind)
-            job_id = Q.enqueue(db, kind, vid, priority=priority)
+            job_id = Q.enqueue(
+                db, kind, vid, priority=priority, payload=payloads.get(kind),
+            )
             state = Q.get_job(db, job_id).state
             tally[kind]["queued"] += 1
             if state in tally[kind]:
                 tally[kind][state] += 1
 
     parts = [f"ingested {ingested} video(s)"]
+    if engine is not None and engine_from_setting:
+        # contracts §3: when the default was used rather than an explicit
+        # choice, say which engine it picked. This one line is the whole
+        # mechanism that keeps 35-90 GPU-hours deliberate instead of
+        # accidental; `rytp transcribe compare` is how you revisit it.
+        parts.append(
+            f"transcriber {engine['transcriber']!r}, from setting "
+            f"{C.SETTING_DEFAULT_TRANSCRIBER} (pass --transcriber to override)"
+        )
+    if unaligned:
+        parts.append(
+            f"no {C.SETTING_DEFAULT_ALIGNER} set, so no align jobs — words will "
+            f"stay in the `timed` tier (searchable, not cuttable) until you "
+            f"align them deliberately"
+        )
     if missing:
         parts.append(
             f"not yet available, skipped: {', '.join(sorted(missing))}"
@@ -5225,7 +5642,10 @@ def fetch_video(db: Database, *, video_id: int, captions: bool = True) -> Comman
     else:
         notes.append(acquire_media(db, video_id))
         if captions:
-            notes.append(acquire_captions(db, video_id))
+            result = acquire_captions(db, video_id)
+            notes.append(result.message)
+            if result.fallback_note:
+                notes.append(result.fallback_note)
     notes.append(f"wav cached at {ensure_wav(db, video_id)}")
     Q.reconcile(db)
     return CommandResult(message="; ".join(notes))
@@ -5263,6 +5683,11 @@ register(
             Param("transcribe", bool,
                   "Also enqueue transcription and alignment (tier 2, GPU).",
                   default=False),
+            Param("transcriber", str,
+                  "Registered transcriber to stamp on the transcribe jobs. "
+                  "Empty uses the default_transcriber setting, and the result "
+                  "says which engine that chose.",
+                  default=""),
             Param("limit", int, "Maximum videos to touch in the bulk form.",
                   default=C.INGEST_DEFAULT_LIMIT, short="n"),
             Param("priority", int, "Higher runs first.", default=0, short="p"),
@@ -5318,7 +5743,7 @@ from rytp.commands import ingest as _ingest  # noqa: E402,F401
 - [ ] **Step 5: Run the tests**
 
 Run: `python -m pytest tests/test_commands_ingest.py -q`
-Expected: 17 passed, 1 failed — `test_every_part_two_command_is_registered` still fails on `jobs.list`, which Task 12 adds. Everything else is green.
+Expected: 27 passed, 1 failed — `test_every_part_two_command_is_registered` still fails on `jobs.list`, which Task 12 adds. Everything else is green.
 
 - [ ] **Step 6: Commit**
 
@@ -5351,7 +5776,8 @@ def test_jobs_list_renders_rows_of_strings(db: Database) -> None:
     _ingest(db, video_id=vid)
     result = resolve("jobs.list").handler(db, state="", pool="", kind="", limit=50)
     assert result.columns == (
-        "id", "kind", "target", "state", "pool", "attempts", "not_before", "error"
+        "id", "kind", "target", "state", "pool", "attempts", "not_before",
+        "error", "note",
     )
     assert len(result.rows) == 3
     assert all(isinstance(cell, str) for row in result.rows for cell in row)
@@ -5377,6 +5803,7 @@ def test_jobs_stats_shows_throttling_not_a_mystery_stall(db: Database) -> None:
     flat = {row[0]: row[1] for row in result.rows}
     assert flat["throttled"] == "1"
     assert flat["next attempt"] == soon
+    assert flat["with notes"] == "0"
     assert flat["paused"] == "no"
 
 
@@ -5511,19 +5938,19 @@ def jobs_list(
     jobs = Q.list_jobs(
         db, state=state or None, pool=pool or None, kind=kind or None, limit=limit
     )
+    def _cell(text: str | None) -> str:
+        return next(iter((text or "").splitlines()), "")[: C.JOB_ERROR_PREVIEW_CHARS]
+
     rows = tuple(
         (
             str(j.id), j.kind, str(j.target_id), j.state, j.pool, str(j.attempts),
-            j.not_before or "",
-            next(iter((j.last_error or "").splitlines()), "")[
-                : C.JOB_ERROR_PREVIEW_CHARS
-            ],
+            j.not_before or "", _cell(j.last_error), _cell(j.note),
         )
         for j in jobs
     )
     return CommandResult(
         columns=("id", "kind", "target", "state", "pool", "attempts",
-                 "not_before", "error"),
+                 "not_before", "error", "note"),
         rows=rows,
         message=None if rows else "no jobs match",
     )
@@ -5537,6 +5964,9 @@ def jobs_stats(db: Database) -> CommandResult:
     # design §5: throttling must be visible, not a mystery stall.
     rows.append(("throttled", str(s.throttled)))
     rows.append(("next attempt", s.next_not_before or ""))
+    # Forty videos that quietly lost their speaker labels must be visible
+    # here, not only by reading every row of `jobs list`.
+    rows.append(("with notes", str(s.noted)))
     rows.append(("paused", "yes" if s.paused else "no"))
     return CommandResult(columns=("metric", "value"), rows=tuple(rows))
 
@@ -5666,7 +6096,7 @@ register(
 - [ ] **Step 4: Run the whole file**
 
 Run: `python -m pytest tests/test_commands_ingest.py -q`
-Expected: PASS, 26 passed. `test_ingest_then_worker_once_acquires_everything` is the one to watch: if it reports 2 done instead of 3, `run_pool_once` is not calling `Q.unblock` after finishing the download and the WAV job never leaves `blocked`.
+Expected: PASS, 36 passed. `test_ingest_then_worker_once_acquires_everything` is the one to watch: if it reports 2 done instead of 3, `run_pool_once` is not calling `Q.unblock` after finishing the download and the WAV job never leaves `blocked`.
 
 - [ ] **Step 5: Run the whole suite, lint and type-check**
 
@@ -5900,16 +6330,18 @@ def test_removing_captions_warns_while_the_words_are_still_caption_tier(
     assert "not been superseded" in (result.message or "")
 
 
-def test_removing_captions_is_quiet_once_an_aligned_transcript_exists(
+def test_removing_captions_is_quiet_once_a_better_transcript_exists(
     db: Database, tmp_path: Path
 ) -> None:
     vid = make_video(db)
     p = touch(tmp_path / "captions.json3")
     asset_id = insert_asset(db, video_id=vid, role="captions", path=str(p))
     db.conn.execute(
+        # contracts §3: `timed` is not cuttable but is still better text
+        # than captions, so it supersedes them.
         "INSERT INTO words (video_id, ord, start_ms, end_ms, text, "
         "normalized_text, stem, source, engine) "
-        "VALUES (?, 0, 0, 10, 'a', 'a', 'a', 'aligned', 'x')",
+        "VALUES (?, 0, 0, 10, 'a', 'a', 'a', 'timed', 'x')",
         (vid,),
     )
     result = _remove(db, asset_id=asset_id, yes=True)
@@ -6018,7 +6450,7 @@ def cancel(db: Database, jobs: Sequence[Job], *, now: datetime | None = None) ->
     with db.transaction():
         db.conn.executemany(
             "UPDATE jobs SET state = 'cancelled', finished_at = ?, "
-            "last_error = NULL WHERE id = ? AND state != 'running'",
+            "last_error = NULL, note = NULL WHERE id = ? AND state != 'running'",
             [(stamp, j.id) for j in jobs],
         )
     return len(jobs)
@@ -6099,7 +6531,7 @@ def assets_remove(
             f"it breaks re-align, render and WAV extraction until it is fetched "
             f"again"
         )
-    if row["role"] == "captions" and not _has_aligned_words(db, int(row["video_id"])):
+    if row["role"] == "captions" and not _has_better_than_captions(db, int(row["video_id"])):
         warnings.append(
             "WARNING: this video's caption words have not been superseded by an "
             "aligned transcript, so removing the track loses the only text there is"
@@ -6133,9 +6565,15 @@ def assets_remove(
     )
 
 
-def _has_aligned_words(db: Database, video_id: int) -> bool:
+def _has_better_than_captions(db: Database, video_id: int) -> bool:
+    """Is there a transcript that supersedes the downloaded captions?
+
+    Contracts §3's tier table: `timed` is already far better *text* than
+    captions even though it is not cuttable, so either tier supersedes them.
+    """
     row = db.conn.execute(
-        "SELECT 1 FROM words WHERE video_id = ? AND source = 'aligned' LIMIT 1",
+        "SELECT 1 FROM words WHERE video_id = ? AND source IN ('timed', 'aligned') "
+        "LIMIT 1",
         (video_id,),
     ).fetchone()
     return row is not None
@@ -6597,9 +7035,11 @@ After Task 12, with only fakes standing in for yt-dlp and ffmpeg:
 5. `rytp cache prune` deletes the WAV, reports the bytes freed, and flips the `extract_wav` job from `done` back to `pending` without anyone enqueuing anything.
 6. `rytp ingest <id>` on a local file creates a `container` asset in place and no download job; one unreadable local file in a bulk run is skipped and counted, not fatal.
 7. No test opens a socket, and `grep -rn "yt_dlp" rytp/` shows the import only inside function bodies.
-8. `rytp jobs cancel --kind download` empties a bad batch out of the queue and says how many were left alone because they are running; `rytp jobs cancel --job-id <running>` refuses and names the fix. A cancelled job is not resurrected by `reconcile`, but `rytp jobs retry --state cancelled` brings it back.
-9. `rytp assets remove <id> --dry-run` prints the path and byte count; with `--yes` it deletes the file, reopens that video's `download` job, and warns in plain words when the asset was the audio or an un-superseded caption track.
-10. `rytp doctor` reports `ffmpeg`, `ffprobe`, `yt-dlp`, `disk` and `disk-headroom`. Uninstall yt-dlp and its line reads as failed while the exit code stays 0 — `ok` is honest, `required=False` makes it advisory. A missing ffmpeg fails and exits non-zero, with the install command as its remedy. A nearly full drive fails `disk-headroom` and still exits 0; an unreadable data volume fails `disk` and does not.
+8. `rytp ingest <id> --transcribe` with no `default_aligner` set enqueues `transcribe` and no `align`, and says so; set `default_aligner` and every `align` job carries `{"aligner": ...}`; set it to a typo and the command refuses before touching the queue. Every `transcribe` job carries `{"transcriber": ...}` — `gigaam` out of the box — and the result message names that engine and the setting it came from; pass `--transcriber` and the message says nothing, because nothing was chosen on your behalf; set `default_transcriber` to a typo and the command refuses before touching the queue.
+9. `rytp jobs cancel --kind download` empties a bad batch out of the queue and says how many were left alone because they are running; `rytp jobs cancel --job-id <running>` refuses and names the fix. A cancelled job is not resurrected by `reconcile`, but `rytp jobs retry --state cancelled` brings it back.
+10. `rytp assets remove <id> --dry-run` prints the path and byte count; with `--yes` it deletes the file, reopens that video's `download` job, and warns in plain words when the asset was the audio or an un-superseded caption track.
+11. A handler that returns a note leaves it on the job row: `rytp jobs list` shows a `note` column, `rytp jobs stats` reports `with notes: 40`, and the job is still `done`. Re-running it cleanly clears the note.
+12. `rytp doctor` reports `ffmpeg`, `ffprobe`, `yt-dlp`, `disk` and `disk-headroom`. Uninstall yt-dlp and its line reads as failed while the exit code stays 0 — `ok` is honest, `required=False` makes it advisory. A missing ffmpeg fails and exits non-zero, with the install command as its remedy. A nearly full drive fails `disk-headroom` and still exits 0; an unreadable data volume fails `disk` and does not.
 
 ## Self-review
 
@@ -6608,6 +7048,8 @@ After Task 12, with only fakes standing in for yt-dlp and ffmpeg:
 **Deliberately out of scope**, and named here so nobody looks for them: parsing json3 captions into `words` (Part 3, `rytp/transcribe/captions.py`), the `transcribe` / `align` / `diarize` / `fingerprint` / `index` / `render` job kinds (each part registers its own through `register_job_kind`), `videos.add` and `channels.sync` (Part 1's `commands/catalog.py`, which calls Task 5's `enumerate_channel` and `probe_video`), and the TUI.
 
 **Contract deviations:** none. This plan tracks the contracts as amended on 2026-09-21, including the "Job handlers" subsection of §5 — `rytp/jobs/__init__.py` exposes `JOB_HANDLERS: dict[str, Callable[[Database, int, dict], None]]`, and every handler takes `(db, target_id, payload)` and returns `None`. `JOB_KINDS` is the richer registry that also carries the pool, the readiness predicate and the summary; `register_job_kind` writes both, so the contracted view can never drift. Four observations for the contract author are in the report rather than changed here: `jobs` has no owner or lease column, so the worker lease lives in `settings`; `assets` has no uniqueness constraint, so design §4's one-audio-one-captions rule is enforced in `insert_asset`; design §4 still names `data/audio/{video_id}.wav` where contracts §7 says `cache/wav/`, and contracts win; and `probe_video` can never yield `kind='short'`.
+
+**Settled by the owner and applied here:** `align` jobs are gated on `settings.default_aligner` — empty means no `align` job, an unregistered name is rejected at enqueue time, and untouched words stay in the `timed` tier (Task 11). `transcribe` jobs are stamped from `settings.default_transcriber`, which defaults to `gigaam` and is resolved once before the loop; an unregistered name is rejected at enqueue time, and when the value came from the setting rather than `--transcriber` the result says which engine it chose (Task 11). The owner chose "set a default and inform" over "refuse until configured", so that announcement is the entire mechanism keeping the choice visible — and the default is a starting point, not a verdict: the one published test on *noisy YouTube* audio, which is what this corpus is, favoured a Russian-finetuned Whisper, and `rytp transcribe compare` (Part 3) exists to settle it on real material. Empty is deliberately not a meaningful value here, unlike for the aligner.
 
 **Decisions the contracts left to me, stated rather than implied:** `jobs.cancel` **refuses** to cancel a `running` job rather than marking it cancelled for the worker to abandon — Part 2's handlers sit inside `yt-dlp` and `ffmpeg` subprocesses with no checkpoint, so the worker would finish the work and overwrite `cancelled` with `done`; the command names the running ids and points at `rytp queue pause`. `assets.remove` **warns and proceeds** on the audio, container and un-superseded-captions cases, because the owner may genuinely want the space. For `doctor`, the split between "what was found" and "does it matter" is carried by `HealthCheck.required`: a missing yt-dlp is honestly `ok=False` on a `required=False` check. The disk question is two checks for the same reason — `disk` (`required=True`) fails only when the data volume cannot be read, while `disk-headroom` (`required=False`) fails honestly when space is low without making `doctor` exit non-zero, because the owner may be deliberately running the drive close to full.
 

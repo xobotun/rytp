@@ -150,7 +150,7 @@ activemq-data/
 # Environments
 .env
 .envrc
-.venv
+.venv/
 env/
 venv/
 ENV/
@@ -221,6 +221,8 @@ __marimo__/
 data/
 sample_inputs/
 yt-dlp.exe
+.rytp-manual/
 
 # Tests
-.pytest_tmp/**
+.pytest_tmp/
+.smoke/

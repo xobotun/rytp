@@ -2,116 +2,116 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## What this project is, and how much of the docs to believe
+## What this project is
 
-The only human-authored parts of the documentation are the **Goal** and **Hardware** sections of `README.md`. The rest of `README.md`, all of `DESIGN.md`, and most module docstrings are AI-generated. They describe an aspirational system and routinely overstate what works — `README.md` claims "All 21 subcommands are wired in v1" and quotes a test count, `cli.py`'s docstring says the same. **Treat every completeness claim as unverified.** Read the code, or run the thing, before relying on any of it.
-
-The actual goal, in the owner's words: a command-line utility that maps videos to *speaker + word* and supports full-text search, with the index running **both ways**:
+A command-line utility that maps a Russian-language video archive to *speaker + word* and supports full-text search, with the index running **both ways**:
 
 - **Forward — `video → transcript`:** every word with its timestamp and the speaker who said it.
-- **Backward — `speaker + word/sentence → {video + timestamps}`:** given a word or phrase (optionally constrained to a speaker), find every place it was said.
+- **Backward — `speaker + word/sentence → {video + timestamps}`:** given a word or phrase, optionally constrained to a speaker, find every place it was said.
 
-Downstream of the backward index, clips get spliced back together into a new video. In the schema, the forward direction is `words` ordered by `words(video_id, start_ms)`; the backward direction is the `words_fts` FTS5 shadow plus `words(speaker_id)`. Those two access paths are the point of the project — changes that make either one harder to serve are going the wrong way.
+Downstream of the backward index, clips are cut and spliced into a new uploadable video with a reference list of every source and timestamp. Those two access paths are the point of the project — changes that make either one harder to serve are going the wrong way.
 
-**Current state: barely working, most features incomplete.** Expect stubs, half-wired paths, and behavior that contradicts the docs. One gap worth knowing up front, because it sits directly on the stated goal: **the mine stage has no speaker dimension at all.** `rytp/mine.py` never references `speaker_id` and `rytp mine` takes no speaker flag, so the backward index currently answers "word → {video + timestamps}" but not "*speaker* + word → …".
+The pipeline is meant to run on the owner's Windows machine (32 GiB RAM, RTX 3080 Laptop 16 GiB, i7-11800H), so local models are the intended path, not cloud APIs.
 
-The pipeline is meant to run on the owner's Windows machine (32 GiB RAM, RTX 3080 Laptop 16 GiB, i7-11800H) — a local GPU is available for STT and diarization, so local models are the intended path, not cloud APIs.
+## State: the rewrite is implemented
 
-Feel free to overwrite any files prior and including commit `44fc214c`.
+The pre-rewrite tree described by `README.md` and `DESIGN.md` is **gone**. Both of those files still describe it and are stale — do not trust them. Eight plans were implemented across parts 1–8 on 2026-09-24:
 
-## A rewrite is planned and specified — read it before touching `rytp/`
+| Part | Owns |
+|---|---|
+| 1 Foundation | `config`, `constants`, `models`, `db/`, `commands/` registry, `cli`, `tui` skeleton, catalog commands |
+| 2 Acquisition | `acquire/`, `jobs/`, `audio/extract` |
+| 3 Transcription | `transcribe/`, `audio/{vad,energy,acoustics}` |
+| 4 Index & search | `index/`, `tui/screens/{search,transcript}` |
+| 5 Assembly | `assemble/` |
+| 6 Render | `render/` |
+| 7 Speakers | `diarize/`, `tui/screens/speakers` |
+| 8 Integration | TUI shell, `tui/{navigation,enqueue,jobs_view,cutlist_view}`, the four `tests/test_consistency_*.py` suites, the M1 walk |
 
-Everything described under "Architecture" and "Gotchas" below is the **old**
-implementation. It is being replaced wholesale. Three documents supersede
-`DESIGN.md` and are the real source of truth:
+**2163 tests, `ruff` and `mypy` clean.** 55 registered commands.
+
+### Documents, in authority order
 
 | Document | What it is |
 |---|---|
-| `docs/superpowers/specs/2026-09-21-rytp-redesign-design.md` | The approved design. Start here. |
 | `docs/superpowers/specs/2026-09-21-rytp-contracts.md` | **Binding** shared interfaces — schema DDL, core types, command registry, engine protocols, job handlers, cross-part invariants. Never vary from it; raise a change instead. |
-| `docs/superpowers/plans/2026-09-21-part*.md` | Seven implementation plans, 98 tasks, 652 TDD steps. |
-| `docs/superpowers/2026-09-21-review-findings.md` | **Read before implementing.** Open defects from an independent review — two that break day one, one that would silently produce bad output. None are fixed. |
+| `docs/superpowers/specs/2026-09-21-rytp-redesign-design.md` | The approved design. Intent, glossary, milestones. |
+| `docs/superpowers/plans/2026-09-2*-part*.md` | The eight implementation plans. Historical now, but they explain *why* a module is shaped the way it is. Parts 1–7 are dated `09-21` and part 8 `09-22`, so a `2026-09-21-part*` glob silently misses it. |
+| `docs/superpowers/2026-09-21-review-findings.md` | Review findings, and a section recording decisions **deliberately left alone** so they are not re-litigated. |
+| `docs/superpowers/2026-09-24-execution-order.md` | The dependency graph between the parts. |
 
-The plans are sequenced: 1 foundation, 2 acquisition, 3 transcription,
-4 index and search, 5 assembly, 6 render, 7 speakers. Parts 1 and 4 were
-verified by extracting every code block and running it; the rest were not.
-A backup mirror of the plans lives at `~/.cache/rytp-plans/` because this
-repo is on an SMB share that has dropped mid-session.
+## What has never been run
 
-Four things the redesign changes that will trip you up if you skim:
+The suite mocks every model and every binary it can, so **a green run says nothing about these**:
 
-- **Words are split on punctuation.** `кто-то` is two rows. A stored word row
-  holds exactly one token, and tokens equal `normalize_text(text).split()` —
-  because a search query runs through the same function.
-- **Captions are a first-class transcript tier**, searchable but never
-  cuttable, so the whole corpus is searchable without GPU time.
-- **Audio and video are separate assets**, never merged, so a rendition can be
-  upgraded later without invalidating a transcript.
-- **Whisper's word timestamps cannot be cut on.** 78.7% of gaps in the real
-  data are exactly zero. Boundaries come from forced alignment, then snap to a
-  measured energy minimum.
+- **No transcriber, aligner, diarizer or embedder has ever executed.** GigaAM, Whisper, MFA, wav2vec2, pyannote and ReDimNet adapters are written from documented APIs and tested through fakes in `tests/fake_engines.py`. Expect adapter-level surprises on first real use.
+- **Nothing has ever been downloaded.** yt-dlp always sits behind `FakeYtDlpRunner`; no test may touch the network.
+- **Part 7's speaker-matching thresholds are unvalidated guesses** (`SPEAKER_MATCH_HI/LO`, `SPEAKER_MATCH_HI_CROSS_ERA`, `ACOUSTIC_FEATURE_SCALES`). They need a real corpus.
 
-Nothing below this section has been rewritten yet, so treat it as a
-description of the code as it stands, not as guidance for new work.
+ffmpeg *is* exercised for real where it is on `PATH` (`tests/test_render_real_ffmpeg.py`), and a real `output.mp4` has been produced by hand.
 
 ## Setup
 
-No virtualenv is checked in and no dependencies are installed (`pytest`, `ruff`, `mypy` are not on `PATH`). Requires Python >= 3.11 and `ffmpeg` on `PATH`.
+Requires Python >= 3.11 and `ffmpeg` on `PATH`.
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"        # pytest, pytest-cov, ruff, mypy
-pip install -e ".[all]"        # yt-dlp, faster-whisper, pyannote-audio, torch
+scripts/bootstrap.sh            # or bootstrap.ps1 on Windows
 ```
 
-Everything heavy is an optional extra (`yt-dlp`, `stt`, `pyannote`, `all`); the base install runs the CRUD subcommands and the test suite. Commands that need a missing extra print a one-line install hint instead of a traceback.
+That creates `.venv` and installs `.[dev]`. Optional extras are `yt-dlp`, `stt`, `pyannote`, `redimnet`, `all`. Commands needing a missing extra print a one-line install hint instead of a traceback.
 
 ## Commands
 
 ```bash
-pytest -q                                  # full suite
-pytest tests/test_mine.py -q               # one file
-pytest tests/test_mine.py::test_name -q    # one test
-pytest -k "splice and not loudnorm" -q     # by expression
-ruff check rytp tests                      # lint (line-length 100, py311 target)
-mypy rytp                                  # type check
-python -m rytp <subcommand> --help         # run the CLI from a source checkout
+python -m pytest                       # full suite, ~30s
+python -m pytest tests/test_index_search.py -q
+python -m pytest -k "utterance and not caption" -q
+ruff check rytp tests                  # line-length 100, py311 target
+mypy rytp
+python -m rytp <subcommand> --help
 ```
 
-`python -m rytp` works without installing; the `rytp` console script appears after `pip install`. `rytp/__main__.py` exists so a bare `python -m rytp` prints help and exits 0 (Typer alone would exit 2).
-
-Two env vars matter: `RYTP_DATA` relocates the whole data tree (default `./data`), and `HF_TOKEN` (or `HUGGINGFACE_TOKEN`) is required only by the pyannote diarizer.
+Two env vars matter: `RYTP_DATA` relocates the data tree (default `./data`), and `HF_TOKEN` / `HUGGINGFACE_TOKEN` is needed only by the pyannote diarizer. `RYTP_TEST_TMP` relocates pytest's scratch root.
 
 ## Architecture
 
-`DESIGN.md` is worth skimming as a map, because nearly every module docstring cites it by section (`DESIGN §7`) — but see the caveat above, and note the concrete drift: it lists a `transcribe/combined_base.py` that doesn't exist, and names the mapper `rytp speakers <video-id>` when the real command is `rytp speakers map <video-id>`.
+**Stages communicate only through SQLite.** Each reads and writes `data/rytp.db` plus the `data/` tree; nothing hands data to anything else in memory. That is what makes the job queue, pause/resume and self-healing possible.
 
-**Stages communicate only through SQLite.** No stage hands data to another in memory; each reads and writes `data/rytp.db` plus the `data/` tree. This is what makes the queue, pause/resume, and resumable transcription possible. The pipeline is `channel sync → queue/download → transcribe (extract + STT + diarize) → speakers map → mine → loudnorm → splice`, one CLI subcommand per stage.
+**One command registry generates both surfaces.** `rytp/commands/__init__.py` holds `COMMANDS`; `rytp/cli.py` builds the Typer app from it and `rytp/tui/palette.py` builds the palette from it. A command is defined once. Registration happens as a side effect of importing the command module, and the sibling-import block at the bottom of `commands/__init__.py` is what performs it.
 
-**`data/audio/{video_id}.wav` (16 kHz mono int16) is the single source of audio truth.** Extracted exactly once per video; STT, spectral features, loudnorm, and `splice --mode concat` all read it. `splice --mode stream-copy` is the only stage that re-reads the original media under `data/media/`. When a video was registered with a separate audio file (`downloaded_audio_path`, set by `+`-format yt-dlp downloads and by `videos add --audio`), extraction reads that file instead of decoding the video.
+**Readiness, not a dependency graph.** A job kind declares a `readiness(db, target_id) -> Readiness` predicate that is a statement about the world — `READY`, `BLOCKED` or `SATISFIED` — derived from database and filesystem state. **A predicate never sees the payload**, deliberately: one that changed its answer based on how a job was enqueued would stop being a statement about the world, and `reconcile`'s self-healing would go with it. Anything that is an *input* to the work belongs in `payload_json`. Handlers may return a short note, stored in `jobs.note` and shown by `jobs.list`.
 
-**Speaker identity is two-level, and denormalized.** The diarizer emits raw per-video labels (`SPEAKER_00`); `videos_speaker_map` maps those to rows in the global `speakers` roster, and that mapping is a human step (`rytp speakers map`). `map_diarizer_to_speaker` writes the mapping *and* back-fills `words.speaker_id` for every matching row (`speakers.py:238`), so both the join and the direct column are valid — but `words.speaker_id` is `NULL` until someone maps the video, and re-running `transcribe` wipes it along with the rest of the words. `transcripts.py` reads speakers via the join; `speakers.py`'s pause stats read the column.
+**Three transcript tiers, one of them cuttable.** `words.source` is `caption | timed | aligned`. `caption` is downloaded auto-captions — searchable, no end times, never cuttable. `timed` is a transcriber's own word timestamps — good text, unusable boundaries. **Only `aligned` may be cut**, and it comes from forced alignment plus a snap to a measured energy minimum and zero crossing.
 
-**Engine registry** (`rytp/engines.py`). STT engines, diarizers, and combined STT+diarize engines are `Protocol`s resolved by name through three dicts. Each concrete engine calls `engines.register_stt(cls)` / `register_diarizer(cls)` at the bottom of its own module, and the subpackage `__init__.py` (`rytp/diarize/__init__.py`, `rytp/transcribe/__init__.py`) imports it — **that import is what makes the name resolvable**, so a new engine needs all three pieces. The registry stores *classes, not instances*, because the HF_TOKEN gate inspects the `requires_hf_token` class attribute before anything is constructed (constructing a pyannote pipeline without a token fails with an unhelpful error, and nobody wants to download 2 GB of checkpoints to learn their token is missing).
+**Two indexes for two jobs.** FTS5 over contiguous `utterances` serves human search (exact column, stem column fallback); a word-ordinal pointer walk serves assembly. `rytp/index/search.py` owns the first, `rytp/assemble/match.py` the second.
 
-**Migrations** are an ordered `(version, sql)` list in `rytp/db.py`, applied by `Database.migrate()`. Add a new tuple; never edit an existing one. The `schema_version` table is bootstrapped outside the list (chicken-and-egg with the runner), and migration 17 is special-cased in `migrate()` because SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. The `words_fts` FTS5 shadow is kept in sync by triggers — write to `words` and the index follows.
+**Assets are never merged.** Audio, video renditions, captions and container are separate `assets` rows, so a rendition can be upgraded later without invalidating a transcript.
 
-**Constants.** Every tunable lives in `rytp/constants.py` with a comment explaining the value and citing its DESIGN section. New magic numbers go there, not inline.
+**Speaker identity is two-level.** `video_speakers` holds per-video diarizer labels (`SPEAKER_00`); `speakers` is the global roster; a nullable FK links them, and linking is a human step (`rytp speakers map`, or `F3` in the TUI). Re-transcribing deletes a video's `utterances` *and* `video_speakers` in the same transaction that replaces its words — re-mapping is the accepted price.
 
-**CLI error handling.** `rytp/cli.py` funnels business exceptions through `_handle_business_error` — one line to stderr, exit 1, no traceback — and validates enum-ish flags with Typer callbacks (`_cohesion_callback`, `_splice_mode_callback`, …) so bad input never reaches the stage code. Follow both patterns for new subcommands.
+**Engines are registered classes, not instances.** `rytp/transcribe/registry.py` and `rytp/diarize/` resolve names through dicts that each adapter module fills at import — *that import is what makes a name resolvable*, so a new engine needs the module, the `register_*` call, and the package `__init__` importing it. Classes rather than instances because the HF-token gate inspects a class attribute before anything is constructed.
+
+**Heavy dependencies are lazy, some out-of-process.** Nothing heavy is imported at module load. `rytp/transcribe/subproc.py` runs an engine under a foreign interpreter for libraries whose dependency pins conflict, which is why `rytp/transcribe/base.py` must stay standard-library-only.
+
+**Migrations** are an ordered `(version, sql)` list in `rytp/db/schema.py`. Append; never edit or renumber an existing tuple.
+
+**Constants.** Every tunable lives in `rytp/constants.py` with a comment citing its design section, grouped by the part that added it. The file is append-only.
 
 ## Gotchas
 
-- **Importing `rytp.config` creates directories.** Its module-level `paths` singleton calls `.ensure()` at import time, so importing it — which `cli.py`, `transcribe/run.py`, and `tests/conftest.py` all do — mkdirs `data/{media,audio,output/normalized,transcripts}` relative to the current working directory.
-- **`--stt` / `--diarizer` / `--combined` exist twice.** On the top-level app (`cli.py:156`) they only drive the mutual-exclusion check and the HF_TOKEN pre-launch gate; on `transcribe` itself (`cli.py:820`) they are the values actually used for the run. Placing them before the subcommand gates but doesn't configure; placing them after configures but doesn't gate.
-- **Re-running `transcribe` deletes and replaces** all `words` rows for that video (`transcribe/run.py:180`). `transcribe_runs` keeps the audit trail, but only the latest run's words survive.
-- **Non-ASCII in help text is deliberate.** `cli.py` and `__main__.py` reconfigure stdout/stderr to UTF-8 at import because docstrings use `§` and `—`; this is a Windows-origin project and those characters were mojibake before the fix. Don't ASCII-fy them.
-- The diarizer always runs on **full audio**, never on the STT chunks — speaker labels are context-dependent and chunking makes them inconsistent. Only STT chunks (25 min windows, 5 min overlap, above a 30 min threshold).
+- **`rytp/config.py` creates no directories.** `paths()` is a *function* resolved per call from `RYTP_DATA`; there is no module-level singleton. Call `config.ensure_dir(p.parent)` immediately before writing.
+- **Words are split on punctuation.** `кто-то` is two rows. A stored row holds exactly one token, and the tokens stored for a piece of text are exactly `normalize_text(text).split()` — because a query runs through the same function. `normalize_text` also folds `ё` to `е`.
+- **Stemming is not idempotent.** An utterance's `normalized_text` and `stem_text` are built by joining the per-word columns, never by re-running the functions over the joined string.
+- **FTS5 uses `unicode61`, never `porter`** — porter is English-only and does nothing to Russian. Stemming is Python-side via `rytp.models.stem_text`, which keeps a thread-local stemmer because the pools stem concurrently.
+- **mypy's `python_version` is `3.12`** only because the installed numpy's stubs will not parse under a 3.11 target. The runtime floor is still 3.11, and `tests/test_python_311_syntax.py` enforces it directly. Do not "fix" the setting.
+- **Non-ASCII in help text is deliberate.** `§` and `—` are intentional; stdout/stderr are reconfigured to UTF-8 at import because this is a Windows-origin project.
+- **No YouTube video ids, channel ids, channel names or URLs in any committed file**, tests and fixtures included. Use `VIDEO_A`, `CHANNEL_ONE`, `https://example.invalid/...`. Russian test strings are wanted.
+- The diarizer always runs on **full audio**, never on transcription chunks — speaker labels are context-dependent and chunking makes them inconsistent.
 
 ## Tests
 
-`tests/conftest.py` overrides pytest's built-in `tmp_path` so scratch dirs land in `./.pytest_tmp/` (gitignored) rather than the system temp dir — a workaround for a Windows sandbox `PermissionError`. The `data_dir` fixture monkeypatches the `config.paths` singleton and `db` gives an opened, migrated `Database`; use them instead of touching the real `data/` tree.
+`tests/conftest.py` roots `tmp_path` at `$RYTP_TEST_TMP` when set, falling back to a workspace-local directory — a workaround for a Windows sandbox `PermissionError`. `data_dir` sets `RYTP_DATA`; `db` gives an opened, migrated `Database`. `tests/fakes.py` and `tests/fake_engines.py` hold the shared factories.
 
-Every external tool is mocked or skipped: yt-dlp behind a fake `YtDlpRunner`, faster-whisper and pyannote behind registered fake engines, ffmpeg and FTS5 behind `pytest.mark.skipif`. `tests/test_real_files_integration.py` additionally needs the bundled sample audio/video pair at the repo root and skips cleanly without them. CLI tests drive the app through `typer.testing.CliRunner`.
+**The four `tests/test_consistency_*.py` suites are the cross-part net**: they assert that every command reaches both surfaces, that a flag has one spelling and one meaning, that every job kind has a handler, a predicate and a producer, and that the schema matches what each part declared it consumes. They exist because the recurring failure mode in this project was *naming a responsibility without naming a signature*. Keep them strict.
 
-Because the suite mocks every heavy dependency, **a green test run says almost nothing about whether the real pipeline works.** Verify end-to-end behavior by actually running `python -m rytp` against a real file.
+`tests/test_m1_end_to_end.py` is the milestone walk: catalog, ingest, transcribe, align, index, search, assemble a sentence **from two different source videos**, render a file with a source list — all through registered commands, with only the binaries faked.

@@ -4,33 +4,51 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rytp"
-version = "0.1.0"
-description = "Download YouTube videos, transcribe with word-level timestamps, datamine, and splice."
+version = "0.2.0"
+description = "Index a video archive by speaker and word; search it; cut and splice the results."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "rytp" }]
+# Contracts §1 base dependencies: importable at module level, and required
+# for the whole suite to collect. Audio analysis and stemming are core to
+# the product, not optional add-ons.
 dependencies = [
-    "typer>=0.12",
+    "typer>=0.27",
     "rich>=13",
-    "textual>=0.60",
+    "textual>=8",
     "numpy>=1.26",
     "scipy>=1.11",
+    "snowballstemmer>=2.2",
 ]
 
 [project.optional-dependencies]
-# Heavy / optional dependencies. Installed only by users who opt in.
+# Contracts §1: transcribers, aligners and diarizers only. Everything here
+# is imported lazily inside a function, never at module import time, so the
+# base install still runs every command that does not need a model.
 yt-dlp = ["yt-dlp>=2024.5"]
-stt = ["faster-whisper>=1.0"]
-pyannote = [
-    "pyannote-audio>=3.1",
-    "torch>=2.1",
-]
+whisper = ["faster-whisper>=1.0"]
+gigaam = ["gigaam>=0.1"]
+wav2vec2 = ["torch>=2.1", "torchaudio>=2.1", "transformers>=4.40"]
+# Part 7's diarizer and embedder, kept separate from the transcriber
+# extras above: design §6 says the recommended transcriber and diarizer
+# pin incompatible versions of their shared dependencies, so installing
+# them into one environment is precisely what the out-of-process seam
+# exists to avoid. Point engine.interpreter.pyannote / .redimnet at the
+# Python inside their own virtual environments instead. Supersedes the
+# old pre-rewrite "diarize" extra, which named the wrong package
+# (pyannote-audio, not pyannote.audio) for a diarizer this plan replaces.
+pyannote = ["pyannote.audio>=4.0"]
+redimnet = ["torch>=2.1", "torchaudio>=2.1", "redimnet>=0.1"]
 all = [
     "yt-dlp>=2024.5",
     "faster-whisper>=1.0",
-    "pyannote-audio>=3.1",
+    "gigaam>=0.1",
     "torch>=2.1",
+    "torchaudio>=2.1",
+    "transformers>=4.40",
+    "pyannote.audio>=4.0",
+    "redimnet>=0.1",
 ]
 dev = [
     "pytest>=8",
@@ -40,12 +58,12 @@ dev = [
 ]
 
 [project.scripts]
-rytp = "rytp.cli:app"
+rytp = "rytp.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["rytp*"]
-exclude = ["tests*", "data*"]
+exclude = ["tests*", "data*", "scripts*"]
 
 [tool.setuptools.package-data]
 rytp = ["py.typed"]
@@ -53,6 +71,9 @@ rytp = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+markers = [
+    "real_ffmpeg: invokes the real ffmpeg binary; skipped when it is not installed",
+]
 
 [tool.ruff]
 line-length = 100
@@ -60,9 +81,81 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "N", "SIM", "RUF"]
+# The rule *selection* is fixed by contracts §1. These four ignores are
+# not exceptions to a rule so much as to a heuristic:
+#   N812  — `from rytp import constants as C` is the house alias, used in
+#           every module. The rule only objects to the capital letter.
+#   RUF001/2/3 — this is a Russian-language project. Every Cyrillic string
+#           literal, docstring and test fixture trips the ambiguous-unicode
+#           check (`е` looks like `e`), and CLAUDE.md is explicit that the
+#           non-ASCII is deliberate.
+ignore = ["N812", "RUF001", "RUF002", "RUF003"]
+
+# Part 2's acquisition error taxonomy (task 1) names exceptions after what
+# went wrong (`VideoUnavailable`, `NoCaptions`, `RateLimited`,
+# `DailyCapReached`) rather than tacking on a redundant `Error` suffix — they
+# all subclass `AcquireError`/`RytpError` already. Scoped to this one file
+# rather than dropped from the global selection.
+[tool.ruff.lint.per-file-ignores]
+"rytp/acquire/policy.py" = ["N818"]
+# Same reasoning as above: WorkerAlreadyRunning states the condition, not a
+# redundant "...Error" tacked onto it, and it already subclasses RytpError.
+"rytp/jobs/worker.py" = ["N818"]
 
 [tool.mypy]
-python_version = "3.11"
+# Bumped from "3.11" to unblock Part 3: numpy 2.5.3's bundled .pyi uses a
+# PEP 695 `type` statement, which mypy refuses to parse — a hard failure
+# before any of rytp's own code is checked — under a "3.11" target. This is
+# a static-analysis target only; the hard constraint that rytp's own source
+# stays 3.11-syntax-compatible (contracts, CLAUDE.md) is unaffected.
+python_version = "3.12"
 strict_optional = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+
+# `rytp/commands/catalog.py` imports these lazily inside a try/except, so a
+# missing yt-dlp extra becomes a one-line hint and a missing job registry
+# becomes an empty tuple, instead of a traceback. Plan part 2 supplies both
+# modules; until then their absence is not an error.
+[[tool.mypy.overrides]]
+module = ["rytp.acquire.*", "rytp.jobs", "rytp.jobs.*"]
+ignore_missing_imports = true
+
+
+# yt-dlp is an optional extra (contracts §1) and ships no stubs or a
+# py.typed marker, so it is untyped when installed and possibly absent
+# entirely in the base dev environment.
+[[tool.mypy.overrides]]
+module = ["yt_dlp", "yt_dlp.*"]
+ignore_missing_imports = true
+
+# snowballstemmer ships neither stubs nor a py.typed marker.
+[[tool.mypy.overrides]]
+module = ["snowballstemmer.*"]
+ignore_missing_imports = true
+
+# numpy is a base dependency (contracts §1) and Part 3 is the first part to
+# import it. The installed numpy version's bundled .pyi uses a PEP 695 `type`
+# statement that mypy rejects under this project's pinned python_version =
+# "3.11" target, crashing before any of rytp's own code is checked — not a
+# finding about rytp. `follow_imports = "skip"` stops mypy from parsing
+# numpy's stubs at all; calls into it are typed `Any` rather than unchecked.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+
+# faster-whisper, gigaam, and torch/torchaudio/transformers (the wav2vec2
+# fallback) are optional extras (contracts §1), imported lazily inside each
+# adapter's own function body, and none is installed in the base dev
+# environment or the test suite's venv.
+[[tool.mypy.overrides]]
+module = [
+    "faster_whisper.*",
+    "gigaam.*",
+    "torch.*",
+    "torchaudio.*",
+    "transformers.*",
+    "redimnet.*",
+    "pyannote.*",
+]
+ignore_missing_imports = true
