@@ -163,7 +163,7 @@ All three run simultaneously, so one video downloads while another transcribes.
 
 **Captions are pulled early and always.** They are tiny, they cost no GPU time, and they are the first thing to disappear when a video is delisted. Fetching them for the whole catalog takes about three hours.
 
-**Acquisition order:** `rytp videos add <url>` catalogs only. `rytp ingest <id>` enqueues the chain, pulling audio, a video rendition and captions together. Local files register as assets and never get download jobs.
+**Acquisition order:** `rytp videos add <url>` catalogs the video *and* enqueues its chain by default — the same chain `rytp ingest <id>` enqueues, pulling audio, a video rendition and captions together. Pass `--register-only` to catalog without enqueueing, the original behaviour. Enqueueing only writes `jobs` rows; a worker (`rytp worker`) still has to drain them before anything is actually fetched. `rytp ingest <id>` remains the way to (re-)enqueue a video's chain later, and the only way to enqueue in bulk (`--channel-id`, `--pending`). `rytp channel add` and `rytp channel sync` are unchanged: they still catalog only, never enqueue, because a channel's chain can be thousands of videos at once and a single video's cannot — that asymmetry is exactly why the video-level default is safe and the channel-level one is not. Local files register as assets and never get download jobs, only `extract_wav`/`fingerprint`.
 
 ---
 

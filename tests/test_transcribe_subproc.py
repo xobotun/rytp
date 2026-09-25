@@ -9,10 +9,22 @@ import pytest
 from rytp.models import RytpError
 from rytp.transcribe.base import EngineSubprocessError, EngineUnavailable
 from rytp.transcribe.registry import TRANSCRIBERS
-from rytp.transcribe.subproc import probe, resolve_device, run_child
+from rytp.transcribe.subproc import probe, resolve_device, run_child, shutdown_workers
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STUB = "tests.subproc_engine_stub"
+
+
+@pytest.fixture(autouse=True)
+def _no_leftover_workers() -> None:
+    """Close every resident worker after each test.
+
+    A real call in this file now spawns a resident worker, not a one-shot
+    child, so a test that deliberately crashes or hangs one must not leave
+    it (or an un-crashed sibling worker) running for the next test.
+    """
+    yield
+    shutdown_workers()
 
 
 def test_round_trip_returns_the_child_result() -> None:
@@ -199,7 +211,9 @@ def test_probe_never_raises_on_timeout(tmp_path: Path, monkeypatch: pytest.Monke
     def explode(**kwargs: object) -> dict[str, object]:
         raise EngineSubprocessError("engine rytp.transcribe.subproc timed out after 1s")
 
-    monkeypatch.setattr(subproc_module, "run_child", explode)
+    # `probe` calls the one-shot child (`_run_once`), never the resident
+    # worker pool (`run_child`) — see `subproc.py`'s module docstring.
+    monkeypatch.setattr(subproc_module, "_run_once", explode)
     result = probe(sys.executable, "", "json")
     assert result["module_ok"] is False
     assert "timed out" in result["module_error"]

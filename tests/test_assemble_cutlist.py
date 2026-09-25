@@ -20,6 +20,7 @@ from rytp.assemble.cutlist import (
     dumps_cutlist,
     load_cutlist,
     read_cutlist,
+    target_from_slots,
     validate_name,
     write_cutlist,
 )
@@ -53,6 +54,7 @@ def sample() -> CutList:
                 end_ms=613_100,
                 align_score=0.81,
                 cost=1.42,
+                tier="aligned",
                 video_speaker_id=11,
                 speaker_label="host",
                 alternatives=(
@@ -422,3 +424,43 @@ def test_read_cutlist_resolves_a_name_under_the_data_tree(data_dir: Path) -> Non
 def test_read_cutlist_rejects_a_traversing_name(data_dir: Path) -> None:
     with pytest.raises(InvalidInputError):
         read_cutlist("../escape")
+
+
+# --- recomputing the target from the slots (owner's request) -------------
+
+
+def test_target_from_slots_reconstructs_an_unedited_target() -> None:
+    """Nothing has been hand-edited yet, so joining the slots' own text —
+    a fragment's real spoken words, a gap's still-missing target word —
+    reproduces exactly what was planned."""
+    cutlist = sample()
+    assert target_from_slots(cutlist.slots) == cutlist.target
+
+
+def test_target_from_slots_keeps_a_gaps_word() -> None:
+    """A gap slot's text is the target word the corpus never says — the
+    recomputed target must still contain it, because the cut list is still
+    trying to say it (the render reports it as missing)."""
+    cutlist = sample()
+    gap = cutlist.gaps[0]
+    assert gap.text in target_from_slots(cutlist.slots).split()
+
+
+def test_target_from_slots_follows_an_adopted_substitution() -> None:
+    """The point of adopting a substitution: the target should say what the
+    video will actually say, `каннибализм` becoming `каннибализмом`."""
+    import dataclasses
+
+    cutlist = sample()
+    gap = cutlist.gaps[0]
+    adopted = dataclasses.replace(gap, kind="fragment", text="исправит")
+    slots = tuple(adopted if slot is gap else slot for slot in cutlist.slots)
+    assert target_from_slots(slots) == "мы всё исправит"
+
+
+def test_target_from_slots_drops_a_removed_fragments_word() -> None:
+    """A fragment dropped from the sequence (`d`) is gone from the splice,
+    so it is gone from the recomputed target too."""
+    cutlist = sample()
+    remaining = tuple(slot for slot in cutlist.slots if slot.kind != "fragment")
+    assert target_from_slots(remaining) == "исправим"

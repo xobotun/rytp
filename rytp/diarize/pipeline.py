@@ -50,14 +50,28 @@ class DiarizeOutcome:
     n_words_labelled: int
     n_words_unlabelled: int
     reindexed: bool
+    #: The diarizer's resolved device (contracts §6, plan §1b): "cuda" once
+    #: an "auto" request resolves, "cpu", or "n/a" for an engine with no GPU
+    #: path. Callers surface this rather than re-deriving it, the same way
+    #: the transcribe path surfaces `TranscribeOutcome.align_device`
+    #: (`rytp/commands/transcribe.py`'s `_device_note`) — otherwise four
+    #: engines can silently run on CPU with a GPU sitting idle (BUGS.md
+    #: entry 34).
+    device: str
+    #: Advisory findings drained from the diarizer's `notes` channel
+    #: (contracts §6). Never a failure.
+    notes: tuple[str, ...] = ()
 
     def message(self) -> str:
         tail = "" if self.reindexed else " (no index job kind registered)"
+        extra = f"; device: {self.device}"
+        if self.notes:
+            extra += f"; {'; '.join(self.notes)}"
         return (
             f"video {self.video_id}: {self.n_labels} speakers from "
             f"{self.n_segments} segments via {self.diarizer}; "
             f"{self.n_words_labelled} words labelled, "
-            f"{self.n_words_unlabelled} left unlabelled{tail}"
+            f"{self.n_words_unlabelled} left unlabelled{tail}{extra}"
         )
 
 
@@ -71,6 +85,20 @@ def _validated(segments: list[DiarSegment]) -> list[DiarSegment]:
         if not segment.local_label:
             raise DiarizeError("diarizer returned a segment with an empty label")
     return segments
+
+
+def _drain_notes(engine: Diarizer) -> tuple[str, ...]:
+    """Read and clear an engine's advisory notes channel (contracts §6).
+
+    ``getattr`` with a default: an engine that never has anything to report
+    simply never defines ``notes``, and this must not require that it does
+    — see ``rytp.transcribe.pipeline._drain_notes``, the same seam for
+    transcribers and aligners.
+    """
+    notes = tuple(str(note) for note in getattr(engine, "notes", ()))
+    if notes and hasattr(engine, "notes"):
+        engine.notes.clear()
+    return notes
 
 
 def request_reindex(db: Database, video_id: int) -> bool:
@@ -139,6 +167,12 @@ def diarize_video(
         n_words_labelled=len(by_word_label),
         n_words_unlabelled=len(words) - len(by_word_label),
         reindexed=reindexed,
+        # `diarizer.diarize` has already returned, so an "auto" request has
+        # resolved to the concrete device it actually used (contracts §6,
+        # plan §1b) — read with a default the same way `notes` is, so a
+        # test fake that predates this attribute does not crash the run.
+        device=str(getattr(diarizer, "device", "n/a")),
+        notes=_drain_notes(diarizer),
     )
 
 

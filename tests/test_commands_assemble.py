@@ -13,8 +13,10 @@ from rytp.assemble import cutlist_name, cutlist_path, read_cutlist
 from rytp.cli import build_app
 from rytp.commands import COMMANDS
 from rytp.commands.assemble import (
+    assemble_list,
     assemble_plan,
     assemble_remove,
+    assemble_retarget,
     assemble_show,
     assemble_suggest,
     format_ms,
@@ -27,7 +29,13 @@ from tests.assembly_corpus import add_video, add_words
 
 runner = CliRunner()
 
-NAMES = ("assemble.plan", "assemble.show", "assemble.suggest")
+NAMES = (
+    "assemble.plan",
+    "assemble.show",
+    "assemble.list",
+    "assemble.suggest",
+    "assemble.retarget",
+)
 
 
 @pytest.fixture()
@@ -55,8 +63,9 @@ def test_parse_ids_reads_a_comma_separated_flag() -> None:
 
 
 def test_format_ms_reads_like_a_timestamp() -> None:
-    assert format_ms(0) == "0:00.000"
-    assert format_ms(612_340) == "10:12.340"
+    """BUGS.md entry 31: always ``H:MM:SS.mmm``, same as the render report."""
+    assert format_ms(0) == "0:00:00.000"
+    assert format_ms(612_340) == "0:10:12.340"
     assert format_ms(3_723_004) == "1:02:03.004"
 
 
@@ -121,6 +130,37 @@ def test_plan_rejects_a_knob_off_the_dial(db: Database, data_dir: Path) -> None:
         assemble_plan(db, target="мы все", name="демо", consistency=3.0)
 
 
+def test_retarget_keeps_untouched_slots_and_reports_what_changed(
+    db: Database, data_dir: Path, corpus: tuple[int, int]
+) -> None:
+    assemble_plan(db, target="мы все понимаем это неизбежно", name="демо")
+    before = read_cutlist("демо")
+
+    result = assemble_retarget(db, name="демо", target=before.target + " точно")
+
+    after = read_cutlist("демо")
+    assert after.target == before.target + " точно"
+    assert after.slots[0] == before.slots[0]
+    assert after.slots[1] == before.slots[1]
+    assert after.slots[2].kind == "gap"
+    assert after.slots[2].text == "точно"
+    assert "kept 2" in (result.message or "")
+    assert "replanned 1" in (result.message or "")
+
+
+def test_retarget_on_an_unknown_name_raises(db: Database, data_dir: Path) -> None:
+    with pytest.raises(RytpError):
+        assemble_retarget(db, name="нет-такого", target="что угодно")
+
+
+def test_retarget_on_an_empty_target_raises(
+    db: Database, data_dir: Path, corpus: tuple[int, int]
+) -> None:
+    assemble_plan(db, target="мы все понимаем", name="демо")
+    with pytest.raises(InvalidInputError, match="empty"):
+        assemble_retarget(db, name="демо", target="   ")
+
+
 def test_show_reads_a_cut_list_back(
     db: Database, data_dir: Path, corpus: tuple[int, int]
 ) -> None:
@@ -153,6 +193,111 @@ def test_show_reports_a_broken_file_on_one_line(db: Database, data_dir: Path) ->
     path.write_text('schema_version = 1\nname = "oops\n', encoding="utf-8", newline="\n")
     with pytest.raises(RytpError, match=r"сломано\.toml"):
         assemble_show(db, name="сломано")
+
+
+def test_show_accepts_the_name_the_tool_printed(
+    db: Database, data_dir: Path, corpus: tuple[int, int]
+) -> None:
+    """BUGS.md entry 27: `assemble plan` prints `wrote .../демо.toml`, and
+    passing that straight back to `assemble show` must not double the
+    extension into `демо.toml.toml`."""
+    assemble_plan(db, target="мы все понимаем", name="демо")
+    result = assemble_show(db, name="демо.toml")
+    assert [row[1] for row in result.rows] == ["fragment"]
+
+
+def test_show_with_no_name_points_at_assemble_list(db: Database, data_dir: Path) -> None:
+    with pytest.raises(InvalidInputError, match="assemble list"):
+        assemble_show(db, name="")
+
+
+def test_the_cli_names_assemble_list_on_a_missing_argument(data_dir: Path) -> None:
+    result = runner.invoke(build_app(), ["assemble", "show"])
+    assert result.exit_code != 0
+    assert "assemble list" in result.output
+
+
+def test_assemble_list_is_registered_and_reads_the_cutlists_directory(
+    db: Database, data_dir: Path, corpus: tuple[int, int]
+) -> None:
+    assert COMMANDS["assemble.list"].group == "assemble"
+    assert assemble_list(db).rows == ()
+    assemble_plan(db, target="мы все понимаем", name="демо")
+    result = assemble_list(db)
+    assert result.rows == (("демо",),)
+    # Copy-pasteable: exactly what assemble_show accepts.
+    assert assemble_show(db, name=result.rows[0][0]).rows
+
+
+def test_assemble_list_is_most_recently_modified_first(
+    db: Database, data_dir: Path, corpus: tuple[int, int]
+) -> None:
+    import os
+
+    assemble_plan(db, target="мы все понимаем", name="старый")
+    path_old = cutlist_path("старый")
+    os.utime(path_old, (1_700_000_000, 1_700_000_000))
+    assemble_plan(db, target="мы все понимаем", name="новый")
+    path_new = cutlist_path("новый")
+    os.utime(path_new, (1_800_000_000, 1_800_000_000))
+    assert assemble_list(db).rows == (("новый",), ("старый",))
+
+
+def test_plan_assembles_a_wav2vec2_shaped_logprob_corpus(db: Database, data_dir: Path) -> None:
+    """BUGS.md entry 26, the blocking defect: a fixed 0.0 floor rejected
+    every negative log-probability, so a wav2vec2-aligned corpus matched
+    nothing at all, with no flag able to fix it. It must now match."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(
+        db, video_id, "мы все понимаем", align_score=-0.96, align_scale=C.ALIGN_SCALE_LOGPROB
+    )
+    result = assemble_plan(db, target="мы все понимаем", name="логпроб")
+    assert [row[1] for row in result.rows] == ["fragment"]
+    assert "1 fragment" in (result.message or "")
+
+
+def test_plan_on_an_unknown_scale_corpus_matches_nothing_and_says_why(
+    db: Database, data_dir: Path
+) -> None:
+    """entries 26/28/36: pre-batch wav2vec2 rows are excluded by design,
+    and the failure must name why rather than read as "not in the
+    corpus"."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "неизбежно", align_score=0.99, align_scale=C.ALIGN_SCALE_UNKNOWN)
+    result = assemble_plan(db, target="неизбежно", name="неясно")
+    assert [row[1] for row in result.rows] == ["gap"]
+    message = result.message or ""
+    assert "неизбежно" in message
+    assert "unknown alignment scale" in message
+    assert "transcribe align" in message
+
+
+def test_allow_timed_assembles_a_timed_only_corpus_and_marks_the_tier(
+    db: Database, data_dir: Path
+) -> None:
+    """D1: an override, not a gate. The tier is recorded on the fragment
+    regardless — the render's source list is what the owner publishes."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "мы все понимаем", source="timed", align_score=None, align_scale=None)
+
+    without_flag = assemble_plan(db, target="мы все понимаем", name="без-флага")
+    assert [row[1] for row in without_flag.rows] == ["gap", "gap", "gap"]
+
+    with_flag = assemble_plan(
+        db, target="мы все понимаем", name="с-флагом", allow_timed=True
+    )
+    assert [row[1] for row in with_flag.rows] == ["fragment"]
+    cutlist = read_cutlist("с-флагом")
+    assert cutlist.fragments[0].tier == "timed"
+    assert cutlist.params.allow_timed is True
+
+
+def test_allow_timed_is_not_spelled_force(data_dir: Path) -> None:
+    """contracts §5: `assemble.plan` already has a `--force` meaning
+    "replace an existing cut list"; the override needed its own name."""
+    params = {param.name for param in COMMANDS["assemble.plan"].params}
+    assert "allow_timed" in params
+    assert "force" in params
 
 
 def test_suggest_ranks_stand_ins_for_a_word(db: Database) -> None:
@@ -320,6 +465,12 @@ def test_orphaned_renders_finds_only_this_cut_lists_renders(db: Database) -> Non
     add_render(db, "другое")
     assert [row[0] for row in orphaned_renders(db, "демо")] == [str(mine)]
     assert orphaned_renders(db, "ничего") == ()
+
+
+def test_orphaned_renders_lists_newest_first(db: Database) -> None:
+    first = add_render(db, "демо")
+    second = add_render(db, "демо")
+    assert [row[0] for row in orphaned_renders(db, "демо")] == [str(second), str(first)]
 
 
 def test_the_cli_runs_remove_end_to_end(data_dir: Path) -> None:

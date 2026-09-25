@@ -63,13 +63,82 @@ def test_adding_a_url_catalogs_what_the_probe_reported(
     assert "added" in (result.message or "")
 
 
-def test_adding_a_url_creates_no_assets_and_no_jobs(
+def test_register_only_creates_no_assets_and_no_jobs(
     db: Database, fake_probe: list[str]
 ) -> None:
-    """Design §5: cataloguing only. `rytp ingest` starts the chain."""
-    catalog.videos_add(db, target=VIDEO_URL)
+    """`--register-only` is the old default: catalog, and nothing else."""
+    catalog.videos_add(db, target=VIDEO_URL, register_only=True)
     assert db.conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
     assert db.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_adding_a_url_enqueues_the_ingest_chain_by_default(
+    db: Database, fake_probe: list[str]
+) -> None:
+    """BUGS.md entry 1: the owner's first command failed because
+    registering and acquiring were separate steps and nothing said so.
+    The default now enqueues the same chain `rytp ingest <id>` would."""
+    result = catalog.videos_add(db, target=VIDEO_URL)
+    video_id = int(result.rows[0][0])
+    kinds = {
+        row[0]
+        for row in db.conn.execute(
+            "SELECT kind FROM jobs WHERE target_id = ?", (video_id,)
+        ).fetchall()
+    }
+    assert kinds == set(C.INGEST_CHAIN_REMOTE)
+    # Readiness, not a dependency graph (contracts §5): the first hop
+    # (`download`) is `pending`, and everything downstream of it is
+    # `blocked` until it runs — neither state is `done`, because nothing
+    # has run yet.
+    assert not any(state == "done" for (state,) in db.conn.execute(
+        "SELECT state FROM jobs WHERE target_id = ?", (video_id,)
+    ).fetchall())
+    # "Queued" must not read as "done" — no worker has run in this test.
+    assert "queued" in (result.message or "")
+    assert "downloaded" not in (result.message or "")
+
+
+def test_adding_a_local_file_enqueues_extract_wav_not_a_download(
+    db: Database, tmp_path: Path
+) -> None:
+    """A local file is coherent with the default: `ingest()` registers the
+    container synchronously (no ffprobe, no network — just the row) and
+    enqueues `extract_wav`/`fingerprint`; the WAV itself is only cached
+    once a worker actually runs `extract_wav`."""
+    path = make_file(tmp_path)
+    result = catalog.videos_add(db, target=str(path))
+    video_id = int(result.rows[0][0])
+    kinds = {
+        row[0]
+        for row in db.conn.execute(
+            "SELECT kind FROM jobs WHERE target_id = ?", (video_id,)
+        ).fetchall()
+    }
+    assert kinds == set(C.INGEST_CHAIN_LOCAL)
+    assert "download" not in kinds
+    container = db.conn.execute(
+        "SELECT role, path FROM assets WHERE video_id = ?", (video_id,)
+    ).fetchone()
+    assert container["role"] == "container"
+    assert container["path"] == str(path)
+
+
+def test_adding_the_same_video_twice_does_not_duplicate_jobs(
+    db: Database, fake_probe: list[str]
+) -> None:
+    """`enqueue` is idempotent by `UNIQUE (kind, target_id)`; re-adding the
+    same video (e.g. to correct its title) must not pile up a second set
+    of jobs alongside the first."""
+    catalog.videos_add(db, target=VIDEO_URL)
+    result = catalog.videos_add(db, target=VIDEO_URL, title="Corrected")
+    video_id = int(result.rows[0][0])
+    counts = db.conn.execute(
+        "SELECT kind, COUNT(*) FROM jobs WHERE target_id = ? GROUP BY kind",
+        (video_id,),
+    ).fetchall()
+    assert all(count == 1 for _, count in counts)
+    assert {kind for kind, _ in counts} == set(C.INGEST_CHAIN_REMOTE)
 
 
 def test_explicit_title_and_kind_override_the_probe(

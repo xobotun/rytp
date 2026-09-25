@@ -296,8 +296,14 @@ def test_a_group_heading_names_what_it_is_about_and_lists_its_commands(
                    if SAMPLE[name].group == "videos"],
         {"videos": "the local video catalog"},
     )
-    assert help_text.startswith("the local video catalog — ")
-    listing = help_text.split(" — ", 1)[1]
+    # Rendered, not raw: the names carry a rich style, so comparing the
+    # plain text proves both that the markup parses and that the content
+    # is right. A malformed tag would raise here.
+    from rich.text import Text
+
+    plain = Text.from_markup(help_text).plain
+    assert plain.startswith("the local video catalog — ")
+    listing = plain.split(" — ", 1)[1]
     assert listing == ", ".join(
         leaf_name(SAMPLE[name]) for name in sorted(SAMPLE)
         if SAMPLE[name].group == "videos"
@@ -318,12 +324,14 @@ def test_a_group_with_no_summary_falls_back_to_the_bare_listing(
 
     # Asserted on the function, not the rendered page: leaf names alone are
     # too short to substring-match ("add" matches half the help text).
+    from rich.text import Text
+
     from rytp.cli import _group_help
 
     cmds = [SAMPLE[n] for n in sorted(SAMPLE) if SAMPLE[n].group == "videos"]
-    help_text = _group_help("videos", cmds, {})
-    assert " — " not in help_text            # no summary, so no dash
-    assert help_text == ", ".join(leaf_name(c) for c in cmds)
+    plain = Text.from_markup(_group_help("videos", cmds, {})).plain
+    assert " — " not in plain                # no summary, so no dash
+    assert plain == ", ".join(leaf_name(c) for c in cmds)
 
 
 def test_the_real_registry_describes_every_group_it_uses(data_dir: Path) -> None:

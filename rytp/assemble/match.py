@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import math
 import sqlite3
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Final
 
 from rytp import constants as C
@@ -36,6 +36,7 @@ from rytp.models import InvalidInputError, normalize_text, stem_text
 __all__ = [
     "SLOT_FRAGMENT",
     "SLOT_GAP",
+    "AbsenceDiagnosis",
     "CandidateRun",
     "MatchFilters",
     "Plan",
@@ -45,6 +46,7 @@ __all__ = [
     "SubstitutionHit",
     "WordRow",
     "build_run_table",
+    "diagnose_absence",
     "edit_distance",
     "edit_distance_at_most",
     "find_occurrences",
@@ -68,6 +70,7 @@ class WordRow:
     normalized_text: str
     align_score: float
     video_speaker_id: int | None
+    source: str
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,17 @@ class CandidateRun:
     last_align: float
     mean_align: float
     video_speaker_id: int | None
+    #: The weakest ``words.source`` any word in this run carries (plan
+    #: §1a / D1). ``WORD_SOURCE_RANK`` orders tiers weakest first for
+    #: exactly this: a run is only as trustworthy as its worst word, so a
+    #: fragment that mixes an ``aligned`` word with a ``timed`` one (only
+    #: possible under ``--allow-timed``) must still be reported as
+    #: ``timed`` rather than silently look fully aligned.
+    tier: str
+
+
+def _default_min_align_by_scale() -> dict[str, float | None]:
+    return dict(C.ASSEMBLE_MIN_ALIGN_BY_SCALE)
 
 
 @dataclass(frozen=True)
@@ -93,7 +107,17 @@ class MatchFilters:
 
     exclude_video_ids: frozenset[int] = frozenset()
     video_speaker_ids: frozenset[int] | None = None
-    min_align_score: float = C.ASSEMBLE_MIN_ALIGN_SCORE
+    #: Per-``align_scale`` floor (plan §1a; BUGS.md entries 26, 28). ``None``
+    #: for a scale means no threshold applies to it. ``unknown`` is never
+    #: consulted here regardless of what it maps to —
+    #: ``C.ASSEMBLE_EXCLUDE_UNKNOWN_SCALE`` excludes it outright.
+    min_align_by_scale: Mapping[str, float | None] = field(
+        default_factory=_default_min_align_by_scale
+    )
+    #: D1: an override, not a gate. Admits ``timed`` words with no
+    #: threshold and no quality logic, alongside the always-eligible
+    #: ``aligned`` tier.
+    allow_timed: bool = False
     max_internal_gap_ms: int = C.ASSEMBLE_MAX_INTERNAL_GAP_MS
     max_run_words: int = C.ASSEMBLE_MAX_RUN_WORDS
     max_occurrences: int = C.ASSEMBLE_MAX_OCCURRENCES_PER_TOKEN
@@ -105,7 +129,7 @@ RunTable = dict[tuple[int, int], dict[int, CandidateRun]]
 
 _SELECT = (
     "SELECT video_id, ord, start_ms, end_ms, text, normalized_text, "
-    "COALESCE(align_score, :default_align) AS align_score, video_speaker_id "
+    "COALESCE(align_score, :default_align) AS align_score, video_speaker_id, source "
 )
 
 
@@ -128,19 +152,38 @@ def _int_list(values: Iterable[int]) -> str:
     return ", ".join(str(int(value)) for value in values)
 
 
-def _eligibility_sql(filters: MatchFilters) -> str:
-    """The shared WHERE tail: cuttable, in scope, well enough anchored.
+def _scale_clause(min_align_by_scale: Mapping[str, float | None]) -> str:
+    """Eligibility by score, scoped to the scale that produced it (plan §1a).
 
-    Contracts §3: "Cuttable is defined as ``source = 'aligned'`` and
-    nothing else may be cut." ``end_ms IS NOT NULL`` is implied by the
-    table's CHECK constraint but stated anyway, because a cut without an
-    end is not a cut.
+    A disjunction over the declared scales: a row is eligible when its
+    ``align_scale`` has a floor and its ``align_score`` clears it, or when
+    its scale has no floor at all (``none`` — MFA reports no score, and
+    contracts §3 permits that) and so nothing gates it. ``unknown`` is
+    never a disjunct here, regardless of what the mapping says about it —
+    ``C.ASSEMBLE_EXCLUDE_UNKNOWN_SCALE`` rows are entry 36's fabricated
+    boundaries and entry 28's un-identifiable sign flips, excluded
+    outright rather than floored (BUGS.md entries 26, 28).
+
+    The scale names and floors are Python constants, never user input, so
+    embedding them as SQL literals is the same trade the surrounding code
+    already makes for ``source = 'aligned'``.
     """
-    clauses = [
-        "source = 'aligned'",
-        "end_ms IS NOT NULL",
-        "COALESCE(align_score, :default_align) >= :min_align",
-    ]
+    disjuncts: list[str] = []
+    for scale, floor in min_align_by_scale.items():
+        if C.ASSEMBLE_EXCLUDE_UNKNOWN_SCALE and scale == C.ALIGN_SCALE_UNKNOWN:
+            continue
+        if floor is None:
+            disjuncts.append(f"align_scale = '{scale}'")
+        else:
+            disjuncts.append(f"(align_scale = '{scale}' AND align_score >= {float(floor)!r})")
+    return "(" + " OR ".join(disjuncts) + ")" if disjuncts else "1 = 0"
+
+
+def _shared_clauses(filters: MatchFilters) -> list[str]:
+    """Scope narrowing that applies regardless of tier: excluded videos,
+    a speaker filter. Factored out so both the per-tier ``UNION ALL``
+    branches and the pair-keyed extension query say it once."""
+    clauses: list[str] = []
     if filters.exclude_video_ids:
         clauses.append(f"video_id NOT IN ({_int_list(filters.exclude_video_ids)})")
     if filters.video_speaker_ids is not None:
@@ -153,7 +196,45 @@ def _eligibility_sql(filters: MatchFilters) -> str:
             clauses.append("1 = 0")
         else:
             clauses.append(f"video_speaker_id IN ({_int_list(filters.video_speaker_ids)})")
+    return clauses
+
+
+def _tier_clause(source: str, filters: MatchFilters) -> str:
+    """One tier's full eligibility, as one clause: cuttable, in scope,
+    well enough anchored. ``end_ms IS NOT NULL`` is implied by the table's
+    CHECK constraint but stated anyway, because a cut without an end is
+    not a cut.
+
+    D1: ``timed`` carries no score floor at all — it is an override, not a
+    gate, with "no threshold and no quality logic" by design, so only the
+    ``aligned`` tier ever consults :func:`_scale_clause`.
+    """
+    if source == C.ALIGNED_WORD_SOURCE:
+        clauses = [
+            "source = 'aligned'",
+            "end_ms IS NOT NULL",
+            _scale_clause(filters.min_align_by_scale),
+        ]
+    else:
+        clauses = ["source = 'timed'", "end_ms IS NOT NULL"]
+    clauses.extend(_shared_clauses(filters))
     return " AND ".join(clauses)
+
+
+def _eligibility_sql(filters: MatchFilters) -> str:
+    """The full WHERE tail for a pair-keyed lookup (extension steps).
+
+    Expressed as an ``OR`` of per-tier clauses rather than the ``UNION
+    ALL`` :func:`occurrence_query` uses: this query already selects by an
+    explicit ``(video_id, ord) IN (VALUES …)`` list, served entirely by
+    the composite ``words(video_id, ord)`` index — there is no partial
+    index on ``source`` for this shape to preserve (plan Task 6, "how to
+    implement D1").
+    """
+    tiers = [_tier_clause(C.ALIGNED_WORD_SOURCE, filters)]
+    if filters.allow_timed:
+        tiers.append(_tier_clause("timed", filters))
+    return "(" + " OR ".join(f"({tier})" for tier in tiers) + ")"
 
 
 def _row(record: sqlite3.Row) -> WordRow:
@@ -168,6 +249,7 @@ def _row(record: sqlite3.Row) -> WordRow:
         normalized_text=str(record["normalized_text"]),
         align_score=float(record["align_score"]),
         video_speaker_id=None if speaker is None else int(speaker),
+        source=str(record["source"]),
     )
 
 
@@ -177,19 +259,48 @@ def occurrence_query(
     """The hot lookup, as SQL and parameters.
 
     Separated from :func:`find_occurrences` so a test can run
-    ``EXPLAIN QUERY PLAN`` over the real statement. The inner ``WHERE`` is
-    written to sit directly on contracts §3's partial index
+    ``EXPLAIN QUERY PLAN`` over the real statement. By default the inner
+    ``WHERE`` is written to sit directly on contracts §3's partial index
     ``words_alignable ON words(normalized_text) WHERE source = 'aligned'``:
     most of the corpus is caption-tier (design §6), so a plan that matched
     the token first and filtered by tier afterwards would scale with the
     whole archive instead of the cuttable part of it.
+
+    Under ``--allow-timed`` the query becomes a ``UNION ALL`` of two
+    per-tier ``SELECT``s, one per source literal, each able to sit on its
+    own partial index (``words_alignable`` / ``words_timed``). A single
+    query using ``source IN ('aligned', 'timed')`` would imply neither
+    index's predicate, and SQLite would fall back to scanning
+    ``words_normalized`` — precisely the caption-tier scan the partial
+    indexes exist to avoid (plan Task 6, "how to implement D1"). The
+    window function ranking seeds per video is applied *outside* that
+    union, over the combined rows, so ``max_seeds_per_video`` still caps
+    per video rather than per tier.
     """
+    tiers = [C.ALIGNED_WORD_SOURCE]
+    if filters.allow_timed:
+        tiers.append("timed")
+    if len(tiers) == 1:
+        # The default shape, unchanged from before per-scale eligibility:
+        # one SELECT directly off `words`, so it sits on `words_alignable`
+        # exactly as it always has.
+        source = f"words WHERE normalized_text = :token AND {_tier_clause(tiers[0], filters)}"
+    else:
+        # `--allow-timed`: a UNION ALL of two per-tier SELECTs, each with
+        # its own `source = '...'` literal, so each half can sit on its
+        # own partial index. `source IN ('aligned', 'timed')` would imply
+        # neither index's predicate and fall back to scanning
+        # `words_normalized` (plan Task 6, "how to implement D1").
+        branches = " UNION ALL ".join(
+            f"SELECT * FROM words WHERE normalized_text = :token AND {_tier_clause(tier, filters)}"
+            for tier in tiers
+        )
+        source = f"({branches})"
     sql = (
         f"{_SELECT}FROM (SELECT *, ROW_NUMBER() OVER ("
         "  PARTITION BY video_id"
         "  ORDER BY COALESCE(align_score, :default_align) DESC, ord"
-        ") AS seed_rank FROM words"
-        f" WHERE normalized_text = :token AND {_eligibility_sql(filters)}"
+        f") AS seed_rank FROM {source}"
         ") WHERE seed_rank <= :max_seeds"
         " ORDER BY align_score DESC, video_id, ord"
         " LIMIT :max_occurrences"
@@ -197,7 +308,6 @@ def occurrence_query(
     return sql, {
         "token": token,
         "default_align": C.ASSEMBLE_DEFAULT_ALIGN_SCORE,
-        "min_align": filters.min_align_score,
         "max_seeds": filters.max_seeds_per_video,
         "max_occurrences": filters.max_occurrences,
     }
@@ -230,10 +340,7 @@ def _fetch_next(
     for start in range(0, len(wanted), C.ASSEMBLE_SQL_BATCH):
         batch = wanted[start : start + C.ASSEMBLE_SQL_BATCH]
         pairs = ", ".join(f"(:v{index}, :o{index})" for index in range(len(batch)))
-        params: dict[str, object] = {
-            "default_align": C.ASSEMBLE_DEFAULT_ALIGN_SCORE,
-            "min_align": filters.min_align_score,
-        }
+        params: dict[str, object] = {"default_align": C.ASSEMBLE_DEFAULT_ALIGN_SCORE}
         for index, (video_id, ordinal) in enumerate(batch):
             params[f"v{index}"] = video_id
             params[f"o{index}"] = ordinal
@@ -242,6 +349,18 @@ def _fetch_next(
             row = _row(record)
             found[(row.video_id, row.ord)] = row
     return found
+
+
+def _weakest_tier(words: Sequence[WordRow]) -> str:
+    """The weakest ``source`` any word in ``words`` carries.
+
+    ``WORD_SOURCE_RANK`` orders tiers weakest first for exactly this
+    purpose (its own docstring: "the order is what lets a run report the
+    weakest tier it contains"). Every word here is already ``aligned`` or
+    ``timed`` — a caption-tier row is never eligible — so a rank lookup
+    that saw one is a bug worth failing loudly on rather than guessing.
+    """
+    return min(words, key=lambda word: C.WORD_SOURCE_RANK.index(word.source)).source
 
 
 def _run_from(words: Sequence[WordRow]) -> CandidateRun:
@@ -259,6 +378,7 @@ def _run_from(words: Sequence[WordRow]) -> CandidateRun:
         last_align=words[-1].align_score,
         mean_align=sum(scores) / len(scores),
         video_speaker_id=words[0].video_speaker_id,
+        tier=_weakest_tier(words),
     )
 
 
@@ -707,6 +827,91 @@ def pad_fragments(db: Database, plan: Plan, pad_ms: int) -> Plan:
 
 
 @dataclass(frozen=True)
+class AbsenceDiagnosis:
+    """Why one target word matched nothing, broken down by cause.
+
+    BUGS.md entry 26: "a user sees 'no fragments' and reasonably concludes
+    the corpus does not contain the phrase" — this is what makes that
+    conclusion checkable instead of assumed. The three counts are
+    mutually exclusive and, together with what is left over, account for
+    every occurrence of the token in the corpus.
+    """
+
+    token: str
+    total: int
+    excluded_tier: int  # caption tier, or timed tier without --allow-timed
+    excluded_unknown_scale: int  # BUGS.md entry 36's fabricated boundaries
+    excluded_below_floor: int  # scored, but the score did not clear its floor
+    #: Words sharing this token's stem, when the exact form was never said.
+    #: Search falls back to stem matching, so it happily shows a hit for an
+    #: inflected form — and then assembly reported "never said in the
+    #: corpus", which reads as a contradiction. Assembly is right to refuse
+    #: (cutting `каннибализмом` to say `каннибализм` puts the wrong word in
+    #: the video); it was the wording that was wrong.
+    stem_forms: tuple[tuple[str, int], ...] = ()
+
+
+def diagnose_absence(db: Database, token: str, filters: MatchFilters) -> AbsenceDiagnosis:
+    """Classify every occurrence of ``token``, cuttable or not, by why it
+    would not have matched under ``filters``.
+
+    Meant to run once a real search already found nothing for this token
+    (design §8: "report the gap plainly") — a single aggregate query, not
+    the hot path :func:`find_occurrences` is, so it need not sit on an
+    index the way that one must.
+    """
+    aligned_ok = _scale_clause(filters.min_align_by_scale)
+    timed_excluded = "0" if filters.allow_timed else "1"
+    unknown = C.ALIGN_SCALE_UNKNOWN
+    sql = (
+        "SELECT COUNT(*) AS total,"
+        " SUM(CASE"
+        "   WHEN source NOT IN ('aligned', 'timed') THEN 1"
+        f"   WHEN source = 'timed' THEN {timed_excluded}"
+        "   ELSE 0 END) AS excluded_tier,"
+        " SUM(CASE WHEN source = 'aligned'"
+        f"   AND (align_scale IS NULL OR align_scale = '{unknown}')"
+        "   THEN 1 ELSE 0 END) AS excluded_unknown_scale,"
+        " SUM(CASE WHEN source = 'aligned'"
+        f"   AND align_scale IS NOT NULL AND align_scale != '{unknown}'"
+        f"   AND NOT {aligned_ok} THEN 1 ELSE 0 END) AS excluded_below_floor"
+        " FROM words WHERE normalized_text = :token"
+    )
+    row = db.conn.execute(sql, {"token": token}).fetchone()
+    total = int(row["total"] or 0)
+    return AbsenceDiagnosis(
+        token=token,
+        total=total,
+        excluded_tier=int(row["excluded_tier"] or 0),
+        excluded_unknown_scale=int(row["excluded_unknown_scale"] or 0),
+        excluded_below_floor=int(row["excluded_below_floor"] or 0),
+        stem_forms=() if total else _stem_forms(db, token),
+    )
+
+
+def _stem_forms(db: Database, token: str) -> tuple[tuple[str, int], ...]:
+    """Forms the corpus *does* have that share this token's stem.
+
+    Only consulted when the exact form was never said. `words_stem` already
+    indexes the column, and this runs once per missing word on a path that
+    is already off the hot loop.
+    """
+    from rytp.models import stem_text
+
+    stem = stem_text(token)
+    if not stem:
+        return ()
+    rows = db.conn.execute(
+        "SELECT normalized_text AS form, COUNT(*) AS n FROM words"
+        " WHERE stem = :stem AND normalized_text != :token"
+        " GROUP BY normalized_text ORDER BY n DESC, normalized_text"
+        " LIMIT :limit",
+        {"stem": stem, "token": token, "limit": C.ASSEMBLE_STEM_FORM_LIMIT},
+    ).fetchall()
+    return tuple((str(r["form"]), int(r["n"])) for r in rows)
+
+
+@dataclass(frozen=True)
 class SubstitutionHit:
     """A word the corpus does say, offered in place of one it does not."""
 
@@ -772,8 +977,6 @@ def _vocabulary(
     tail = _eligibility_sql(filters)
     params: dict[str, object] = {
         "token": token,
-        "default_align": C.ASSEMBLE_DEFAULT_ALIGN_SCORE,
-        "min_align": filters.min_align_score,
         "limit": C.ASSEMBLE_SUBSTITUTION_VOCAB_LIMIT,
     }
     if same_stem:

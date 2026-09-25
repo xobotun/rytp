@@ -9,18 +9,80 @@ that wrote its own SELECT would quietly make that false.
 What it adds is what a command line cannot: filters you cycle with one key,
 a refresh that keeps up with a worker in another process, and the highlighted
 job's `note` shown in full rather than in a column.
+
+BUGS.md entry 41: enqueueing only writes a `jobs` row — a separate `rytp
+worker` process drains it, and the TUI cannot run one inline (`worker` is
+`FOREGROUND_ONLY` in `rytp/tui/enqueue.py`, correctly: it is the process that
+drains the queue, so running it as a queued/foreground call on this thread
+would block the whole screen). What this view *can* do is start that process
+detached — `spawn_worker` below — so the person staring at this screen is
+never told to go open a second terminal.
 """
 
 from __future__ import annotations
 
-from typing import Final
+import os
+import subprocess
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Final
 
+from rytp import config
 from rytp import constants as C
 from rytp.commands import CommandResult, resolve
 from rytp.db import Database
+from rytp.jobs.worker import live_lease
 from rytp.models import RytpError
 
 __all__ = ["JobsView"]
+
+#: Win32 creation flags for a fully detached child (design targets Windows
+#: first — see CLAUDE.md). `getattr` with the documented Win32 numeric value
+#: as fallback because `subprocess.DETACHED_PROCESS` and
+#: `.CREATE_NEW_PROCESS_GROUP` only exist in typeshed under a
+#: `sys.platform == "win32"` narrowing; branching on the real
+#: `sys.platform` (needed so this is exercisable on any host under test)
+#: would leave mypy unable to see the attribute at all on other platforms.
+_DETACHED_PROCESS: Final = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+_CREATE_NEW_PROCESS_GROUP: Final = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+
+
+_Spawn = Callable[[Sequence[str], Mapping[str, str]], subprocess.Popen[bytes]]
+
+
+def _spawn_worker_process(
+    argv: Sequence[str], env: Mapping[str, str]
+) -> subprocess.Popen[bytes]:
+    """Launch `argv` fully detached from this process and its console.
+
+    Output goes to `DEVNULL`, not a log file: contracts §7 enumerates the
+    data tree's filesystem layout exhaustively and has no slot for one, and
+    the contracts are binding — adding `logs/` is a change to raise, not to
+    make here. The loss is bounded: per-job progress and errors already
+    land in `jobs.progress` / `jobs.error` (`_DbProgressSink`,
+    `_handle_failure` in `rytp/jobs/worker.py`), which this same screen
+    shows; what is lost is a traceback that happens before the lease is
+    even acquired (a bad import, an adapter surprise on first real use —
+    CLAUDE.md's "What has never been run").
+
+    POSIX detaches with a new session; Windows (this project's primary
+    target) gets no inherited console and its own process group, so a
+    Ctrl-C in the TUI's terminal cannot reach the child — which also means
+    stopping it later is `taskkill /PID <pid>` (Windows) or `kill <pid>`
+    (POSIX), not Ctrl-C, and `spawn_worker`'s message says so.
+    """
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": dict(env),
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = _DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(list(argv), **kwargs)
 
 #: Column positions in `jobs.list`'s result. Named rather than counted so a
 #: reader can see what the view depends on; the test above pins the header.
@@ -45,9 +107,19 @@ def _choices(command: str, param: str) -> tuple[str, ...]:
 class JobsView:
     """What is queued, running, done and failed — and why."""
 
-    def __init__(self, db: Database, *, limit: int = C.TUI_QUEUE_ROW_LIMIT) -> None:
+    def __init__(
+        self,
+        db: Database,
+        *,
+        limit: int = C.TUI_QUEUE_ROW_LIMIT,
+        spawn: _Spawn = _spawn_worker_process,
+    ) -> None:
         self._db = db
         self._limit = limit
+        # Overridable so a test can assert the argv and creation flags
+        # without ever starting a real process (spawning a real detached
+        # process from a test is how one gets left behind after the run).
+        self._spawn = spawn
         self.state: str = ""
         self.pool: str = ""
         self.state_choices: tuple[str, ...] = _choices("jobs.list", "state")
@@ -159,6 +231,32 @@ class JobsView:
 
         name = "queue.resume" if is_paused(self._db) else "queue.pause"
         return self._run(name)
+
+    def spawn_worker(self) -> str:
+        """Start `rytp worker` detached, or say why not (BUGS.md entry 41).
+
+        Checks the lease first: `acquire_lease` (`rytp/jobs/worker.py`) is
+        the real guard, and a second worker started here would just die on
+        startup with `WorkerAlreadyRunning`, so this check is a courtesy that
+        avoids spawning a process only to watch it fail — not a substitute
+        for the lease, which stays the single source of truth against a
+        genuine race between two people opening the TUI at once.
+        """
+        held = live_lease(self._db)
+        if held is not None:
+            return (
+                f"a worker is already running (pid {held.get('pid')}, "
+                f"last seen {held.get('heartbeat')})"
+            )
+        argv = (sys.executable, "-m", "rytp", "worker")
+        env = {**os.environ, "RYTP_DATA": str(config.data_root())}
+        process = self._spawn(argv, env)
+        stop_hint = (
+            f"taskkill /PID {process.pid}"
+            if sys.platform == "win32"
+            else f"kill {process.pid}"
+        )
+        return f"started worker (pid {process.pid}); stop it with `{stop_hint}`"
 
     def _run(self, command: str, **values: object) -> str:
         """Run a registered command and refresh. Errors become a status line."""

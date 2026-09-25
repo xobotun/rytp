@@ -25,6 +25,7 @@ NAMES = (
     "transcribe.captions",
     "transcribe.run",
     "transcribe.align",
+    "transcribe.unalign",
     "transcribe.compare",
     "transcribe.engines",
     "transcribe.fingerprint",
@@ -70,6 +71,9 @@ def test_the_long_running_commands_are_flagged() -> None:
     assert resolve("transcribe.fingerprint").long_running is True
     assert resolve("transcribe.captions").long_running is False
     assert resolve("transcribe.engines").long_running is False
+    # A single UPDATE plus a DELETE, cheap enough to run inline — not a job
+    # kind, so it never appears in test_consistency_jobs.py's roster.
+    assert resolve("transcribe.unalign").long_running is False
 
 
 def test_captions_handler_reports_how_many_words_it_wrote(
@@ -167,6 +171,40 @@ def test_align_handler_retimes_existing_words(db: Database, tmp_path: Path) -> N
         )
     assert result.rows[0][3] == "aligned"
     assert result.rows[0][4] == "fake+fake-aligner+energy"
+
+
+def test_unalign_handler_restores_the_timed_tier(db: Database, tmp_path: Path) -> None:
+    video_id = _make_video(db)
+    wav = _wav(tmp_path)
+    with registered(FakeTranscriber, FakeAligner):
+        resolve("transcribe.run").handler(
+            db, video=str(video_id), transcriber="fake", aligner="fake-aligner", wav=wav
+        )
+        result = resolve("transcribe.unalign").handler(db, video=str(video_id))
+    assert result.rows[0][2] == "timed"
+    assert result.rows[0][3] == "fake"
+    assert "not cuttable" in (result.message or "")
+    sources = {
+        row[0]
+        for row in db.conn.execute(
+            "SELECT source FROM words WHERE video_id = ?", (video_id,)
+        ).fetchall()
+    }
+    assert sources == {"timed"}
+
+
+def test_unalign_handler_refuses_a_video_with_no_aligned_words(
+    db: Database, tmp_path: Path
+) -> None:
+    from rytp.models import RytpError
+
+    video_id = _make_video(db)
+    with registered(FakeTranscriber):
+        resolve("transcribe.run").handler(
+            db, video=str(video_id), transcriber="fake", wav=_wav(tmp_path)
+        )
+    with pytest.raises(RytpError):
+        resolve("transcribe.unalign").handler(db, video=str(video_id))
 
 
 def test_engines_handler_lists_what_is_registered(db: Database) -> None:

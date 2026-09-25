@@ -55,6 +55,7 @@ PINNED_TYPES: dict[str, type] = {
     "force": bool,
     "enqueue": bool,
     "long": bool,
+    "register_only": bool,
 }
 
 

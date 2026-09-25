@@ -422,7 +422,7 @@ def test_jobs_list_renders_rows_of_strings(db: Database) -> None:
     result = resolve("jobs.list").handler(db, state="", pool="", kind="", limit=50)
     assert result.columns == (
         "id", "kind", "target", "state", "pool", "attempts", "not_before",
-        "error", "note",
+        "error", "note", "progress",
     )
     assert len(result.rows) == len(C.INGEST_CHAIN_REMOTE)
     assert all(isinstance(cell, str) for row in result.rows for cell in row)
@@ -437,6 +437,34 @@ def test_jobs_list_filters_by_state(db: Database) -> None:
     # extract_wav has no audio yet, caption_words has no captions asset yet,
     # and fingerprint has no cached WAV yet — all three start blocked.
     assert {row[1] for row in result.rows} == {"extract_wav", "caption_words", "fingerprint"}
+
+
+def test_jobs_list_shows_progress_only_for_running_jobs(db: Database) -> None:
+    """contracts §5: `jobs.progress` is advisory and lossy, cleared the
+    instant a job leaves `running` — a finished job must not read as if it
+    were still moving, even one that happens to carry a stale value."""
+    vid = make_video(db)
+    running_id = Q.enqueue(db, "download", vid)
+    claimed = Q.claim(db, "network")
+    assert claimed is not None and claimed.id == running_id
+    Q.set_progress(db, running_id, "download 3/10 частей")
+
+    done_id = Q.enqueue(db, "captions", vid)
+    Q.claim(db, "network")
+    Q.finish(db, done_id)
+
+    result = resolve("jobs.list").handler(db, state="", pool="", kind="", limit=50)
+    by_id = {row[0]: row for row in result.rows}
+    progress_col = result.columns.index("progress")
+    state_col = result.columns.index("state")
+
+    running_row = by_id[str(running_id)]
+    assert running_row[state_col] == "running"
+    assert running_row[progress_col] == "download 3/10 частей"
+
+    done_row = by_id[str(done_id)]
+    assert done_row[state_col] == "done"
+    assert done_row[progress_col] == ""
 
 
 def test_jobs_stats_shows_throttling_not_a_mystery_stall(db: Database) -> None:

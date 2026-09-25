@@ -28,7 +28,7 @@ from typing import Any
 from rytp import constants as C
 from rytp.diarize.base import register_diarizer
 from rytp.models import DiarSegment
-from rytp.transcribe.subproc import resolve_device, run_child
+from rytp.transcribe.subproc import load_cached, resolve_device, run_child
 
 
 def segments_from_tracks(
@@ -61,6 +61,10 @@ class PyannoteDiarizer:
     extra = "pyannote"
     #: Class-level default (plan §1b, contracts §6); see :class:`GigaAMTranscriber`.
     device = C.ENGINE_DEFAULT_DEVICE
+    #: Contracts §6: a diarizer has no `words.align_score` to report, so
+    #: this is a fixed, honest placeholder — see
+    #: :class:`rytp.transcribe.engines.whisper.FasterWhisperTranscriber`.
+    score_scale = C.ALIGN_SCALE_NONE
 
     def __init__(
         self,
@@ -77,6 +81,10 @@ class PyannoteDiarizer:
         #: Requested device, then the concrete device the last call used
         #: (BUGS.md entry 34) — see :class:`GigaAMTranscriber`.
         self.device = device
+        #: Non-fatal findings from the last :meth:`diarize` call (contracts
+        #: §6's engine notes channel). A genuine instance attribute — see
+        #: :class:`rytp.transcribe.engines.whisper.FasterWhisperTranscriber`.
+        self.notes: list[str] = []
 
     def diarize(self, audio: Path) -> Iterable[DiarSegment]:
         """Whole file in, labelled turns out.
@@ -107,13 +115,28 @@ class PyannoteDiarizer:
 
 
 def child_main(request: dict[str, Any]) -> dict[str, Any]:
-    """Runs inside pyannote's own interpreter. The only import of the library."""
+    """Runs inside pyannote's own interpreter. The only import of the library.
+
+    The pipeline is cached across calls in this process, keyed by
+    ``(model, device)`` — a diarizer already ran once per video before the
+    persistent worker seam, but this now also spares every video after the
+    first in one run from reloading it (the seam's "helps all four engines
+    uniformly" goal). The HF token used to build a cached pipeline is
+    whichever call first constructed it for that key; a token change
+    mid-process would not take effect until the worker is torn down.
+    """
     import torch
     from pyannote.audio import Pipeline
 
     device = resolve_device(str(request.get("device") or C.ENGINE_DEFAULT_DEVICE))
-    pipeline = Pipeline.from_pretrained(request["model"], token=request["hf_token"])
-    pipeline.to(torch.device(device))
+    model_name = str(request["model"])
+
+    def _load() -> Any:
+        built = Pipeline.from_pretrained(model_name, token=request["hf_token"])
+        built.to(torch.device(device))
+        return built
+
+    pipeline = load_cached(("pyannote", model_name, device), _load)
     annotation = pipeline(request["audio"])
     tracks = [
         (segment.start, segment.end, label)

@@ -20,7 +20,9 @@ IDS = [entry.id for entry in ENTRIES]
 
 def test_every_screen_is_named_once() -> None:
     assert len(IDS) == len(set(IDS))
-    assert set(IDS) == {"speakers", "search", "transcripts", "jobs", "cutlists"}
+    assert set(IDS) == {
+        "speakers", "search", "transcripts", "jobs", "cutlists", "videos",
+    }
 
 
 def test_every_screen_has_a_title_and_a_summary() -> None:
@@ -79,6 +81,22 @@ def test_one_key_means_one_thing_wherever_it_is_bound() -> None:
                 )
     clashes = {key: sorted(what) for key, what in meanings.items() if len(what) > 1}
     assert not clashes, f"one key, several meanings: {clashes}"
+
+
+def test_the_videos_screen_is_f9_not_f5() -> None:
+    """BUGS.md entry 23 named `f5` as the natural key, but Part 7's mapper
+    already binds it locally — see `SCREENS`'s comment. `f9` is next."""
+    entry = N.screen_by_id("videos")
+    assert entry.key == "f9"
+    assert "f5" not in N.app_keys()
+
+
+def test_f5_really_would_collide_with_the_mapper() -> None:
+    """The reasoning `SCREENS` records, checked against the real code rather
+    than trusted as a comment: if `f5` were an app-level key it would be
+    shadowed on the speakers screen, exactly as
+    `test_no_app_level_key_is_shadowed_by_a_screen` would refuse."""
+    assert "f5" in N.screen_binding_keys()["speakers"]
 
 
 def test_no_app_level_key_is_shadowed_by_a_screen() -> None:

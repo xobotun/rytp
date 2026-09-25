@@ -25,6 +25,7 @@ from rytp.transcribe.pipeline import (
     realign_video,
     speaker_loss_warning,
     transcribe_video,
+    unalign_video,
 )
 from rytp.transcribe.registry import default_transcriber, engine_rows, resolve_transcriber, setting
 
@@ -420,6 +421,34 @@ register(
         ),
         handler=_align_handler,
         long_running=True,
+    )
+)
+
+def _unalign_handler(db: Database, *, video: str) -> CommandResult:
+    video_id = resolve_video_id(db, video)
+    outcome = unalign_video(db, video_id)
+    enqueue_index(db, video_id)
+    return CommandResult(
+        columns=("video", "words", "tier", "engine"),
+        rows=((str(outcome.video_id), str(outcome.n_words), "timed", outcome.engine),),
+        message=(
+            f"video {video_id}: restored {outcome.n_words} word(s) to their "
+            "transcriber's own timing and downgraded them to 'timed' — not "
+            "cuttable until re-aligned"
+        ),
+    )
+
+
+register(
+    Command(
+        name="transcribe.unalign",
+        group="transcribe",
+        summary=(
+            "Undo an alignment: restore a video's aligned words to timed, "
+            "with their original transcriber timings."
+        ),
+        params=(_VIDEO_ID,),
+        handler=_unalign_handler,
     )
 )
 

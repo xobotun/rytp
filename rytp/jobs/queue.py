@@ -107,6 +107,18 @@ def enqueue(
     state from the readiness predicate, so running ``rytp ingest`` twice on a
     video whose media was deleted does the right thing instead of nothing. A
     job somebody is currently running is left strictly alone.
+
+    **The payload is refreshed too.** It used to be written only by the
+    INSERT, so re-enqueuing an existing row silently kept the old one: a
+    `transcribe` job cancelled while stamped `gigaam`, then enqueued again
+    with `whisper` as the default, reopened carrying `gigaam` and would
+    have run the wrong engine. The payload is the *input* to the work
+    (contracts §5 — a readiness predicate never sees it, precisely because
+    anything that changes what the work does belongs there), so a request
+    with different inputs must not inherit the old ones.
+
+    A running job keeps its payload along with its state: the parameters of
+    work already in flight cannot be changed underneath it.
     """
     spec = resolve_job_kind(kind)
     state = _state_for(spec.readiness(db, target_id))
@@ -122,7 +134,10 @@ def enqueue(
                 state      = CASE WHEN jobs.state = 'running'
                                   THEN jobs.state ELSE excluded.state END,
                 not_before = CASE WHEN jobs.state = 'running'
-                                  THEN jobs.not_before ELSE NULL END
+                                  THEN jobs.not_before ELSE NULL END,
+                payload_json = CASE WHEN jobs.state = 'running'
+                                  THEN jobs.payload_json
+                                  ELSE excluded.payload_json END
             """,
             (kind, target_id, state, spec.pool, priority,
              json.dumps(payload or {}), stamp),
@@ -403,7 +418,14 @@ def list_jobs(
     kind: str | None = None,
     limit: int = C.JOB_LIST_LIMIT,
 ) -> list[Job]:
-    """Jobs, newest priority first, for the CLI and the TUI."""
+    """Jobs, most recently created first, for the CLI and the TUI.
+
+    Display only — this has nothing to do with :func:`claim`'s scheduling
+    order (``priority DESC, id ASC``, a FIFO queue within a priority band).
+    A listing exists to be read by a person, who wants to see what just
+    happened; a claim exists to pick the next job to run fairly. Reversing
+    ``id`` here does not touch that.
+    """
     where: list[str] = []
     params: list[Any] = []
     for column, value in (("state", state), ("pool", pool), ("kind", kind)):
@@ -413,7 +435,7 @@ def list_jobs(
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     params.append(limit)
     rows = db.conn.execute(
-        f"SELECT * FROM jobs {clause} ORDER BY priority DESC, id ASC LIMIT ?",
+        f"SELECT * FROM jobs {clause} ORDER BY id DESC LIMIT ?",
         params,
     ).fetchall()
     return [Job.from_row(r) for r in rows]
@@ -511,7 +533,7 @@ def cancellable(
     sql = "SELECT * FROM jobs WHERE state NOT IN ('running', 'cancelled')"
     if clause:
         sql += f" AND {clause}"
-    sql += " ORDER BY id"
+    sql += " ORDER BY id DESC"
     return [Job.from_row(r) for r in db.conn.execute(sql, params).fetchall()]
 
 

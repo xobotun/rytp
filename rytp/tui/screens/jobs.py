@@ -45,6 +45,14 @@ class JobsScreen(Screen[None]):
         Binding("ctrl+g", "retry_all", "Retry all failed"),
         Binding("ctrl+x", "cancel", "Cancel job"),
         Binding("ctrl+b", "toggle_pause", "Pause/resume"),
+        # BUGS.md entry 41: enqueueing only writes a `jobs` row; nothing
+        # drains it without a separate `rytp worker` process, and this is
+        # the screen someone watches while wondering why nothing moves.
+        # Every ctrl+<letter> chord is already claimed somewhere in the app
+        # (`test_one_key_means_one_thing_wherever_it_is_bound` requires one
+        # meaning per key everywhere, not just on this screen) and f1-f9 are
+        # all app-level screen keys, so this is the next function key up.
+        Binding("f12", "start_worker", "Start worker"),
     ]
 
     def __init__(self, db: Database) -> None:
@@ -91,6 +99,9 @@ class JobsScreen(Screen[None]):
 
     def action_toggle_pause(self) -> None:
         self._announce(self.view.toggle_pause())
+
+    def action_start_worker(self) -> None:
+        self._announce(self.view.spawn_worker())
 
     # -- drawing -----------------------------------------------------
 

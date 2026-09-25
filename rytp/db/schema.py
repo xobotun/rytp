@@ -296,6 +296,28 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX words_timed ON words(normalized_text) WHERE source = 'timed';
         """,
     ),
+    (
+        16,
+        """
+        -- The transcriber's own pre-alignment, pre-refinement per-token
+        -- timing (contracts amendment §7; BUGS.md entry 44), so
+        -- `transcribe unalign` can restore it after `realign_video` or
+        -- `--refine` overwrites `start_ms`/`end_ms` in place. Never a
+        -- CHECK: SQLite cannot add one by ALTER TABLE, and there is nothing
+        -- to check here anyway. Both columns are set together or left both
+        -- NULL — never one without the other — by whichever writer creates
+        -- the row, and are never touched again afterwards by anything.
+        --
+        -- NULL for every row written before this migration: there is
+        -- nothing to backfill, the same call migration 13 made for
+        -- `align_scale`. Also NULL for a row whose transcriber left timing
+        -- entirely to the aligner (contracts §4 permits a text-only
+        -- RawWord) or supplied only one of the two bounds — a restore needs
+        -- both or neither.
+        ALTER TABLE words ADD COLUMN orig_start_ms INTEGER;
+        ALTER TABLE words ADD COLUMN orig_end_ms INTEGER;
+        """,
+    ),
 ]
 
 #: The version a fully migrated database reports.

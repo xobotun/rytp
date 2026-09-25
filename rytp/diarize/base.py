@@ -49,6 +49,18 @@ class Diarizer(Protocol):
     name: str
     requires_hf_token: bool
     out_of_process: bool
+    #: Contracts §6: declared on all three engine protocols. A diarizer has
+    #: no `words.align_score` to report, so this stays a fixed, honest
+    #: placeholder rather than reusing "unknown" (which contracts §6 reserves
+    #: for an engine that predates the attribute entirely) — see
+    #: :class:`rytp.transcribe.base.Transcriber`.
+    score_scale: str
+    #: "auto" | "cuda" | "cpu" | "n/a"; contracts §6, plan §1b.
+    device: str
+    #: Advisory, non-fatal findings from the last call; contracts §6's engine
+    #: notes channel. Read with ``getattr(engine, "notes", [])`` — an engine
+    #: that never has anything to report simply never defines it.
+    notes: list[str]
 
     def diarize(self, audio: Path) -> Iterable[DiarSegment]: ...
 

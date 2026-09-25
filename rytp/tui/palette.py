@@ -22,12 +22,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from rytp.commands import COMMANDS, PARAM_ALIASES, REQUIRED, Command, Param
+from rytp.commands import COMMANDS, GROUP_SUMMARIES, PARAM_ALIASES, REQUIRED, Command, Param
 from rytp.models import InvalidInputError
 
 __all__ = [
     "PaletteEntry",
     "cli_invocation",
+    "group_heading",
     "match_entries",
     "palette_entries",
     "parse_arguments",
@@ -83,6 +84,21 @@ def palette_entries(commands: Mapping[str, Command] | None = None) -> list[Palet
         for cmd in sorted(source.values(), key=lambda c: c.name)
         if not cmd.cli_only
     ]
+
+
+def group_heading(group: str, summaries: Mapping[str, str] | None = None) -> str:
+    """What a group's commands are about — the palette's half of entry 6.
+
+    Mirrors `rytp.cli._group_help`: both surfaces read `GROUP_SUMMARIES`
+    (contracts §5) and say what the group is *about*, never the command
+    list a second time — the row directly under the heading already names
+    each command. ``group`` itself is the heading's first word, since the
+    palette shows a command as ``videos add`` (the spaced form) with
+    nothing else naming the group it sits under.
+    """
+    source = GROUP_SUMMARIES if summaries is None else summaries
+    about = source.get(group, "")
+    return f"{group} — {about}" if about else group
 
 
 def match_entries(entries: Sequence[PaletteEntry], query: str) -> list[PaletteEntry]:

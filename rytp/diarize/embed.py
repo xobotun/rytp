@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from rytp import constants as C
 from rytp.models import RytpError, UnknownEngineError
 from rytp.transcribe.registry import check_available, interpreter_for
-from rytp.transcribe.subproc import resolve_device, run_child
+from rytp.transcribe.subproc import load_cached, resolve_device, run_child
 
 if TYPE_CHECKING:
     from rytp.db import Database
@@ -278,7 +278,13 @@ class ReDimNetEmbedder:
 
 
 def child_main(request: dict[str, Any]) -> dict[str, Any]:
-    """Runs inside ReDimNet's own interpreter. The only import of torch."""
+    """Runs inside ReDimNet's own interpreter. The only import of torch.
+
+    The model is cached across calls in this process, keyed by ``(model,
+    device)``. Part 7 already calls this once per speaker label rather than
+    per chunk, but a corpus with many labels still paid a reload each time
+    before the persistent worker seam existed.
+    """
     import tempfile
 
     import redimnet
@@ -286,13 +292,16 @@ def child_main(request: dict[str, Any]) -> dict[str, Any]:
     import torchaudio
 
     device = resolve_device(str(request.get("device") or C.ENGINE_DEFAULT_DEVICE))
+    model_name = str(request["model"])
     windows = [(int(start), int(end)) for start, end in request["windows"]]
+    model = load_cached(
+        ("redimnet", model_name, device),
+        lambda: redimnet.ReDimNet.from_pretrained(model_name).to(device).eval(),
+    )
     with tempfile.TemporaryDirectory(prefix="rytp-embed-") as tmp:
         clip = concat_wav_windows(Path(request["audio"]), Path(tmp) / "clip.wav", windows)
         waveform, _rate = torchaudio.load(str(clip))
         waveform = waveform.to(device)
-        model = redimnet.ReDimNet.from_pretrained(request["model"]).to(device)
-        model.eval()
         with torch.no_grad():
             vector = model(waveform).squeeze().tolist()
     return {"vector": [float(value) for value in vector], "device": device}

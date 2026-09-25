@@ -91,6 +91,15 @@ def test_cancel_dry_run_changes_nothing(db: Database) -> None:
     assert Q.get_job(db, job_id).state == "pending"
 
 
+def test_cancel_dry_run_lists_newest_job_first(db: Database) -> None:
+    a = make_video(db, external_id="VIDEO_A", url="https://example.invalid/a")
+    b = make_video(db, external_id="VIDEO_B", url="https://example.invalid/b")
+    first = Q.enqueue(db, "download", a)
+    second = Q.enqueue(db, "download", b)
+    result = _cancel(db, kind="download", dry_run=True)
+    assert [row[0] for row in result.rows] == [str(second), str(first)]
+
+
 def test_cancel_with_no_filter_at_all_is_refused(db: Database) -> None:
     # "rytp jobs cancel" with nothing set would wipe the queue by accident.
     with pytest.raises(InvalidInputError, match="filter"):

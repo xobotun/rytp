@@ -45,10 +45,13 @@ __all__ = [
     "Substitution",
     "cutlist_name",
     "cutlist_path",
+    "cutlists_dir",
     "dumps_cutlist",
     "from_plan",
     "load_cutlist",
     "read_cutlist",
+    "slots_from_plan",
+    "target_from_slots",
     "validate_name",
     "write_cutlist",
 ]
@@ -124,6 +127,15 @@ class Slot:
     video_speaker_id: int | None = None
     speaker_label: str | None = None
     gap_before_ms: int | None = None
+    #: The weakest ``words.source`` this fragment was cut from — always
+    #: recorded for a fragment, not only under ``--allow-timed`` (D1:
+    #: "every fragment records its tier ... without the recorded tier a
+    #: degraded cut is visible only at plan time"). ``None`` for a gap,
+    #: which cuts nothing and so has no tier to report. On read a
+    #: fragment with no ``tier`` key defaults to ``aligned`` (see
+    #: :func:`_slot`), because that was the only tier a cut list written
+    #: before this batch could ever have held.
+    tier: str | None = None
     alternatives: tuple[Alternative, ...] = ()
     substitutions: tuple[Substitution, ...] = ()
 
@@ -170,18 +182,45 @@ class CutlistParams:
     speaker: str
     exclude: tuple[int, ...]
     min_align_score: float
+    #: D1's override, recorded for provenance like every other knob.
+    #: Absent on a cut list written before this batch; the reader
+    #: defaults it to ``False``, which was the only behavior there was.
+    allow_timed: bool = False
 
 
 @dataclass(frozen=True)
 class CutList:
-    """A whole cut list, in memory."""
+    """A whole cut list, in memory.
+
+    ``gap_notes`` is transient plan-time diagnosis (BUGS.md entry 26: "a
+    user must never again read 'no fragments' and conclude the corpus
+    does not contain the phrase") — never written to the file and never
+    read back from one; it is empty on anything :func:`load_cutlist`
+    returns. See :func:`dumps_cutlist`, which does not reference it.
+    """
 
     schema_version: int
     name: str
+    #: What the cut list says, in two different phases of its life.
+    #:
+    #: At plan time (``assemble plan``, ``assemble retarget``) this is an
+    #: *input*: the sentence the assembler was asked to find fragments
+    #: for. Once a cut list has been hand-edited by a boundary-editing
+    #: verb — a fragment removed with ``d``, a ranked substitution
+    #: adopted with ``s`` — its role flips to *derived output*: it is
+    #: recomputed from the slots themselves (:func:`target_from_slots`,
+    #: called by ``rytp.tui.cutlist_view.CutlistView``), so it always
+    #: describes what the cut list will actually say rather than what it
+    #: was originally asked to say. There is deliberately no marker for
+    #: which phase produced the value on disk — a cut list that has not
+    #: been hand-edited already has slots that partition its planned
+    #: target, so recomputing it would be a no-op anyway (modulo case and
+    #: `ё`/`е`, which the words themselves are stored under).
     target: str
     created_at: str
     params: CutlistParams
     slots: tuple[Slot, ...]
+    gap_notes: tuple[str, ...] = ()
 
     @property
     def fragments(self) -> tuple[Slot, ...]:
@@ -215,14 +254,27 @@ def cutlist_name(target: str) -> str:
     return slug or C.ASSEMBLE_FALLBACK_NAME
 
 
+_PATH_SPLIT = re.compile(r"[\\/]")
+
+
 def validate_name(name: str) -> str:
     """Reject anything that would write outside ``cutlists/``.
 
     The name reaches this from the command line, so a separator or a
-    ``..`` in it is a path traversal, not a naming preference. Windows
-    also treats ``C:name`` as a drive-relative path, hence the colon.
+    ``..`` in it is a path traversal, not a naming preference — *unless*
+    the string ends in ``.toml``, which only happens when it is what a
+    tool printed (BUGS.md entry 27): `` `assemble plan` `` reports
+    ``wrote …/cutlists/<name>.toml``, and copy-pasting that back into
+    `` `assemble show` `` must work rather than doubling the extension
+    into ``<name>.toml.toml``. In that one case only the final path
+    component is kept — a traversal segment earlier in the string is
+    simply discarded, never joined into a real path, so this stays as
+    safe as the plain-name case below. Windows also treats ``C:name`` as
+    a drive-relative path, hence the colon check.
     """
     cleaned = name.strip()
+    if cleaned.endswith(".toml"):
+        cleaned = _PATH_SPLIT.split(cleaned)[-1][: -len(".toml")]
     if not cleaned:
         raise InvalidInputError("a cut list needs a name")
     if cleaned in {".", ".."} or any(bad in cleaned for bad in ("/", "\\", ":")):
@@ -237,19 +289,53 @@ def cutlist_path(name: str) -> Path:
     return paths().cutlist(validate_name(name))
 
 
+def cutlists_dir() -> Path:
+    """Where every cut list lives, without needing one's name.
+
+    BUGS.md entry 27: `` `assemble list` `` enumerates this directory.
+    """
+    return paths().root / C.CUTLISTS_DIRNAME
+
+
+def newest_cutlist_paths() -> tuple[Path, ...]:
+    """Every `.toml` cut list file, most recently modified first.
+
+    Shared by `assemble list` (CLI) and the TUI's cut list picker so the two
+    surfaces agree on order — one rule, stated once. The name tiebreaks equal
+    mtimes (same-tick writes on coarse-granularity filesystems) so the order
+    is still deterministic.
+    """
+    directory = cutlists_dir()
+    if not directory.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            directory.glob("*.toml"),
+            key=lambda p: (p.stat().st_mtime, p.name),
+            reverse=True,
+        )
+    )
+
+
 # -- building from a plan ---------------------------------------------
 
 
-def from_plan(
+def slots_from_plan(
     plan: Plan,
     *,
-    name: str,
-    params: CutlistParams,
-    created_at: str,
     substitutions: Mapping[int, Sequence[SubstitutionHit]],
     speaker_labels: Mapping[int, str],
-) -> CutList:
-    """Turn a coverage plan into the artifact.
+) -> tuple[Slot, ...]:
+    """Dress one coverage plan's slots — the part of :func:`from_plan` that
+    has nothing to do with the whole-cutlist envelope (name, target text,
+    ``created_at``, ``[params]``).
+
+    Split out so a retarget (`rytp.assemble.retarget_cutlist`) can dress a
+    plan covering only the *changed* run of a target exactly the way
+    `assemble_target` dresses one covering the whole sentence — same
+    substitutions, same speaker-label lookup, same alternative pricing —
+    without fabricating an envelope for a plan that is not the whole cut
+    list.
 
     ``substitutions`` is keyed by the gap's first target word;
     ``speaker_labels`` maps ``video_speakers.id`` to a roster label, and
@@ -295,6 +381,7 @@ def from_plan(
                 end_ms=run.end_ms,
                 align_score=run.mean_align,
                 cost=slot.cost,
+                tier=run.tier,
                 video_speaker_id=run.video_speaker_id,
                 speaker_label=(
                     None
@@ -322,14 +409,58 @@ def from_plan(
                 ),
             )
         )
+    return tuple(slots)
+
+
+def from_plan(
+    plan: Plan,
+    *,
+    name: str,
+    params: CutlistParams,
+    created_at: str,
+    substitutions: Mapping[int, Sequence[SubstitutionHit]],
+    speaker_labels: Mapping[int, str],
+    gap_notes: tuple[str, ...] = (),
+) -> CutList:
+    """Turn a coverage plan into the artifact — the whole-sentence case.
+
+    ``substitutions`` is keyed by the gap's first target word;
+    ``speaker_labels`` maps ``video_speakers.id`` to a roster label, and
+    is simply empty for an undiarized corpus.
+    """
     return CutList(
         schema_version=C.CUTLIST_SCHEMA_VERSION,
         name=name,
         target=plan.target,
         created_at=created_at,
         params=params,
-        slots=tuple(slots),
+        slots=slots_from_plan(plan, substitutions=substitutions, speaker_labels=speaker_labels),
+        gap_notes=gap_notes,
     )
+
+
+def target_from_slots(slots: Sequence[Slot]) -> str:
+    """Recompute :attr:`CutList.target` from its slots, in document order.
+
+    Owner's request (superseding an earlier suggestion to mark a
+    hand-edited target "(deviated)"): rather than flag a target that no
+    longer describes its slots, make it always true by deriving it from
+    them. Each slot's ``text`` already holds exactly the words it
+    contributes — a fragment's real spoken text, a gap's still-missing
+    target word — so joining them in slot order reconstructs the
+    sentence the cut list will actually say. A gap keeps its word (the
+    render still reports it as missing); an adopted substitution's text
+    replaces the word it stood in for, because that is the point of
+    adopting it.
+
+    Never call this at plan time: ``assemble_target`` and
+    ``retarget_cutlist`` both write the literal sentence they were asked
+    to find fragments for, because that is the input a plan means to
+    satisfy. This is for afterwards, when a hand edit
+    (``rytp.tui.cutlist_view.CutlistView``'s boundary-editing verbs) has
+    changed what the slots say and the stored target must catch up.
+    """
+    return " ".join(slot.text for slot in slots)
 
 
 # -- the emitter ------------------------------------------------------
@@ -511,6 +642,18 @@ def _str_or(where: str, table: Mapping[str, object], key: str, default: str = ""
     return default if value is None else cast(str, value)
 
 
+def _bool_or(where: str, table: Mapping[str, object], key: str, default: bool) -> bool:
+    """A boolean field with a fallback. Not handled by :func:`_raw`, which
+    deliberately rejects ``bool`` — TOML's ``true``/``false`` would
+    otherwise pass silently as ``int`` 1/0."""
+    if key not in table:
+        return default
+    value = table[key]
+    if not isinstance(value, bool):
+        raise _reject(where, f"{key} must be a boolean, got {value!r}")
+    return value
+
+
 def _opt_str(where: str, table: Mapping[str, object], key: str) -> str | None:
     value = _raw(where, table, key, str, required=False)
     return None if value is None else cast(str, value)
@@ -625,6 +768,7 @@ def _slot(where: str, table: Mapping[str, object]) -> Slot:
         end_ms=end,
         align_score=_opt_float(where, table, "align_score"),
         cost=_opt_float(where, table, "cost"),
+        tier=_str_or(where, table, "tier", C.ALIGNED_WORD_SOURCE),
         video_speaker_id=_opt_int(where, table, "video_speaker_id"),
         speaker_label=_opt_str(where, table, "speaker_label"),
         gap_before_ms=(
@@ -647,6 +791,7 @@ def _params(where: str, table: Mapping[str, object]) -> CutlistParams:
         speaker=_str_or(where, table, "speaker"),
         exclude=tuple(int(item) for item in exclude),
         min_align_score=_float_or(where, table, "min_align_score", C.ASSEMBLE_MIN_ALIGN_SCORE),
+        allow_timed=_bool_or(where, table, "allow_timed", False),
     )
 
 

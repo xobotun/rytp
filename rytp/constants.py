@@ -1179,9 +1179,11 @@ TUI_CUTLIST_SHIFT_NUDGE_MS: Final = 100
 
 # --- Transcript rendering (BUGS.md entry 15) ---
 
-#: Default wrap width, in characters, requested for `transcript show` /
-#: `transcript build`'s `--line-length` knob, so the transcript wraps to a
-#: chosen width instead of whatever the table or the markdown writer decides.
+#: Default maximum characters per transcript row, for `transcript show`'s
+#: `--line-length` knob. Rows are *built* short — split at word boundaries so
+#: each keeps its own real start and end (BUGS.md entry 37) — rather than one
+#: long row being wrapped. `transcript build` has no equivalent knob: it
+#: writes a regenerable file, not a terminal-sized rendering.
 TRANSCRIPT_DEFAULT_LINE_LENGTH: Final = 80
 
 # --- Surfaces (BUGS.md entry 25) ---
@@ -1193,3 +1195,35 @@ TRANSCRIPT_DEFAULT_LINE_LENGTH: Final = 80
 #: reuse the same vocabulary rather than inlining its own glyph.
 CELL_TICK: Final = "✓"
 CELL_CROSS: Final = "✗"
+
+#: Note left on a job the worker finished without running, because its
+#: readiness predicate already answered SATISFIED. Without it the row is
+#: indistinguishable from one that did the work (BUGS.md entry 40).
+JOB_ALREADY_SATISFIED_NOTE: Final = "already satisfied; nothing to do"
+
+# ---------------------------------------------------------------------------
+# --- Worker output (BUGS.md entries 3, 10, 22, 41) ---
+# ---------------------------------------------------------------------------
+# `rytp worker` claimed jobs, ran them and exited in total silence: it wraps
+# every handler call in `PR.install(_DbProgressSink(...))`, which *replaces*
+# the terminal's sink for the whole call rather than joining it. These two
+# constants are for the two kinds of line the fix adds — a lifecycle line
+# per job (claimed, settled) and a periodic queue-stats line — neither of
+# which goes through `rytp/progress.py`'s per-call throttle, because both
+# are discrete events rather than an animation and must survive a redirect
+# to a log file unabridged.
+
+#: How often the worker logs queue stats (counts by state) while it runs, in
+#: seconds. Coarser than `WORKER_POLL_INTERVAL_S`: this is "is the queue
+#: draining", not a repaint, and a quiet queue with nothing pending or
+#: running must not repeat itself every tick.
+WORKER_STATS_LOG_INTERVAL_S: Final = 30.0
+
+#: How many inflected forms to name when a target word was never said in
+#: the exact form asked for. Search falls back to stem matching, so it
+#: shows a hit where assembly refuses — naming the forms the corpus does
+#: have turns an apparent contradiction into an explanation (BUGS.md
+#: entry 46). A handful is enough to recognise the word; a full list
+#: would bury the message.
+ASSEMBLE_STEM_FORM_LIMIT: Final = 3
+

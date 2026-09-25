@@ -4,23 +4,27 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, replace
+from pathlib import Path
+from types import SimpleNamespace
 
 from rytp import constants as C
 from rytp.render import report as R
+from rytp.render import run as RUN
+from rytp.render.canvas import Canvas, SourceGeometry
 
 FRAGMENTS = (
     R.FragmentReport(
         ord=0, video_id=3, video_title="Разговор о выборах", video_url=None,
         speaker="host", source_start_ms=612_340, source_end_ms=613_100,
         output_start_ms=0, output_end_ms=760, gap_after_ms=180,
-        gap_origin="measured", text="мы всё",
+        gap_origin="measured", text="мы всё", tier="aligned",
     ),
     R.FragmentReport(
         ord=1, video_id=9, video_title="Другой | разговор",
         video_url="https://example.invalid/watch/VIDEO_B", speaker=None,
         source_start_ms=220_100, source_end_ms=220_780,
         output_start_ms=940, output_end_ms=1_620, gap_after_ms=0,
-        gap_origin="measured", text="исправит",
+        gap_origin="measured", text="исправит", tier="timed",
     ),
 )
 
@@ -28,13 +32,13 @@ SOURCES = (
     R.SourceReport(
         video_id=3, title="Разговор о выборах", url=None, fragment_count=1,
         used_ms=760, measured_lufs=-23.4, gain_db=7.4, first_output_ms=0,
-        geometry="1280x720 @ 25 fps",
+        geometry="1280x720 @ 25 fps", timed_fragment_count=0,
     ),
     R.SourceReport(
         video_id=9, title="Другой | разговор",
         url="https://example.invalid/watch/VIDEO_B", fragment_count=1,
         used_ms=680, measured_lufs=None, gain_db=None, first_output_ms=940,
-        geometry="640x480 @ 25 fps",
+        geometry="640x480 @ 25 fps", timed_fragment_count=1,
     ),
 )
 
@@ -128,6 +132,136 @@ def test_the_description_block_is_fenced_inside_the_markdown() -> None:
 
 def test_notes_are_rendered_so_a_degenerate_fallback_is_visible() -> None:
     assert "fell back to 180 ms" in R.render_markdown(REPORT)
+
+
+def test_a_timed_tier_fragment_is_marked_in_the_source_list() -> None:
+    """D1: `--allow-timed` has no quality check, so the recorded tier is the
+    only signal a cut came from unaligned data — the render's source list is
+    what the owner publishes, so it must say so (BUGS.md entry 31)."""
+    text = R.render_markdown(REPORT)
+    fragments_section = text[text.index("## Fragments") : text.index("## Words not found")]
+    rows = [line for line in fragments_section.splitlines() if line.startswith("|")]
+    aligned_row = next(r for r in rows if "мы всё" in r)
+    timed_row = next(r for r in rows if "исправит" in r)
+    assert "| aligned |" in aligned_row
+    assert "| timed |" in timed_row
+
+    sources_section = text[text.index("## Sources") : text.index("## Description")]
+    source_rows = [line for line in sources_section.splitlines() if line.startswith("|")]
+    row_3 = next(r for r in source_rows if r.startswith("| 3 "))
+    row_9 = next(r for r in source_rows if r.startswith("| 9 "))
+    assert "timed" not in row_3
+    assert "1 (1 timed)" in row_9
+
+
+def test_a_fragment_with_no_recorded_tier_shows_the_null_placeholder() -> None:
+    """A fragment carrying no tier at all must not be misreported as
+    ``aligned`` — that would hide exactly what entry 31 exists to show."""
+    from dataclasses import replace
+
+    untiered = replace(FRAGMENTS[0], tier=None)
+    report = replace(REPORT, fragments=(untiered, FRAGMENTS[1]))
+    text = R.render_markdown(report)
+    fragments_section = text[text.index("## Fragments") : text.index("## Words not found")]
+    row = next(
+        line
+        for line in fragments_section.splitlines()
+        if line.startswith("|") and "мы всё" in line
+    )
+    assert "| aligned |" not in row
+    assert "| — |" in row
+
+
+def test_request_from_cutlist_carries_each_slots_tier() -> None:
+    """The adapter half of the plumbing (BUGS.md entry 31 / D1): a real cut
+    list slot's ``tier`` must reach :class:`~rytp.render.run.RenderFragment`
+    unchanged, and a slot with no ``tier`` attribute at all — not something
+    Task 6 produces, but the adapter must not invent one — must not be
+    misreported as ``aligned``."""
+    cutlist = SimpleNamespace(
+        name="demo",
+        target="мы всё",
+        slots=(
+            SimpleNamespace(
+                kind="fragment", target_first=0, target_last=0, text="мы",
+                video_id=3, first_word_ord=1, last_word_ord=1,
+                start_ms=0, end_ms=200, tier="aligned",
+            ),
+            SimpleNamespace(
+                kind="fragment", target_first=1, target_last=1, text="всё",
+                video_id=3, first_word_ord=2, last_word_ord=2,
+                start_ms=200, end_ms=400, tier="timed",
+            ),
+            SimpleNamespace(
+                kind="fragment", target_first=2, target_last=2, text="?",
+                video_id=3, first_word_ord=3, last_word_ord=3,
+                start_ms=400, end_ms=600,
+                # deliberately no `tier` attribute
+            ),
+        ),
+    )
+    request = RUN.request_from_cutlist(cutlist)
+    assert [f.tier for f in request.fragments] == ["aligned", "timed", None]
+
+
+def test_build_report_marks_a_timed_fragment_in_the_source_list() -> None:
+    """The render side of D1: a fragment cut under `--allow-timed` must show
+    up in the render's own report, not only at plan time, and a source made
+    entirely of `aligned` fragments must report zero timed fragments."""
+    geometry = SourceGeometry(width=1280, height=720, fps=25.0)
+    source = RUN.SourceMedia(
+        video_id=3, title="Разговор", url=None,
+        video_path=Path("video.mp4"), audio_path=Path("audio.m4a"),
+        geometry=geometry,
+    )
+    aligned_fragment = RUN.RenderFragment(
+        video_id=3, first_word_ord=1, last_word_ord=1,
+        start_ms=0, end_ms=200, text="мы", tier="aligned",
+    )
+    timed_fragment = RUN.RenderFragment(
+        video_id=3, first_word_ord=2, last_word_ord=2,
+        start_ms=200, end_ms=400, text="всё", tier="timed",
+    )
+    plan = RUN.RenderPlan(
+        render_id="demo-1a2b3c4d",
+        request=RUN.RenderRequest(name="demo", fragments=(aligned_fragment, timed_fragment)),
+        options=RUN.RenderOptions(),
+        canvas=Canvas(width=1280, height=720, fps=25, mode="letterbox"),
+        fragments=(
+            RUN.PlannedFragment(
+                ord=0, fragment=aligned_fragment, source=source,
+                gap_after_ms=0, gap_origin="measured",
+                output_start_ms=0, output_end_ms=200,
+                intermediate=Path("0.mp4"),
+            ),
+            RUN.PlannedFragment(
+                ord=1, fragment=timed_fragment, source=source,
+                gap_after_ms=0, gap_origin="measured",
+                output_start_ms=200, output_end_ms=400,
+                intermediate=Path("1.mp4"),
+            ),
+        ),
+        sources=(source,),
+        output_dir=Path("out"), output_path=Path("out/output.mp4"),
+        report_path=Path("out/report.md"), list_file=Path("out/concat.txt"),
+        duration_ms=400, notes=(),
+    )
+    report = RUN.build_report(plan, notes=(), created_at="2026-09-25T00:00:00+00:00")
+    assert report.fragments[0].tier == "aligned"
+    assert report.fragments[1].tier == "timed"
+    assert report.sources[0].timed_fragment_count == 1
+
+    text = R.render_markdown(report)
+    sources_section = text[text.index("## Sources") : text.index("## Description")]
+    row = next(line for line in sources_section.splitlines() if line.startswith("| 3 "))
+    assert "1 timed" in row
+
+
+def test_a_source_cut_entirely_from_aligned_fragments_reports_no_timed() -> None:
+    text = R.render_markdown(REPORT)  # both REPORT sources: 1 aligned, 1 timed
+    sources_section = text[text.index("## Sources") : text.index("## Description")]
+    row_3 = next(line for line in sources_section.splitlines() if line.startswith("| 3 "))
+    assert "timed" not in row_3
 
 
 def test_the_whole_report_is_json_serialisable() -> None:

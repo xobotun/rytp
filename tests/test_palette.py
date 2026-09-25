@@ -10,6 +10,7 @@ from rytp.commands import Command, CommandResult, Param
 from rytp.models import InvalidInputError
 from rytp.tui.palette import (
     cli_invocation,
+    group_heading,
     match_entries,
     palette_entries,
     parse_arguments,
@@ -261,3 +262,35 @@ def test_cli_invocation_renders_flags_and_omits_defaults() -> None:
     assert cli_invocation(SYNC, {"channel": "Channel One"}) == (
         'rytp channel sync "Channel One"'
     )
+
+
+# -- entry 6, palette half: GROUP_SUMMARIES reaches the TUI ------------------
+
+
+def test_group_heading_says_what_the_group_is_about() -> None:
+    """contracts §5: both surfaces read `GROUP_SUMMARIES` and describe a
+    group the same way — the CLI's `_group_help` and this palette heading."""
+    heading = group_heading("videos", {"videos": "the local video catalog"})
+    assert heading == "videos — the local video catalog"
+
+
+def test_group_heading_never_restates_the_command_list() -> None:
+    """The summary says what the group is *about*; the commands underneath
+    it are their own rows already, so the heading must not repeat them."""
+    heading = group_heading("channel", {"channel": "the channels videos are catalogued from"})
+    assert "sync" not in heading
+    assert "add" not in heading
+
+
+def test_group_heading_falls_back_to_the_bare_group_name() -> None:
+    """A group with no entry in `GROUP_SUMMARIES` is a registration error
+    the consistency suite already refuses (`commands.__init__._validate`),
+    but the heading itself degrades rather than raising, since it only
+    renders what it is given."""
+    assert group_heading("mystery", {}) == "mystery"
+
+
+def test_group_heading_reads_the_real_registry_by_default() -> None:
+    """Without an explicit table, both surfaces read the same
+    `GROUP_SUMMARIES` the registry ships (contracts §5)."""
+    assert group_heading("videos") == "videos — the local video catalog"

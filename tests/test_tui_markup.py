@@ -45,6 +45,14 @@ _OWNED_MODULES = (
     _REPO_ROOT / "rytp" / "tui" / "screens" / "speakers.py",
     _REPO_ROOT / "rytp" / "tui" / "screens" / "transcript.py",
     _REPO_ROOT / "rytp" / "tui" / "screens" / "search.py",
+    _REPO_ROOT / "rytp" / "tui" / "screens" / "videos.py",
+    _REPO_ROOT / "rytp" / "tui" / "confirm.py",
+    # The help screen renders a bindings table and the tier glossary, both
+    # built from data. It was left out when this sweep was written and the
+    # omission was noticed twice before it was closed — a module that draws
+    # text belongs here whether or not the task adding it happened to own
+    # this file.
+    _REPO_ROOT / "rytp" / "tui" / "screens" / "help.py",
 )
 
 

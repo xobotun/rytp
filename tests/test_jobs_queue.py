@@ -58,6 +58,24 @@ def test_enqueue_raises_priority_but_never_lowers_it(db: Database) -> None:
     assert Q.list_jobs(db)[0].priority == 5
 
 
+def test_list_jobs_is_newest_first_regardless_of_priority(db: Database) -> None:
+    """Display order, not :func:`claim`'s scheduling order — a low-priority
+    job queued after a high-priority one still lists above it."""
+    a = make_video(db, external_id="VIDEO_A", url="https://example.invalid/a")
+    b = make_video(db, external_id="VIDEO_B", url="https://example.invalid/b")
+    first = Q.enqueue(db, "download", a, priority=9, now=NOW)
+    second = Q.enqueue(db, "download", b, priority=0, now=NOW)
+    assert [j.id for j in Q.list_jobs(db)] == [second, first]
+
+
+def test_cancellable_is_newest_first(db: Database) -> None:
+    a = make_video(db, external_id="VIDEO_A", url="https://example.invalid/a")
+    b = make_video(db, external_id="VIDEO_B", url="https://example.invalid/b")
+    first = Q.enqueue(db, "download", a, now=NOW)
+    second = Q.enqueue(db, "download", b, now=NOW)
+    assert [j.id for j in Q.cancellable(db, kind="download")] == [second, first]
+
+
 def test_claim_moves_pending_to_running_and_burns_an_attempt(db: Database) -> None:
     vid = make_video(db)
     Q.enqueue(db, "download", vid, now=NOW)
@@ -406,3 +424,37 @@ def test_progress_is_distinct_from_note(db: Database) -> None:
     job = Q.list_jobs(db)[0]
     assert job.note == "discarded 4 speaker labels"
     assert job.progress is None
+
+
+def test_re_enqueue_replaces_a_stale_payload(db: Database) -> None:
+    """The owner's report: a `transcribe` job cancelled while stamped
+    `gigaam`, then enqueued again with `whisper` as the default, reopened
+    still carrying `gigaam` — so it would have run the engine they had
+    just stopped asking for. The payload is the input to the work; a
+    request with different inputs must not inherit the old ones."""
+    video_id = make_video(db)
+    job_id = Q.enqueue(db, "transcribe", video_id, payload={"transcriber": "gigaam"})
+    Q.cancel(db, [Q.get_job(db, job_id)])
+    assert Q.get_job(db, job_id).state == "cancelled"
+
+    again = Q.enqueue(db, "transcribe", video_id, payload={"transcriber": "whisper"})
+
+    assert again == job_id, "re-enqueue should reuse the row, not duplicate the work"
+    reopened = Q.get_job(db, again)
+    assert reopened.state != "cancelled"
+    assert reopened.payload == {"transcriber": "whisper"}
+
+
+def test_a_running_job_keeps_the_payload_it_started_with(db: Database) -> None:
+    """Work in flight cannot have its parameters changed underneath it."""
+    video_id = make_video(db)
+    job_id = Q.enqueue(db, "transcribe", video_id, payload={"transcriber": "gigaam"})
+    db.conn.execute("UPDATE jobs SET state = 'running' WHERE id = ?", (job_id,))
+    db.conn.commit()
+
+    Q.enqueue(db, "transcribe", video_id, payload={"transcriber": "whisper"})
+
+    still = Q.get_job(db, job_id)
+    assert still.state == "running"
+    assert still.payload == {"transcriber": "gigaam"}
+

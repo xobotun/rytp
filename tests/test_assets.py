@@ -54,6 +54,16 @@ def test_video_renditions_accumulate_but_one_per_format(db: Database, tmp_path: 
     assert {Path(r["path"]).name for r in rows} == {"v360b.mp4", "v720.mp4"}
 
 
+def test_assets_for_lists_newest_first(db: Database, tmp_path: Path) -> None:
+    vid = make_video(db)
+    first = insert_asset(db, video_id=vid, role="video", format_id="360",
+                          path=str(touch(tmp_path / "v360.mp4")))
+    second = insert_asset(db, video_id=vid, role="video", format_id="720",
+                           path=str(touch(tmp_path / "v720.mp4")))
+    assert [r["id"] for r in assets_for(db, vid, "video")] == [second, first]
+    assert [r["id"] for r in assets_for(db, vid)] == [second, first]
+
+
 def test_asset_for_returns_the_newest_rendition(db: Database, tmp_path: Path) -> None:
     vid = make_video(db)
     insert_asset(db, video_id=vid, role="video", format_id="360",

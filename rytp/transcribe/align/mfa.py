@@ -13,6 +13,14 @@ Download the models once with ``mfa model download acoustic russian_mfa`` and
 
 MFA reports no per-word confidence, so spans come back with ``score=None``
 and the pipeline substitutes the measured boundary quality instead.
+
+**The persistent worker seam (``rytp.transcribe.subproc``) does not remove
+MFA's per-call reload.** ``child_main`` below still shells out to a fresh
+``mfa align`` process every call — MFA has no long-lived server mode this
+adapter can talk to instead, so its acoustic model is reloaded by that
+external binary each time regardless of how long *this* Python child stays
+resident. The seam still saves the Python interpreter start/import cost,
+just not the dominant one.
 """
 from __future__ import annotations
 

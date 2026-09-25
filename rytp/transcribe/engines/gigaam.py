@@ -28,7 +28,7 @@ from rytp import constants as C
 from rytp.models import RawWord, RytpError
 from rytp.transcribe.base import slice_wav_window
 from rytp.transcribe.registry import register_transcriber
-from rytp.transcribe.subproc import resolve_device, run_child
+from rytp.transcribe.subproc import load_cached, resolve_device, run_child
 
 
 def words_from_gigaam(result: dict[str, Any], offset_ms: int) -> list[dict[str, Any]]:
@@ -63,6 +63,10 @@ class GigaAMTranscriber:
     #: ``device`` starts as whatever was requested and, after the first
     #: call, holds the concrete device the child actually used.
     device = C.ENGINE_DEFAULT_DEVICE
+    #: Contracts §6: a transcriber has no `words.align_score` to report, so
+    #: this is a fixed, honest placeholder — see
+    #: :class:`rytp.transcribe.engines.whisper.FasterWhisperTranscriber`.
+    score_scale = C.ALIGN_SCALE_NONE
 
     def __init__(
         self,
@@ -77,6 +81,10 @@ class GigaAMTranscriber:
         #: re-deriving it, so a foreground result and a queued job's note
         #: both say what ran (BUGS.md entry 34).
         self.device = device
+        #: Non-fatal findings from the last :meth:`transcribe` call (contracts
+        #: §6's engine notes channel). A genuine instance attribute — see
+        #: :class:`rytp.transcribe.engines.whisper.FasterWhisperTranscriber`.
+        self.notes: list[str] = []
 
     def transcribe(
         self,
@@ -121,6 +129,12 @@ def child_main(request: dict[str, Any]) -> dict[str, Any]:
     ``load_model``'s documented signature accepts it; if the installed
     version spells device placement differently, this function — and only
     this function — is what changes.
+
+    The model load is cached across calls in this process via
+    :func:`load_cached`, keyed by ``(model, device)`` — the whole point of
+    the persistent worker seam (``rytp.transcribe.subproc``'s module
+    docstring). Only the load is cached; each call still transcribes its own
+    window.
     """
     import tempfile
 
@@ -129,10 +143,13 @@ def child_main(request: dict[str, Any]) -> dict[str, Any]:
     device = resolve_device(str(request.get("device") or C.ENGINE_DEFAULT_DEVICE))
     start_ms = int(request["start_ms"])
     end_ms = request["end_ms"]
+    model_name = str(request["model"])
+    model = load_cached(
+        ("gigaam", model_name, device), lambda: gigaam.load_model(model_name, device=device)
+    )
     with tempfile.TemporaryDirectory(prefix="rytp-gigaam-") as tmp:
         window = slice_wav_window(
             Path(request["audio"]), Path(tmp) / "window.wav", start_ms, end_ms
         )
-        model = gigaam.load_model(request["model"], device=device)
         result = model.transcribe(str(window))
     return {"words": words_from_gigaam(dict(result), start_ms), "device": device}

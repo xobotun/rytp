@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import os
 import random
 import threading
 from datetime import UTC, datetime, timedelta
@@ -9,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from rytp import constants as C
+from rytp import progress as PR
 from rytp.acquire.policy import (
     DownloadPolicy,
     RateLimited,
@@ -22,6 +25,20 @@ from rytp.jobs import Readiness
 from rytp.jobs import queue as Q
 from rytp.jobs import worker as W
 from tests.fakes import make_video, temp_job_kind, touch
+
+
+class _FakeTty(io.StringIO):
+    """Claims to be a terminal, like `tests/test_progress.py`'s fixture."""
+
+    def isatty(self) -> bool:  # type: ignore[override]
+        return True
+
+
+class _FakeNonTty(io.StringIO):
+    """A redirected-to-a-file stream: never a terminal."""
+
+    def isatty(self) -> bool:  # type: ignore[override]
+        return False
 
 NOW = datetime(2026, 9, 21, 12, 0, 0, tzinfo=UTC)
 
@@ -114,6 +131,11 @@ def test_a_job_satisfied_since_enqueue_skips_its_handler(db: Database) -> None:
         did, report, _ = _tick(db, "cpu")
     assert did is True and calls == []
     assert report.done == 1 and Q.list_jobs(db)[0].state == "done"
+    # BUGS.md entry 40: skipping must not look like working. Without the
+    # note this row is a blank-noted `done`, exactly what a successful run
+    # leaves — which is how "I queued a transcribe and nothing happened"
+    # presents when the video already had words.
+    assert Q.list_jobs(db)[0].note == C.JOB_ALREADY_SATISFIED_NOTE
 
 
 def test_a_job_blocked_since_enqueue_is_parked(db: Database) -> None:
@@ -449,3 +471,238 @@ def test_a_handler_that_reports_nothing_leaves_progress_untouched(db: Database) 
         Q.enqueue(db, "t_prog_quiet", make_video(db), now=NOW)
         _tick(db, "cpu")
     assert Q.list_jobs(db)[0].progress is None
+
+
+# ---------------------------------------------------------------------------
+# The worker's own output (BUGS.md entries 3, 10, 22, 41): `rytp worker`
+# used to claim jobs, run them and exit in total silence, because
+# installing the database progress sink replaced the terminal's sink for
+# the whole handler call instead of joining it.
+# ---------------------------------------------------------------------------
+
+
+def test_a_claimed_job_is_announced(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeNonTty()
+    monkeypatch.setattr(W.sys, "stderr", fake)
+    with temp_job_kind("t_ok", "cpu", lambda db_, t, p: None):
+        vid = make_video(db)
+        Q.enqueue(db, "t_ok", vid, now=NOW)
+        _tick(db, "cpu")
+    lines = fake.getvalue()
+    assert f"job 1 claimed: kind=t_ok target={vid} pool=cpu" in lines
+
+
+def test_a_successful_job_settles_with_its_note_and_no_control_characters(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeNonTty()
+    monkeypatch.setattr(W.sys, "stderr", fake)
+    with temp_job_kind("t_note", "cpu", lambda db_, t, p: "labels discarded"):
+        Q.enqueue(db, "t_note", make_video(db), now=NOW)
+        _tick(db, "cpu")
+    lines = fake.getvalue()
+    assert "job 1 done in" in lines
+    assert "note=labels discarded" in lines
+    # Redirected to a file (the owner's `cmd /c "... > run.log 2>&1"`):
+    # plain lines only, never a repaint escape.
+    assert "\x1b" not in lines
+    assert "\r" not in lines
+
+
+def test_a_job_already_satisfied_is_announced_settled_not_silently_dropped(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeNonTty()
+    monkeypatch.setattr(W.sys, "stderr", fake)
+    with temp_job_kind(
+        "t_sat", "cpu", lambda db_, t, p: None,
+        readiness=lambda db_, t: Readiness.SATISFIED,
+    ):
+        vid = make_video(db)
+        db.conn.execute(
+            "INSERT INTO jobs (kind, target_id, state, pool, payload_json, created_at) "
+            "VALUES ('t_sat', ?, 'pending', 'cpu', '{}', ?)",
+            (vid, NOW.isoformat()),
+        )
+        _tick(db, "cpu")
+    lines = fake.getvalue()
+    assert "job 1 claimed" in lines
+    assert "job 1 done in" in lines
+    assert f"note={C.JOB_ALREADY_SATISFIED_NOTE}" in lines
+
+
+def test_a_blocked_job_is_announced_settled(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeNonTty()
+    monkeypatch.setattr(W.sys, "stderr", fake)
+    with temp_job_kind(
+        "t_blk", "cpu", lambda db_, t, p: None,
+        readiness=lambda db_, t: Readiness.BLOCKED,
+    ):
+        vid = make_video(db)
+        db.conn.execute(
+            "INSERT INTO jobs (kind, target_id, state, pool, payload_json, created_at) "
+            "VALUES ('t_blk', ?, 'pending', 'cpu', '{}', ?)",
+            (vid, NOW.isoformat()),
+        )
+        _tick(db, "cpu")
+    lines = fake.getvalue()
+    assert "job 1 blocked in" in lines
+
+
+def test_a_failed_job_settles_with_its_error(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeNonTty()
+    monkeypatch.setattr(W.sys, "stderr", fake)
+
+    def gone(db_, t, p):
+        raise VideoUnavailable("Private video")
+
+    with temp_job_kind("t_gone", "network", gone):
+        Q.enqueue(db, "t_gone", make_video(db), now=NOW)
+        _tick(db, "network")
+    lines = fake.getvalue()
+    assert "job 1 failed in" in lines
+    assert "error=Private video" in lines
+
+
+def test_a_throttled_job_settles_as_deferred(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeNonTty()
+    monkeypatch.setattr(W.sys, "stderr", fake)
+
+    def boom(db_, t, p):
+        raise RateLimited("HTTP Error 429")
+
+    with temp_job_kind("t_429", "network", boom):
+        Q.enqueue(db, "t_429", make_video(db), now=NOW)
+        _tick(db, "network")
+    lines = fake.getvalue()
+    assert "job 1 deferred in" in lines
+
+
+def test_the_worker_still_writes_the_db_progress_column_off_tty(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeNonTty()
+    monkeypatch.setattr(PR.sys, "stderr", fake)
+
+    def handler(db_, t, p):
+        PR.report("stage", done=1, total=2)
+
+    with temp_job_kind("t_prog", "cpu", handler):
+        Q.enqueue(db, "t_prog", make_video(db), now=NOW)
+        _tick(db, "cpu")
+    # The animation itself must not reach a non-tty stream (BUGS.md entry
+    # 22's precedent, still honoured), but the lifecycle lines do, and the
+    # db write (already covered above) is unaffected either way.
+    assert "stage 1/2" not in fake.getvalue()
+    assert "job 1 claimed" in fake.getvalue()
+    assert "job 1 done" in fake.getvalue()
+
+
+def test_a_handlers_progress_reaches_the_terminal_and_the_db_together(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The bug: installing the db sink used to *replace* the terminal's
+    # sink for the whole handler call, so a foreground `rytp worker` never
+    # printed a chunk's progress even when stderr was a live terminal.
+    fake = _FakeTty()
+    monkeypatch.setattr(PR.sys, "stderr", fake)
+
+    def handler(db_, t, p):
+        PR.report("chunk", done=1, total=2)
+
+    with temp_job_kind("t_prog_tty", "cpu", handler):
+        vid = make_video(db)
+        Q.enqueue(db, "t_prog_tty", vid, now=NOW)
+        _tick(db, "cpu")
+        row = db.conn.execute(
+            "SELECT progress FROM jobs WHERE target_id = ?", (vid,)
+        ).fetchone()
+    assert "chunk 1/2" in fake.getvalue()
+    assert row["progress"] is None  # cleared once the job left `running`
+
+
+def test_current_and_combine_fan_a_report_out_to_both_sinks() -> None:
+    calls: list[str] = []
+    with PR.install(lambda s, d, t, x: calls.append(f"outer:{s}")):
+        outer = PR.current()
+        with PR.install(PR.combine(outer, lambda s, d, t, x: calls.append(f"inner:{s}"))):
+            PR.report("stage")
+    assert calls == ["outer:stage", "inner:stage"]
+
+
+def test_combine_runs_every_sink_even_if_one_raises() -> None:
+    calls: list[str] = []
+
+    def boom(s, d, t, x):
+        raise RuntimeError("a broken sink must not silence the others")
+
+    sink = PR.combine(boom, lambda s, d, t, x: calls.append(s))
+    sink("stage", None, None, "")
+    assert calls == ["stage"]
+
+
+def test_stats_log_is_silent_on_an_idle_queue(db: Database) -> None:
+    with temp_job_kind("t_quiet", "cpu", lambda db_, t, p: None):
+        Q.enqueue(db, "t_quiet", make_video(db), now=NOW)
+        _tick(db, "cpu")  # runs to completion: nothing pending or running
+    lines: list[str] = []
+    monkeypatch_log = W._log
+    try:
+        W._log = lines.append  # type: ignore[assignment]
+        W._log_stats(db)
+    finally:
+        W._log = monkeypatch_log  # type: ignore[assignment]
+    assert lines == []
+
+
+def test_stats_log_reports_counts_while_work_remains(db: Database) -> None:
+    with temp_job_kind("t_pending", "cpu", lambda db_, t, p: None):
+        Q.enqueue(db, "t_pending", make_video(db), now=NOW)
+    lines: list[str] = []
+    monkeypatch_log = W._log
+    try:
+        W._log = lines.append  # type: ignore[assignment]
+        W._log_stats(db)
+    finally:
+        W._log = monkeypatch_log  # type: ignore[assignment]
+    assert len(lines) == 1
+    assert "pending=1" in lines[0]
+
+
+def test_the_threaded_worker_logs_lifecycle_lines_too(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeNonTty()
+    monkeypatch.setattr(W.sys, "stderr", fake)
+    with temp_job_kind("t_cpu", "cpu", lambda db_, t, p: None):
+        Q.enqueue(db, "t_cpu", make_video(db), now=NOW)
+        W.run_worker(
+            db,
+            W.WorkerOptions(pools=("cpu",), max_jobs=1, poll_interval_s=0.01),
+        )
+    lines = fake.getvalue()
+    assert "job 1 claimed: kind=t_cpu" in lines
+    assert "job 1 done in" in lines
+
+
+def test_the_worker_says_it_started(db: Database, capsys) -> None:
+    """A worker started against an empty queue must not be silent.
+
+    Otherwise it is indistinguishable from one that failed to start —
+    the doubt BUGS.md entries 41 and 42 are both about. The pid is named
+    so an operator can match this line to the lease `jobs list` reads.
+    """
+    W.run_worker(db, W.WorkerOptions(pools=("cpu",), once=True))
+    err = capsys.readouterr().err
+    assert "watching pools" in err
+    assert "cpu" in err
+    assert str(os.getpid()) in err
+

@@ -60,6 +60,10 @@ class FasterWhisperTranscriber:
     #: own ``"auto"`` resolves to CUDA when available — so this adapter only
     #: needed to *report* the resolved choice, not add placement.
     device = "auto"
+    #: Contracts §6: a transcriber has no `words.align_score` to report, so
+    #: this is a fixed, honest placeholder — not "unknown", which contracts
+    #: §6 reserves for an engine that predates the attribute entirely.
+    score_scale = C.ALIGN_SCALE_NONE
 
     def __init__(
         self,
@@ -74,6 +78,12 @@ class FasterWhisperTranscriber:
         #: concrete device ctranslate2 actually resolved ``"auto"`` to.
         #: Callers read this rather than re-deriving it (BUGS.md entry 34).
         self.device = device
+        #: Non-fatal findings from the last :meth:`transcribe` call (contracts
+        #: §6's engine notes channel). A genuine instance attribute, never a
+        #: shared `ClassVar` — this engine never has anything to report, but
+        #: the channel still has to be a real per-instance list to satisfy
+        #: `Transcriber.notes` the same way as every other engine.
+        self.notes: list[str] = []
 
     def _load(self) -> Any:
         if self._model is None:

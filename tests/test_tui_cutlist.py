@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -101,6 +102,19 @@ def test_the_picker_lists_what_is_on_disk(written: Path) -> None:
     assert listed[0].gaps == 1
     assert listed[0].sources == 1
     assert listed[0].error is None
+
+
+def test_the_picker_lists_the_most_recently_modified_first(
+    written: Path, data_dir: object
+) -> None:
+    import os
+
+    from rytp.assemble.cutlist import cutlist_path
+
+    os.utime(written, (1_700_000_000, 1_700_000_000))
+    other = write_cutlist(dataclasses.replace(sample(), name="other"), cutlist_path("other"))
+    os.utime(other, (1_800_000_000, 1_800_000_000))
+    assert [item.name for item in available_cutlists()] == ["other", "demo"]
 
 
 def test_a_broken_file_is_listed_with_its_complaint_not_hidden(
@@ -343,6 +357,114 @@ def test_undo_walks_back_through_every_kind_of_edit(written: Path) -> None:
     assert "nothing to undo" in view.undo().lower()
 
 
+def test_removing_a_fragment_drops_it_rather_than_turning_it_into_a_gap(
+    written: Path,
+) -> None:
+    """The task's real decision: a removed fragment is not a gap. A gap means
+    the corpus does not say the word (BUGS.md entry 46); removing a fragment
+    the owner no longer wants in the splice is a different fact, so the slot
+    is dropped from the sequence outright rather than relabelled `kind =
+    "gap"` — which would otherwise reach the render's report and source list
+    as "never said in the corpus" for a word that plainly was."""
+    view = CutlistView(written)
+    assert len(view.cutlist.slots) == 2
+    message = view.remove(0)
+    assert "removed" in message.lower()
+    assert len(view.cutlist.slots) == 1
+    # What is left is the gap that was already there — untouched, and never
+    # relabelled from the removed fragment.
+    assert view.cutlist.slots[0].kind == "gap"
+    assert view.cutlist.slots[0].text == "исправим"
+    assert view.dirty is True
+
+
+def test_removing_the_only_slot_left_is_refused(tmp_path: Path, data_dir: object) -> None:
+    """`load_cutlist` itself refuses a file with no `[[slot]]` tables at all
+    — this borrows that rule rather than saving something unreadable."""
+    from rytp.assemble.cutlist import cutlist_path
+
+    one_slot = dataclasses.replace(sample(), slots=(sample().slots[1],))
+    path = write_cutlist(one_slot, cutlist_path("onlyone"))
+    view = CutlistView(path)
+    message = view.remove(0)
+    assert "cannot remove" in message.lower()
+    assert len(view.cutlist.slots) == 1
+    assert view.dirty is False
+
+
+def test_removing_a_fragment_recomputes_the_target(written: Path) -> None:
+    """Owner's request: rather than mark a hand-edited target
+    "(deviated)", the stored target is recomputed from the slots so it is
+    always true. Removing the fragment drops its words from the target
+    too — the splice no longer says them."""
+    view = CutlistView(written)
+    view.remove(0)
+    assert view.cutlist.target == "исправим"
+
+
+def test_adopting_a_substitution_recomputes_the_target(written: Path) -> None:
+    """`каннибализм` becoming `каннибализмом`, in miniature: adopting the
+    ranked substitution for the gap changes what the target says, because
+    that is the point of adopting it."""
+    view = CutlistView(written)
+    view.swap(1, 0)
+    assert view.cutlist.target == "мы всё исправит"
+
+
+def test_nudging_does_not_disturb_the_target(written: Path) -> None:
+    """A boundary edit changes no words, so the recomputed target is
+    unchanged — recomputing on every edit must be a safe no-op for edits
+    that never touched any text."""
+    view = CutlistView(written)
+    view.nudge(0, edge="start", delta_ms=-C.TUI_CUTLIST_NUDGE_MS)
+    assert view.cutlist.target == "мы всё исправим"
+
+
+def test_the_recomputed_target_is_what_a_save_writes(written: Path) -> None:
+    """The file is the durable representation; a picker (`assemble show`,
+    the TUI's own picker) reads `target` straight off disk, so it must be
+    the recomputed one, not the one the cut list was originally planned
+    from."""
+    view = CutlistView(written)
+    view.remove(0)
+    reloaded = load_cutlist(view.save())
+    assert reloaded.target == "исправим"
+
+
+def test_recomputing_the_target_never_renames_the_file(written: Path) -> None:
+    """The name is slugged from the *original* target at plan time and is
+    the cut list's stable identity (`assemble show <name>`, `render run
+    <name>`) — a file that renamed itself as it was edited would break
+    every reference to it, so recomputing `target` must never touch
+    `name`."""
+    view = CutlistView(written)
+    view.remove(0)
+    assert view.cutlist.name == "demo"
+    assert view.path == written
+
+
+def test_removal_survives_a_save_and_load_round_trip(written: Path) -> None:
+    view = CutlistView(written)
+    view.remove(0)
+    reloaded = load_cutlist(view.save())
+    assert len(reloaded.slots) == 1
+    assert reloaded.slots[0].kind == "gap"
+    assert reloaded.slots[0].text == "исправим"
+
+
+def test_undo_restores_a_removed_slot(written: Path) -> None:
+    view = CutlistView(written)
+    view.remove(0)
+    view.undo()
+    assert view.cutlist == load_cutlist(written)
+    assert view.dirty is False
+
+
+def test_an_index_off_the_end_has_nothing_to_remove(written: Path) -> None:
+    view = CutlistView(written)
+    assert "no slot" in view.remove(99).lower()
+
+
 def test_saving_round_trips_through_the_file_part_five_wrote(written: Path) -> None:
     """The file is the durable representation (design §8), so what the screen
     saves must be what Part 6 can read."""
@@ -422,6 +544,52 @@ def test_a_fragment_with_no_alternatives_says_so(written: Path, tmp_path: Path) 
     assert "no alternative" in view.swap(0, 0).lower()
 
 
+# --- playing what's selected (the owner's F8 request) ---------------------
+
+
+def test_play_target_of_a_fragment_is_its_current_edited_span(written: Path) -> None:
+    """Not re-derived from word ordinals: a nudge must be audible."""
+    view = CutlistView(written)
+    view.nudge(0, edge="start", delta_ms=C.TUI_CUTLIST_NUDGE_MS)
+    slot = view.slot_at(0)
+    assert slot is not None
+    assert slot.video_id is not None
+    assert slot.start_ms is not None
+    assert slot.end_ms is not None
+    assert view.play_target(0, None) == (slot.video_id, slot.start_ms, slot.end_ms)
+
+
+def test_play_target_of_a_gap_is_none(written: Path) -> None:
+    view = CutlistView(written)
+    assert view.play_target(1, None) is None
+
+
+def test_play_target_of_an_alternative_is_the_alternatives_own_span(written: Path) -> None:
+    view = CutlistView(written)
+    slot = view.slot_at(0)
+    assert slot is not None
+    alt = slot.alternatives[0]
+    assert view.play_target(0, 0) == (alt.video_id, alt.start_ms, alt.end_ms)
+
+
+def test_play_target_of_a_substitution_is_the_substitutions_own_span(written: Path) -> None:
+    view = CutlistView(written)
+    slot = view.slot_at(1)
+    assert slot is not None
+    sub = slot.substitutions[0]
+    assert view.play_target(1, 0) == (sub.video_id, sub.start_ms, sub.end_ms)
+
+
+def test_play_target_of_an_out_of_range_option_is_none(written: Path) -> None:
+    view = CutlistView(written)
+    assert view.play_target(0, 9) is None
+
+
+def test_play_target_of_a_missing_slot_is_none(written: Path) -> None:
+    view = CutlistView(written)
+    assert view.play_target(99, None) is None
+
+
 # --- the screens ---------------------------------------------------------
 
 import asyncio  # noqa: E402
@@ -429,6 +597,7 @@ from collections.abc import Awaitable, Callable  # noqa: E402
 from typing import Any  # noqa: E402
 
 from textual.app import App, ComposeResult  # noqa: E402
+from textual.binding import Binding  # noqa: E402
 from textual.widgets import DataTable, Footer, Static  # noqa: E402
 
 from rytp.db import Database  # noqa: E402
@@ -439,6 +608,13 @@ def drive(
     screen_factory: Callable[[], Any], body: Callable[[Any, Any], Awaitable[None]]
 ) -> None:
     class Harness(App[None]):
+        # Match `RytpApp`, which disables this. A bare `App` leaves it on,
+        # and Textual's palette answers to ctrl+p first — so a harness
+        # without this line makes the real Play binding untestable and
+        # invites the conclusion that ctrl+p does not work, when in the
+        # product it does.
+        ENABLE_COMMAND_PALETTE = False
+
         def compose(self) -> ComposeResult:
             return iter(())
 
@@ -577,6 +753,52 @@ def test_the_help_key_opens_the_help_screen(db: Database, written: Path) -> None
     asyncio.run(main())
 
 
+def test_h_hides_and_shows_the_hint(db: Database, written: Path) -> None:
+    """Owner's request: the hint the owner had to open F1 to discover wraps
+    to several rows in an 80x24 terminal — measure the widget's actual
+    height, not a boolean, since reclaiming rows is the entire point and a
+    flag flipping while the widget still occupies space would pass a
+    weaker test."""
+
+    async def body(screen: Any, pilot: Any) -> None:
+        hint = screen.query_one("#cutlist-hint", Static)
+        # `.region.height` is the measured, laid-out height (what actually
+        # reclaims rows), not `.outer_size`, which stays stale across a
+        # `display` flip until something else forces a fresh arrangement.
+        visible_height = hint.region.height
+        assert visible_height > 1, "the hint should wrap to more than one row at 80 columns"
+
+        await pilot.press("h")
+        await pilot.pause()
+        assert hint.region.height == 0, "hidden should reclaim every row, not just collapse"
+
+        await pilot.press("h")
+        await pilot.pause()
+        assert hint.region.height == visible_height, "pressing h again restores it exactly"
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_hint_is_visible_by_default(db: Database, written: Path) -> None:
+    """Visible by default: it exists for someone meeting the screen for
+    the first time, so a fresh screen must never start hidden."""
+
+    async def body(screen: Any, pilot: Any) -> None:
+        hint = screen.query_one("#cutlist-hint", Static)
+        assert hint.display is True
+        assert hint.region.height > 0
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_hint_names_its_own_off_switch(db: Database, written: Path) -> None:
+    """A hint whose off-switch is undiscoverable is worse than no hint."""
+    from rytp.tui.screens.cutlist import _EDIT_HINT
+
+    assert "h" in _EDIT_HINT.lower()
+    assert "hint" in _EDIT_HINT.lower()
+
+
 def test_the_screens_own_footer_keys_fit_an_80_column_terminal(
     db: Database, written: Path
 ) -> None:
@@ -665,10 +887,468 @@ def test_saving_writes_the_file(db: Database, written: Path) -> None:
 
 
 def test_the_screen_holds_only_its_view(db: Database, written: Path) -> None:
-    """Every decision is `CutlistView`'s; the screen keeps two cursors, and
-    Textual keeps those in the `DataTable`s. Measured against a bare `Screen`,
-    because Textual's own `__init__` sets dozens of attributes."""
+    """Every decision is `CutlistView`'s; the screen keeps two cursors and
+    one playback guard, and Textual keeps the cursors in the `DataTable`s.
+    Measured against a bare `Screen`, because Textual's own `__init__` sets
+    dozens of attributes.
+
+    `_playing` is the one bit of state `ctrl+p` needs: `play_clip` blocks a
+    whole OS thread, so a second press while one clip is still sounding is
+    ignored rather than queued or made to interrupt (see `action_play`)."""
     from textual.screen import Screen
 
     added = set(vars(CutlistScreen(db, written))) - set(vars(Screen()))
-    assert added == {"view", "_db"}
+    assert added == {"view", "_db", "_playing"}
+
+
+# --- ctrl+p: play what's selected (the owner's F8 request) ---------------
+#
+# `play_clip` is never really invoked: `rytp.tui.screens.cutlist.play_clip`
+# is monkeypatched the same way `tests/test_tui_search.py` replaces Task 6's
+# seam, so no test here can make noise. `action_play` schedules its work on
+# a real OS thread (`@work(thread=True)`, entry 22's lesson), so a bare
+# `pilot.pause()` is not enough to observe it land — `wait_for` below polls
+# a handful of times, which is enough for a fake that returns immediately.
+#
+# These call `screen.action_play()` directly rather than `pilot.press
+# ("ctrl+p")`, the same way `tests/test_tui_search.py` exercises the search
+# screen's own `ctrl+p`: Textual's own command-palette binding answers to
+# `ctrl+p` first in a driven test, so the key itself is pinned separately,
+# by `test_the_key_is_bound_to_play` below, and reading `CutlistScreen.
+# BINDINGS` is what proves the wiring rather than a press that never
+# reaches the screen.
+
+
+async def wait_for(pilot: Any, predicate: Callable[[], bool], attempts: int = 50) -> None:
+    for _ in range(attempts):
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+        await pilot.pause()
+    raise AssertionError("the worker never finished")
+
+
+def test_the_key_is_bound_to_play(db: Database, written: Path) -> None:
+    """Pins the wiring `pilot.press` cannot: Textual's own command-palette
+    binding answers to `ctrl+p` before a screen sees it (checked against a
+    real driven app below), so every other test here calls
+    `screen.action_play()` directly, the same way `tests/test_tui_search.py`
+    exercises the search screen's own `ctrl+p`."""
+    bindings = {b.key: b.description for b in CutlistScreen.BINDINGS if isinstance(b, Binding)}
+    assert bindings["ctrl+p"] == "Play fragment"
+
+
+def test_ctrl_p_reaches_the_screen_and_is_not_eaten_by_the_palette(
+    db: Database, written: Path
+) -> None:
+    """Pressing the real key must reach Play.
+
+    Textual's command palette answers to ctrl+p, which is why `RytpApp`
+    sets `ENABLE_COMMAND_PALETTE = False` — the owner confirmed play works
+    on the search screen in the real app. An earlier version of this test
+    drove a bare `App`, where the palette *is* enabled, and so recorded the
+    harness's behaviour as though it were the product's.
+    """
+    from textual.command import CommandPalette
+
+    seen: list[tuple[int, int, int]] = []
+
+    async def body(screen: Any, pilot: Any) -> None:
+        screen.view.play = lambda *a, **k: seen.append(a)  # type: ignore[assignment]
+        await pilot.press("ctrl+p")
+        await pilot.pause()
+        assert not isinstance(screen.app.screen, CommandPalette)
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_current_slot_reflecting_a_nudge_is_what_plays(
+    db: Database, written: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the request: a nudge must be audible, so what
+    plays is the slot's current span, not the one it was planned with."""
+    calls: list[tuple[int, int, int]] = []
+
+    def fake_play_clip(_db: Database, video_id: int, start_ms: int, end_ms: int) -> None:
+        calls.append((video_id, start_ms, end_ms))
+
+    monkeypatch.setattr("rytp.tui.screens.cutlist.play_clip", fake_play_clip)
+
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("[")
+        await pilot.pause()
+        slot = screen.view.slot_at(0)
+        assert slot is not None
+        screen.action_play()
+        await wait_for(pilot, lambda: bool(calls))
+        assert calls == [(slot.video_id, slot.start_ms, slot.end_ms)]
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_options_pane_plays_the_highlighted_alternative(
+    db: Database, written: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(
+        "rytp.tui.screens.cutlist.play_clip",
+        lambda _db, video_id, start_ms, end_ms: calls.append((video_id, start_ms, end_ms)),
+    )
+
+    async def body(screen: Any, pilot: Any) -> None:
+        options_table = screen.query_one("#cutlist-options", DataTable)
+        options_table.focus()
+        await pilot.pause()
+        screen.action_play()
+        await wait_for(pilot, lambda: bool(calls))
+        slot = screen.view.slot_at(0)
+        assert slot is not None
+        alt = slot.alternatives[0]
+        assert calls == [(alt.video_id, alt.start_ms, alt.end_ms)]
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_a_gap_slot_does_nothing_and_says_nothing(
+    db: Database, written: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silent by design: a gap is visibly a gap on screen already, and a key
+    pressed repeatedly while auditioning fragments should not narrate every
+    miss (the owner's amendment to the original brief, which had asked for
+    a status line here)."""
+    calls: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(
+        "rytp.tui.screens.cutlist.play_clip",
+        lambda _db, video_id, start_ms, end_ms: calls.append((video_id, start_ms, end_ms)),
+    )
+
+    async def body(screen: Any, pilot: Any) -> None:
+        screen.query_one("#cutlist-slots", DataTable).move_cursor(row=1)
+        await pilot.pause()
+        status_before = str(screen.query_one("#cutlist-status", Static).content)
+        screen.action_play()
+        await pilot.pause()
+        await pilot.pause()
+        assert calls == []
+        assert str(screen.query_one("#cutlist-status", Static).content) == status_before
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_a_missing_ffplay_is_reported_not_raised(
+    db: Database, written: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rytp.index.export import MediaToolMissing
+
+    def fake_play_clip(_db: Database, video_id: int, start_ms: int, end_ms: int) -> None:
+        raise MediaToolMissing("ffplay not found on PATH. It ships with ffmpeg; install that.")
+
+    monkeypatch.setattr("rytp.tui.screens.cutlist.play_clip", fake_play_clip)
+
+    async def body(screen: Any, pilot: Any) -> None:
+        screen.action_play()
+
+        def landed() -> bool:
+            text = str(screen.query_one("#cutlist-status", Static).content)
+            return "ffplay" in text
+
+        await wait_for(pilot, landed)
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_an_uncached_source_is_reported_not_raised(
+    db: Database, written: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rytp.index.export import ClipError
+
+    def fake_play_clip(_db: Database, video_id: int, start_ms: int, end_ms: int) -> None:
+        raise ClipError(f"video {video_id}: no cached WAV and no audio on disk")
+
+    monkeypatch.setattr("rytp.tui.screens.cutlist.play_clip", fake_play_clip)
+
+    async def body(screen: Any, pilot: Any) -> None:
+        screen.action_play()
+
+        def landed() -> bool:
+            text = str(screen.query_one("#cutlist-status", Static).content)
+            return "no cached wav" in text.lower()
+
+        await wait_for(pilot, landed)
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_a_second_press_while_still_playing_is_ignored(
+    db: Database, written: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The decision this task made: `play_clip` blocks a whole OS thread, so
+    there is no cheap way to cut the first clip off mid-word, and starting a
+    second `ffplay` would only overlap two clips into noise. Set the guard
+    directly rather than racing a real thread — the guard is what this test
+    is pinning, not the timing."""
+    calls: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(
+        "rytp.tui.screens.cutlist.play_clip",
+        lambda _db, video_id, start_ms, end_ms: calls.append((video_id, start_ms, end_ms)),
+    )
+
+    async def body(screen: Any, pilot: Any) -> None:
+        screen._playing = True
+        screen.action_play()
+        await pilot.pause()
+        assert calls == []
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+# --- the owner's three requests: hints, remove, render --------------------
+
+
+def test_the_hint_names_the_keys_the_owner_had_to_hunt_for(
+    db: Database, written: Path
+) -> None:
+    """BUGS.md entry 29 hid the editing keys from the footer to make it fit;
+    the owner then had to open F1 to learn `[`, `]`, `ctrl+left` and
+    `ctrl+right` existed. They belong in the screen's own body instead."""
+
+    async def body(screen: Any, pilot: Any) -> None:
+        text = str(screen.query_one("#cutlist-hint", Static).content)
+        for needle in (
+            "[", "]", "ctrl+left", "ctrl+right", "shift+[", "ctrl+shift+left",
+            "snap", "ctrl+p", "play",
+        ):
+            assert needle in text, needle
+        # The coordinator's addition: the owner found ctrl+p only by being
+        # told it existed, so it belongs alongside the nudge/snap group it
+        # completes rather than only in the footer or F1.
+        assert "ctrl+p" in text and "play" in text.lower()
+        # This task's other two additions must be discoverable the same way.
+        assert "remove" in text.lower()
+        assert "render" in text.lower()
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_hint_is_markup_safe(db: Database, written: Path) -> None:
+    """The irony BUGS.md entry 20 sets up: a hint line advertising `[` and
+    `]` is itself bracket-heavy text — exactly what crashes a bare
+    `Static.update`. Reaching this far without a `MarkupError` is the test."""
+
+    async def body(screen: Any, pilot: Any) -> None:
+        # No exception means the screen rendered; also confirm the literal
+        # brackets survived rather than being silently swallowed as markup.
+        text = str(screen.query_one("#cutlist-hint", Static).content)
+        assert "[ / ]" in text
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_screen_renders_the_hint_at_eighty_columns(
+    db: Database, written: Path
+) -> None:
+    """Entry 29's own lesson: an isolated harness measurement is what let
+    the original footer overflow go unnoticed, so this checks the real,
+    running app at 80 columns rather than trusting that a `Static` wraps."""
+    from rytp.tui.app import RytpApp
+
+    async def main() -> None:
+        app = RytpApp(db)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.push_screen(CutlistScreen(db, written))
+            await pilot.pause()
+            hint = app.screen.query_one("#cutlist-hint", Static)
+            # Wrapped onto more than one line at 80 columns, not truncated —
+            # the widget's height grew to fit rather than clipping content.
+            assert hint.size.height >= 2, hint.size
+
+    asyncio.run(main())
+
+
+def test_d_removes_the_highlighted_fragment(db: Database, written: Path) -> None:
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("d")
+        await pilot.pause()
+        assert len(screen.view.cutlist.slots) == 1
+        status = str(screen.query_one("#cutlist-status", Static).content)
+        assert "removed" in status.lower()
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_d_key_is_bound_to_remove(db: Database, written: Path) -> None:
+    bindings = {b.key: b.description for b in CutlistScreen.BINDINGS if isinstance(b, Binding)}
+    assert bindings["d"] == "Remove"
+
+
+def test_e_orders_a_render_by_enqueueing_never_running_inline(
+    db: Database, written: Path
+) -> None:
+    """BUGS.md entry 22: rendering encodes video, so it must be queued for
+    the worker, exactly like the Videos screen's shortcuts, never run on
+    Textual's event loop."""
+
+    async def body(screen: Any, pilot: Any) -> None:
+        before = db.conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+        await pilot.press("e")
+        await pilot.pause()
+        after = db.conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE kind = 'render'"
+        ).fetchone()["n"]
+        assert after == 1
+        total_after = db.conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+        assert total_after == before + 1
+        status = str(screen.query_one("#cutlist-status", Static).content)
+        assert "queued" in status.lower()
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_the_e_key_is_bound_to_render(db: Database, written: Path) -> None:
+    bindings = {b.key: b.description for b in CutlistScreen.BINDINGS if isinstance(b, Binding)}
+    assert bindings["e"] == "Render"
+
+
+def test_ordering_a_render_saves_an_unsaved_edit_first(
+    db: Database, written: Path
+) -> None:
+    """`render.run` reads the cut list off disk, so an edit still only in
+    memory would otherwise be silently absent from what gets rendered —
+    this must never hand the owner a video that does not match the screen."""
+
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("s")  # promote the alternative in memory only
+        await pilot.pause()
+        assert screen.view.dirty is True
+        await pilot.press("e")
+        await pilot.pause()
+        assert screen.view.dirty is False
+        assert load_cutlist(written).slots[0].video_id == 7
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_ordering_a_render_with_no_unsaved_edit_does_not_resave(
+    db: Database, written: Path
+) -> None:
+    async def body(screen: Any, pilot: Any) -> None:
+        assert screen.view.dirty is False
+        mtime_before = written.stat().st_mtime_ns
+        await pilot.press("e")
+        await pilot.pause()
+        assert written.stat().st_mtime_ns == mtime_before
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+def test_a_missing_cutlist_file_is_reported_not_raised_on_render(
+    db: Database, written: Path
+) -> None:
+    async def body(screen: Any, pilot: Any) -> None:
+        written.unlink()
+        await pilot.press("e")
+        await pilot.pause()
+        status = str(screen.query_one("#cutlist-status", Static).content)
+        assert "no cut list named" in status.lower()
+
+    drive(lambda: CutlistScreen(db, written), body)
+
+
+# --- retargeting (owner's request: edit the target without losing the ---
+# --- hand-tuning already done on the rest of the cut list) --------------
+
+
+@pytest.fixture()
+def planned_written(db: Database, data_dir: object) -> Path:
+    """A real cut list, planned against real corpus words — `written`'s
+    fixture cutlist names videos 3/7/9 that do not exist in any database,
+    which is fine for the boundary-editing tests above but useless for a
+    retarget, which has to plan real replacement material."""
+    from rytp.assemble import assemble_target
+    from rytp.assemble.cutlist import cutlist_path
+    from tests.assembly_corpus import add_video, add_words
+
+    video_id = add_video(db, external_id="VIDEO_A", title="A")
+    add_words(db, video_id, "мы все понимаем")
+    cutlist = assemble_target(db, "мы все понимаем", name="демо2")
+    return write_cutlist(cutlist, cutlist_path("демо2"))
+
+
+def test_the_retarget_key_opens_a_modal_prefilled_with_the_current_target(
+    db: Database, planned_written: Path
+) -> None:
+    from textual.widgets import Input
+
+    from rytp.tui.screens.cutlist import RetargetScreen
+
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("t")
+        await pilot.pause()
+        modal = screen.app.screen
+        assert isinstance(modal, RetargetScreen)
+        assert modal.query_one("#retarget-input", Input).value == "мы все понимаем"
+
+    drive(lambda: CutlistScreen(db, planned_written), body)
+
+
+def test_escape_in_the_retarget_modal_cancels_without_changing_anything(
+    db: Database, planned_written: Path
+) -> None:
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("t")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert screen.app.screen is screen
+        assert screen.view.dirty is False
+        assert screen.view.cutlist.target == "мы все понимаем"
+
+    drive(lambda: CutlistScreen(db, planned_written), body)
+
+
+def test_the_retarget_key_applies_the_edit_and_joins_the_undo_stack(
+    db: Database, planned_written: Path
+) -> None:
+    from textual.widgets import Input
+
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("t")
+        await pilot.pause()
+        modal = screen.app.screen
+        modal.query_one("#retarget-input", Input).value = "мы все понимаем точно"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert screen.app.screen is screen  # modal dismissed
+        assert screen.view.cutlist.target == "мы все понимаем точно"
+        assert screen.view.dirty is True
+        status = str(screen.query_one("#cutlist-status", Static).content)
+        assert "retargeted" in status
+        assert "kept 1" in status
+
+        await pilot.press("u")
+        await pilot.pause()
+        assert screen.view.cutlist.target == "мы все понимаем"
+
+    drive(lambda: CutlistScreen(db, planned_written), body)
+
+
+def test_retargeting_to_an_empty_box_is_reported_not_raised(
+    db: Database, planned_written: Path
+) -> None:
+    from textual.widgets import Input
+
+    async def body(screen: Any, pilot: Any) -> None:
+        await pilot.press("t")
+        await pilot.pause()
+        modal = screen.app.screen
+        modal.query_one("#retarget-input", Input).value = "   "
+        await pilot.press("enter")
+        await pilot.pause()
+        assert screen.app.screen is screen
+        assert screen.view.dirty is False
+        status = str(screen.query_one("#cutlist-status", Static).content)
+        assert "cannot be empty" in status.lower()
+
+    drive(lambda: CutlistScreen(db, planned_written), body)

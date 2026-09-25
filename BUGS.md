@@ -1053,6 +1053,297 @@ Two decisions it needs:
 parameter, rather than "wrap width", a display one. Same flag, sharper
 meaning.
 
+### 38. A fifth time formatter the consistency scan cannot see
+
+Follow-up from entry 31's fix. `rytp/timefmt.py` now holds one formatter per
+purpose (`format_seek`, `format_spoken`, `format_length`), and
+`tests/test_timefmt.py::test_no_module_outside_timefmt_builds_a_private_formatter`
+scans `rytp/` for modules rolling their own.
+
+**`rytp/diarize/mapper.py:36 format_ms` is a fifth private formatter that the
+scan cannot detect.** It renders `m:ss` with no hour rollover — one
+zero-padded field, where the scan looks for two joined by a colon — and is
+used by `rytp/commands/speakers.py`. It was named here rather than added to
+the scan's `_KNOWN_PRIVATE` allowlist, deliberately: an allowlist entry would
+make the net read as complete while leaving a hole in it.
+
+Two things to do when `rytp/diarize/*` is next touched: point it at `timefmt`
+(probably `format_spoken`, or its own purpose if the missing hour rollover is
+intentional rather than an oversight — a diarizer label past an hour would
+currently render as `73:20` rather than `1:13:20`), and widen the scan so a
+single-field formatter is caught too.
+
+### 39. `engine.binary.<name>` is a setting nothing reads
+
+Found while building the settings catalogue. `SETTINGS_BINARY_PREFIX =
+"engine.binary."` exists in `rytp/constants.py:696` and has **no reader**:
+every binary is resolved by `shutil.which` or a hardcoded name
+(`render/ffmpeg.py`, `audio/extract.py`, `transcribe/align/mfa.py`,
+`transcribe/registry.py`). The catalogue keeps an entry so the drift test
+holds, but marks it invisible — there is no read site to verify a default
+against and no roster of names to expand.
+
+**It is worth finishing rather than deleting.** The interpreter sibling,
+`engine.interpreter.<name>`, is what made the engines usable at all on a
+machine where the wheels would not install. A binary override is the same
+idea for the one engine that is not a Python module: MFA is a conda binary,
+and on Windows a conda environment's `Scripts` directory is frequently not
+on `PATH`. Today `MfaAligner.required_binary = "mfa"` is looked up with
+`shutil.which` plus a beside-the-interpreter guess, so a user whose MFA
+lives somewhere else has no way to say where — exactly the dead end
+`engine.interpreter.*` removed for the others.
+
+Either wire it (read it in the same place `required_binary` is resolved, so
+a set value wins over the `PATH` search) or delete the constant. Leaving a
+named setting that silently does nothing is the worse of the three.
+
+### 40. A job skipped as already-satisfied looked exactly like one that ran — FIXED
+
+Reported as: "I ordered a transcription on a video with a tick in the
+transcribed column. It said it'll be enqueued, but nothing happened — no GPU
+usage."
+
+Nothing was wrong with the enqueue. `transcribe_readiness`
+(`rytp/transcribe/readiness.py:61`) answers `SATISFIED` as soon as a video
+has words at *either* tier, and the worker
+(`rytp/jobs/worker.py:238`) finishes a `SATISFIED` job immediately without
+calling the handler. Correct by design — readiness is a statement about the
+world, so "already transcribed" means there is nothing to do.
+
+The defect was that it left **no trace**: `Q.finish()` was called without a
+note, so the row read `done` with a blank note — byte-identical to a job
+that did the work. The only way to tell them apart was the absence of GPU
+activity.
+
+**Fixed:** the skip now writes `JOB_ALREADY_SATISFIED_NOTE` ("already
+satisfied; nothing to do"), visible in `jobs list`'s note column and on the
+TUI's F7 screen. Folded into the existing
+`test_a_job_satisfied_since_enqueue_skips_its_handler` rather than added
+alongside it.
+
+**Not changed, because it is the design:** to genuinely re-transcribe, the
+words have to go first — `transcribe remove <video>`, then enqueue — or run
+the foreground `transcribe run <video>`, which does not consult readiness
+and replaces the words outright. Worth considering later whether the Videos
+screen's shortcut should say so before enqueueing a no-op, since the screen
+knows the column is ticked.
+
+### 41. Nothing says a worker must be running, and nothing notices when one is not
+
+Reported as: "I re-ordered `align` — but it seems to be `pending`?" — after
+the same confusion a few minutes earlier with `transcribe`.
+
+`pending` means the row was written and no worker has claimed it. Enqueueing
+only writes to `jobs`; a separate `rytp worker` process drains the queue, and
+it is `FOREGROUND_ONLY` ("it is the process that drains the queue") so the
+TUI deliberately will not start one.
+
+**Nothing anywhere says this.** Not the enqueue message ("queued — F7 to
+watch the queue"), not `jobs list`, not `jobs stats`, and there is no
+`doctor` check. A user who has not read the design has no way to learn that
+queued work needs a second terminal — the queue simply fills up silently and
+looks broken. It cost the owner two separate rounds of confusion in one
+session, which is the same silent-success family as entries 3, 10, 22 and 40.
+
+**The detection already exists and is unused.** `worker.lease`
+(`rytp/jobs/worker.py:78-116`) holds `{"pid", "started_at", "heartbeat"}`
+with a heartbeat the running worker refreshes, and `WorkerAlreadyRunning` is
+raised off a stale one. So "is a worker alive right now" is a lease read and
+a staleness comparison — no new state, no polling.
+
+Three places it should surface, cheapest first:
+
+- **`jobs list` / `jobs stats`** — when anything is `pending` and no lease is
+  live, say so: "N pending; no worker is running — start one with
+  `rytp worker`". This is the screen a confused user actually looks at.
+- **The enqueue message**, in both surfaces — "queued" is only half true if
+  nothing will ever pick it up.
+- **A `doctor` check**, advisory rather than required: a queue with pending
+  work and no live worker is a state worth reporting, but it is not a broken
+  installation.
+
+### 42. A detached worker that dies before acquiring its lease leaves no trace
+
+The TUI's F12 "Start worker" spawns a detached `rytp worker` with stdout and
+stderr on `DEVNULL`, because contracts §7 enumerates the filesystem layout
+exhaustively and has no slot for a log file. That was the right call — a TUI
+convenience should not invent a top-level directory — but it leaves a gap.
+
+Once the worker is up, nothing is lost: per-job progress and errors reach
+`jobs.progress` and `jobs.error`, which the same F7 screen displays. **The
+hole is everything before the lease is acquired.** A bad import, a missing
+dependency, an adapter blowing up at module load — those happen before any
+job row exists, so a detached worker simply vanishes and the queue stays
+`pending` with no explanation.
+
+That is not a hypothetical failure mode here. CLAUDE.md's "What has never
+been run" says no transcriber, aligner, diarizer or embedder has executed
+against its real library; the adapters were written from documented APIs.
+An import-time surprise on first real use is among the *most* likely things
+to happen, and F12 is precisely where a user would meet it — with no output
+at all.
+
+Options, needing a contracts §7 amendment either way:
+
+- Add a `logs/` slot to the data tree and point the detached child's
+  stdout/stderr at `logs/worker-<timestamp>.log`. Simple, and useful beyond
+  this case.
+- Or have the child write its startup failure to the database before dying,
+  which needs no new directory but cannot capture a failure that happens
+  before `rytp.db` can be opened — the case most likely to occur.
+
+The first is worth the amendment. Until then, a worker that will not start
+should be diagnosed by running `rytp worker` in a terminal, where the
+traceback is visible — worth saying in the F12 status line.
+
+### 43. Resident engine workers can now hold three models on the GPU at once
+
+A consequence of removing the per-chunk model reload, not a defect in it —
+but it lands squarely on this project's hardware.
+
+Engines now keep one resident child per `(interpreter, module, root)`, and
+each child caches its model. Nothing releases them between pipeline stages:
+`shutdown_workers()` and dead-worker eviction exist and work, but no caller
+invokes them from `pipeline.py`. So a process that transcribes with
+`gigaam`, aligns with `wav2vec2` and then diarizes with `pyannote` ends up
+**holding all three resident simultaneously**.
+
+The target machine has an RTX 3080 Laptop with 16 GiB. Three models is
+plausibly fine and plausibly not, depending on which are loaded — and the
+failure, if it comes, is a CUDA out-of-memory partway through a long run,
+after the expensive work is done. That is worse than the reload it replaced.
+
+Worth deciding rather than discovering:
+
+- **Release at stage boundaries.** `pipeline.py` knows when it has finished
+  transcribing and is about to align. Evicting the previous engine's worker
+  there costs one reload per stage — not per chunk — and bounds residency at
+  one model.
+- **Cap by count or by key.** Keep the most recently used worker and evict
+  the rest, the usual cache shape.
+- **Leave it and measure first.** `doctor` already reports the GPU and its
+  memory, so the honest first step may be to observe an actual three-engine
+  run on the real card rather than pre-optimise a problem that may not
+  materialise.
+
+Note the worker is per *interpreter* too, and the documented setup puts each
+engine in its own virtualenv — so in the owner's configuration these are
+separate processes, each holding its own model, which makes the total
+footprint more visible but no smaller.
+
+Related, unfixed and unfixable at this seam: **MFA still reloads per call.**
+Its `child_main` shells out to the external `mfa align` binary, which has no
+server mode, so no amount of Python-side residency helps. Documented in the
+adapter.
+
+### 44. No way to un-align a video: `aligned` is a one-way door
+
+Asked for directly: "the aligner fails again, and I want to invalidate the
+transcription altogether and downgrade the video back to just `timed`."
+
+There is no command for it. `transcribe remove` deletes a video's words
+outright — along with its utterances and speaker labels — so recovering to
+`timed` means paying for transcription again. Nothing anywhere sets
+`words.source` back from `aligned`.
+
+**Why this matters more than it looks.** The tiers exist precisely to
+separate "searchable" from "cuttable". A failed or untrusted alignment
+leaves every word still marked `aligned`, which means assembly will happily
+cut from it — so the only way to stop a bad alignment poisoning renders is
+to destroy the transcript that produced it. The cheap, correct action
+(stop trusting these boundaries) is unavailable; only the expensive,
+destructive one is.
+
+**What such a command can and cannot do.** `realign_video` overwrites
+timings **in place**, so the transcriber's original `timed` boundaries are
+gone the moment an aligner runs. A downgrade therefore cannot restore them
+— it can only relabel the current boundaries as `timed`, which is the
+honest outcome: the timings stay, but they stop being treated as cuttable.
+Say so in the command's help, or someone will expect their old timestamps
+back.
+
+Shape: `transcribe unalign <video>` — set `source = 'timed'` for that
+video's `aligned` rows, clear `align_score` and `align_scale`, leave text,
+ordinals and speaker labels untouched. Cheap, reversible by re-running
+`transcribe align`, and it makes the tier mean what it says again.
+
+Note it does **not** need to make re-alignment possible: `align_readiness`
+never reports `SATISFIED`, so re-aligning already works at any time. The
+value is purely in withdrawing trust.
+
+### 45. Re-enqueueing kept the old payload, so a job ran parameters you had withdrawn — FIXED
+
+Reported: "I cancelled an old job on video 1 — it had gigaam as the
+transcription engine. I enqueued a new transcription and it reopened the
+cancelled job instead, but I have whisper as the default."
+
+Both halves were happening, and the second is the damaging one.
+
+`Q.enqueue` is idempotent by `UNIQUE (kind, target_id)` and its
+`ON CONFLICT DO UPDATE` refreshed `priority`, `state` and `not_before` —
+but **never `payload_json`**. So the reopened job carried the payload from
+the original request. The engine name is stamped into the payload at
+enqueue time, so the job would have run `gigaam` after the owner had
+switched the default to `whisper` and cancelled the `gigaam` work.
+
+Contracts §5 is explicit that a readiness predicate never sees the payload,
+precisely because the payload is the *input* to the work — anything that
+changes what the job does lives there. A request carrying different inputs
+must not silently inherit the previous ones.
+
+**Fixed:** the payload is refreshed on conflict, guarded by the same
+`state = 'running'` check that already protects state and `not_before` —
+work in flight cannot have its parameters changed underneath it. Two tests
+pin it, and the first fails against the old code with exactly the reported
+symptom.
+
+**Considered and not done: making it a new job.** The owner's suggestion was
+that a differing payload should create a separate row. That needs the
+`UNIQUE (kind, target_id)` constraint relaxed, which is a schema and
+contracts change — and the constraint is earning its keep: two `transcribe`
+jobs for one video is duplicated GPU work, and comparing engines is what
+`transcribe compare` exists for. Refreshing the payload delivers the
+intent ("run what I just asked for") without weakening the guarantee that
+one video has at most one job of a kind outstanding.
+
+### 46. "never said in the corpus" while search is showing you a hit — FIXED
+
+Reported: "why was I able to find all fragments except the last one? It is
+present in the search, though."
+
+    assemble plan "... каннибализм" --allow-timed
+      1 word not found: каннибализм; 'каннибализм': never said in the corpus
+
+    search words "каннибализм"
+      1 hit(s), stem match, so these are inflected forms
+      v3:1722-1722 ... timed ... канниб…
+
+Both were behaving correctly and the pair read as a contradiction.
+
+**Search matched by stem.** Its own header says so. Falling back to stems
+when the exact form is absent is a deliberate requirement — the owner asked
+for it — because an archive is searched by people who do not know which
+inflection was spoken.
+
+**Assembly needs the exact form**, because it cuts real audio. Splicing
+`каннибализмом` into a sentence that calls for `каннибализм` puts a word in
+the video that was never said in that form. Refusing is right.
+
+The defect was the wording. `AbsenceDiagnosis.total` counts occurrences of
+the exact `normalized_text`, so zero means "not in this form" — and it was
+reported as "never said in the corpus", which is a much stronger claim and
+plainly false while a hit is on screen.
+
+**Fixed:** when the exact form is absent, the diagnosis now looks up forms
+sharing its stem (the `words_stem` index already exists, and this runs once
+per missing word, off the hot path) and the message names them:
+
+    'каннибализм': not said in this exact form; the corpus has
+    каннибализмом (1) — `assemble suggest каннибализм` ranks stand-ins
+
+The original wording survives for a word genuinely absent in every form,
+pinned by its own test so the two cases cannot collapse into one.
+
 ---
 
 ## Open design questions

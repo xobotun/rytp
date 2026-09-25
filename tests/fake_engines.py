@@ -177,6 +177,23 @@ def registered(*classes: type) -> Iterator[None]:
                 table[name] = previous  # type: ignore[assignment]
 
 
+class FailingAligner(FakeAligner):
+    """Always raises — simulates a real aligner failure mid-run.
+
+    Used to prove the defect fix: a failed alignment must cost only the
+    alignment, leaving the `timed` transcript that preceded it in place.
+    """
+
+    name = "fake-failing-aligner"
+
+    def align(
+        self, audio: Path, words: Sequence[str], *, start_ms: int, end_ms: int
+    ) -> list[Span]:
+        from rytp.models import RytpError
+
+        raise RytpError("simulated alignment failure")
+
+
 class ScorelessAligner(FakeAligner):
     """An aligner that reports no per-word confidence — MFA behaves this way."""
 

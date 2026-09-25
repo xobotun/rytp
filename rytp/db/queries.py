@@ -323,16 +323,16 @@ def insert_asset(
 
 
 def assets_for(db: Database, video_id: int, role: str | None = None) -> list[sqlite3.Row]:
-    """Every asset of a video, oldest first, optionally filtered by role."""
+    """Every asset of a video, newest first, optionally filtered by role."""
     if role is None:
         return list(
             db.conn.execute(
-                "SELECT * FROM assets WHERE video_id = ? ORDER BY id", (video_id,)
+                "SELECT * FROM assets WHERE video_id = ? ORDER BY id DESC", (video_id,)
             ).fetchall()
         )
     return list(
         db.conn.execute(
-            "SELECT * FROM assets WHERE video_id = ? AND role = ? ORDER BY id",
+            "SELECT * FROM assets WHERE video_id = ? AND role = ? ORDER BY id DESC",
             (video_id, role),
         ).fetchall()
     )

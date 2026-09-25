@@ -258,10 +258,18 @@ def _run_transcribe(db: Database, video_id: int, payload: dict[str, Any]) -> str
     warning = speaker_loss_warning(video_id, outcome.speakers_lost)
     if warning:
         notes.append(warning)
+    # `outcome.align_device`/`.align_notes` are the aligner's, when this run
+    # used one — contracts §6's engine notes/device channel, merged with the
+    # "which transcriber ran" note above rather than replacing it, so a
+    # queued job's note says everything a foreground run's message does
+    # (`rytp/commands/transcribe.py`'s `_device_note` + `outcome.align_notes`).
+    if outcome.align_device is not None:
+        notes.append(f"aligner device: {outcome.align_device}")
+    notes.extend(outcome.align_notes)
     return ". ".join(notes) if notes else None
 
 
-def _run_align(db: Database, video_id: int, payload: dict[str, Any]) -> None:
+def _run_align(db: Database, video_id: int, payload: dict[str, Any]) -> str | None:
     from rytp.audio.extract import wav_path
     from rytp.models import RytpError
     from rytp.transcribe.pipeline import enqueue_index, realign_video
@@ -272,7 +280,7 @@ def _run_align(db: Database, video_id: int, payload: dict[str, Any]) -> None:
             f"align job for video {video_id} has no 'aligner' in its payload"
         )
     _load_transcribe_engines()
-    realign_video(
+    outcome = realign_video(
         db,
         video_id,
         wav_path=wav_path(video_id),
@@ -281,6 +289,18 @@ def _run_align(db: Database, video_id: int, payload: dict[str, Any]) -> None:
     )
     # Re-timing rewrote every boundary, so the utterances are gone too.
     enqueue_index(db, video_id)
+    # `jobs.note` (contracts §5), not `jobs.progress`: written once, here, as
+    # this handler's return value, and it survives completion — distinct
+    # from the worker's while-running progress line. Before this, `_run_align`
+    # discarded `realign_video`'s outcome entirely and the queued path had no
+    # note channel at all, so the device fact never reached a worker-run
+    # job's note even though `rytp transcribe align` already surfaced it
+    # (`rytp/commands/transcribe.py`'s `_align_handler`).
+    notes: list[str] = []
+    if outcome.align_device is not None:
+        notes.append(f"aligner device: {outcome.align_device}")
+    notes.extend(outcome.align_notes)
+    return ". ".join(notes) if notes else None
 
 
 def _run_fingerprint(db: Database, video_id: int, payload: dict[str, Any]) -> None:

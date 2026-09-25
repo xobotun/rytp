@@ -1,4 +1,4 @@
-"""The progress seam. plan §1c, BUGS.md entries 3, 10, 22.
+"""The progress seam. plan §1c, BUGS.md entries 3, 10, 22, 41.
 
 Nothing in this system reported that it was working: a download, a
 first-run model fetch of several gigabytes, a WAV decode and a diarizer's
@@ -26,6 +26,15 @@ the chunk, which already exists (``plan_chunks``, and the completion table
 already prints ``chunks = 38``); for a download it is bytes; for a single
 blocking call it is nothing more than "this stage started" and "this stage
 finished".
+
+Fixing entry 3/10 for the worker (entry 41's family) meant this seam had to
+stop being exclusive: :func:`install` replaces whatever is current, which is
+right for the TUI and for a bare CLI run, but a foreground ``rytp worker``
+installing its database sink *this way* silenced the terminal for the whole
+handler call — the worker claimed jobs, ran them and exited without a line.
+:func:`current` and :func:`combine` let a caller fold the sink already
+installed into a new one instead of stepping on it, without touching
+:func:`install`'s re-entrancy.
 """
 
 from __future__ import annotations
@@ -135,6 +144,38 @@ def report(
         return
     with contextlib.suppress(Exception):
         sink(stage, done, total, detail)
+
+
+def current() -> Sink | None:
+    """The sink presently installed, so a caller can wrap it rather than
+    replace it.
+
+    Exists for the worker (BUGS.md entries 3, 10, 22): swapping in
+    ``_DbProgressSink`` for the duration of one handler call used to
+    *replace* whatever terminal sink was already installed, so a foreground
+    ``rytp worker`` run went completely silent. Reading the current sink
+    first and folding it into a :func:`combine` keeps both alive.
+    """
+    return _current.get()
+
+
+def combine(*sinks: Sink | None) -> Sink:
+    """Fan one :func:`report` call out to several sinks.
+
+    Each sink runs even if an earlier one raises — :func:`report` only
+    guards the call to the *installed* sink as a whole, so without this a
+    broken database write would silence the terminal too. ``None`` entries
+    are dropped, so ``combine(current(), other)`` is safe even when nothing
+    was installed yet.
+    """
+    active = [s for s in sinks if s is not None]
+
+    def _fanout(stage: str, done: int | None, total: int | None, detail: str) -> None:
+        for sink in active:
+            with contextlib.suppress(Exception):
+                sink(stage, done, total, detail)
+
+    return _fanout
 
 
 @contextmanager

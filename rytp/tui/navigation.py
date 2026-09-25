@@ -71,7 +71,9 @@ class ScreenEntry:
 #: transcripts, searching, playing hits, editing cut lists, adding to the queue,
 #: watching job progress", plus speaker assignment, which it calls the one
 #: genuinely interactive task. Browsing videos is the palette itself
-#: (`videos list` on the home view); the other five are here.
+#: (`videos list` on the home view) or the fleet overview below (`f9`), which
+#: adds pipeline-stage columns and shortcuts on top of the same listing; the
+#: other five are here.
 SCREENS: Final[tuple[ScreenEntry, ...]] = (
     ScreenEntry(
         key="f3",
@@ -119,7 +121,23 @@ SCREENS: Final[tuple[ScreenEntry, ...]] = (
         # free and the editing verbs read better as `s`, `a`, `g`.
         bare_letters=True,
     ),
+    ScreenEntry(
+        key="f9",
+        id="videos",
+        title="Videos",
+        summary="See where each video is between registered and cuttable.",
+        module="rytp.tui.screens.videos",
+        factory="VideosScreen",
+    ),
 )
+
+#: BUGS.md entry 23 named `f5` — free at app level, and it "sits naturally
+#: before Search" — but Part 7's mapper already binds it locally
+#: (`toggle_suggestions`, on `SpeakerMapperScreen`). An app-level `f5` would
+#: still technically work (a screen's own bindings win over the app's), but
+#: the footer would then show two different meanings for the same key on
+#: that one screen, which `test_no_app_level_key_is_shadowed_by_a_screen`
+#: refuses to allow. `f9` is the next unclaimed function key.
 
 #: App-level keys that are not a screen. `f5` is absent on purpose and stays
 #: absent: Part 7's mapper binds it. Nothing here says so — the test derives it

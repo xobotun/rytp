@@ -47,7 +47,10 @@ def job_kinds(monkeypatch: pytest.MonkeyPatch) -> tuple[str, ...]:
 def video(db: Database, data_dir: Path, fake_probe: None, job_kinds: tuple[str, ...]) -> int:
     """One catalogued video with rows, files and a queued job."""
     catalog.channel_add(db, url=CHANNEL_URL, title="Channel One")
-    catalog.videos_add(db, target=VIDEO_URL, channel="1")
+    # register_only: this fixture inserts its own hand-picked job rows below
+    # (using the faked `job_kinds`), which the real acquisition chain would
+    # collide with under `jobs`' `UNIQUE (kind, target_id)`.
+    catalog.videos_add(db, target=VIDEO_URL, channel="1", register_only=True)
     db.conn.execute(
         "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text,"
         " stem, source, engine) VALUES (1, 0, 0, 100, 'да', 'да', 'да', 'aligned', 'mfa')"

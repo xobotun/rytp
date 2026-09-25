@@ -110,6 +110,15 @@ def test_jobs_declares_progress(db: Database) -> None:
     assert "progress" in _columns(db, "jobs")
 
 
+def test_words_declares_the_original_timing_columns(db: Database) -> None:
+    """Contracts §3 (amendment §7): `words.orig_start_ms`/`orig_end_ms`,
+    gained by migration 16, so `transcribe unalign` (BUGS.md entry 44) has
+    something honest to restore from."""
+    columns = _columns(db, "words")
+    assert "orig_start_ms" in columns
+    assert "orig_end_ms" in columns
+
+
 def test_align_scales_constant_matches_the_contracts_comment(db: Database) -> None:
     """contracts §3's `words` DDL block names the permitted `align_scale`
     values in a comment: "The scale that produced align_score: 'energy' |

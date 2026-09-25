@@ -137,6 +137,17 @@ CREATE TABLE words (
     source           TEXT NOT NULL CHECK (source IN ('caption','timed','aligned')),
     engine           TEXT NOT NULL,
     video_speaker_id INTEGER REFERENCES video_speakers(id) ON DELETE SET NULL,
+    -- The transcriber's own pre-alignment, pre-refinement per-token timing
+    -- (contracts amendment §7; BUGS.md entry 44), so `transcribe unalign` can
+    -- restore it after `realign_video` or `--refine` overwrites start_ms/
+    -- end_ms. Both set or both NULL: NULL for every `caption` row (nothing to
+    -- restore to), for a row written before migration 16, and for a word
+    -- whose transcriber left timing entirely to the aligner (contracts §4
+    -- permits a text-only `RawWord`). Gained by migration 16
+    -- (rytp/db/schema.py); this DDL block is the target state, not what
+    -- every live database currently has.
+    orig_start_ms    INTEGER,
+    orig_end_ms      INTEGER,
     UNIQUE (video_id, ord),
     CHECK (source = 'caption' OR end_ms IS NOT NULL)
 );
@@ -254,7 +265,7 @@ CREATE TABLE settings (
 
 `words.end_ms` is null exactly for caption-sourced rows.
 
-**This DDL block is the target state, not what every live database currently has.** `words.align_scale` and `jobs.progress` are gained by migrations 13 and 14 respectively (`rytp/db/schema.py`); a database migrated from an earlier version reaches this shape only after those migrations run. Nothing before this batch wrote either column.
+**This DDL block is the target state, not what every live database currently has.** `words.align_scale` and `jobs.progress` are gained by migrations 13 and 14 respectively (`rytp/db/schema.py`); `words.orig_start_ms`/`orig_end_ms` by migration 16. A database migrated from an earlier version reaches this shape only after those migrations run. Nothing before this batch wrote any of them.
 
 ### Choosing a transcriber
 
@@ -291,7 +302,7 @@ cut list", and one name cannot carry two meanings.
 
 The `timed` tier exists because a transcriber's own word timestamps are not good enough to cut on — measured on the owner's real data, 78.7% of Whisper's word gaps are exactly zero, because it assigns `word[i].end == word[i+1].start` and absorbs every pause into an adjacent word. Energy refinement relocates a boundary within a window; it cannot place one that was never there.
 
-But such a transcript is still far better *text* than captions, so it is worth having and worth searching. Marking it `timed` rather than `aligned` states the truth: you can find the words, you cannot cut them by default. Running the `align` job upgrades those rows in place from `timed` to `aligned`.
+But such a transcript is still far better *text* than captions, so it is worth having and worth searching. Marking it `timed` rather than `aligned` states the truth: you can find the words, you cannot cut them by default. Running the `align` job upgrades those rows in place from `timed` to `aligned`. `transcribe unalign` reverses that promotion — restoring `words.orig_start_ms`/`orig_end_ms` (amendment §7) and setting `source` back to `timed` — for a video whose alignment turned out untrustworthy, without paying for transcription again.
 
 The alternative — writing these rows as `aligned` and hoping — is what the design was built to avoid, and nothing downstream could have detected it: `words.engine` records the difference but no consumer reads it, and `align_score` is null without an aligner.
 
@@ -656,6 +667,53 @@ report simply never defines `notes`, which is why callers read it with
 `getattr` and a default rather than assuming it exists. A note appended here is
 always advisory — it is drained into `jobs.note` (§5), never treated as a
 failure and never affecting whether the call succeeded.
+
+**The out-of-process seam's lifecycle (2026-09-25 amendment — persistent
+worker).** A companion entry recording the full "forces / breaks / rejected"
+reasoning belongs in `docs/superpowers/2026-09-25-contracts-amendments.md`
+alongside its existing entries, but that file was outside this change's
+scope; the reasoning instead lives in this task's handback. This section is
+the terse, binding version. `out_of_process = True` no longer means "one
+fresh child per call". `rytp/transcribe/subproc.py`
+keeps one resident child per `(interpreter, module, repo root)` for the life of
+the process (`get_worker`/`_WORKERS`), and `run_child(...)` — same signature as
+before, no adapter call site changed — sends that child a call rather than
+spawning a new one. Binding rules for any engine adapter:
+
+* **A call is a control line naming a request file and a response file**,
+  never a raw payload on stdin/stdout — library noise on either stream must
+  never be able to corrupt the protocol. The response is written
+  temp-then-`os.replace` so a concurrent poller never observes a partial file.
+* **Calls to one worker are serialised** by a per-worker lock. Two callers
+  wanting the same engine at once queue; the second's wait is silent (no
+  progress report of "waiting for the lock"), for up to
+  `ENGINE_SUBPROCESS_TIMEOUT_S`.
+* **A worker that dies or times out is torn down and evicted**; the next call
+  to that key pays one respawn. A worker that merely returns `ok: False` (an
+  ordinary exception inside `child_main`) stays resident.
+* **An engine's `child_main` is responsible for caching its own expensive
+  state** (a loaded model, a built pipeline) across calls via
+  `rytp.transcribe.subproc.load_cached` — the resident child alone does not
+  remove a reload; only caching inside `child_main` does. gigaam, wav2vec2,
+  pyannote and redimnet do this, keyed by whatever identifies the loaded
+  object (typically model name + device). MFA does not: its reload is inside
+  the external `mfa` binary `child_main` shells out to, which has no
+  long-lived server mode.
+* **`probe()` (contracts §6's availability check) stays a one-shot child**
+  (`_run_once`), never joining the resident pool — it may run against an
+  engine nobody constructs, and a resident process (possibly with a model
+  loaded) for that would be exactly the waste this amendment removes
+  elsewhere.
+* **Cost, not just benefit:** a resident worker holds its cached state (GPU
+  memory included) for as long as it lives. Running several out-of-process
+  engines back to back leaves all of them loaded at once unless something
+  calls `shutdown_workers()` (or lets the key be evicted) between stages —
+  nothing does this automatically today.
+* **Batching the protocol** (widening `align`/`transcribe`/`diarize` to take
+  a sequence of windows per call) was the considered alternative and was
+  rejected: it would touch every adapter, every fake, and the pipeline's
+  chunk loop, for the same result a persistent child gets with zero
+  signature change.
 
 ## 7. Filesystem layout
 

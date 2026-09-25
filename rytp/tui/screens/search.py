@@ -148,7 +148,7 @@ class SearchScreen(Screen[None]):
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "app.pop_screen", "Back"),
-        Binding("ctrl+p", "play", "Play hit"),
+        Binding("ctrl+p", "play", "Play fragment"),
         Binding(
             "ctrl+t",
             "toggle_cuttable",

@@ -105,6 +105,7 @@ class RenderFragment:
     video_speaker_id: int | None = None
     speaker_label: str | None = None
     gap_before_ms: int | None = None
+    tier: str | None = None
 
     @property
     def duration_ms(self) -> int:
@@ -148,6 +149,7 @@ def request_from_cutlist(cutlist: object) -> RenderRequest:
                     video_speaker_id=getattr(slot, "video_speaker_id", None),
                     speaker_label=getattr(slot, "speaker_label", None),
                     gap_before_ms=getattr(slot, "gap_before_ms", None),
+                    tier=getattr(slot, "tier", None),
                 )
             )
             continue
@@ -203,7 +205,9 @@ def _newest_existing(db: Database, video_id: int, role: str) -> Path | None:
     insert; existence is checked because an asset row whose file was
     deleted outside the tool must not look usable.
     """
-    for row in reversed(assets_for(db, video_id, role)):
+    # `assets_for` is newest-first, so the first existing file found here
+    # already is the newest one.
+    for row in assets_for(db, video_id, role):
         path = Path(row["path"])
         if path.exists():
             return path
@@ -594,6 +598,7 @@ def build_report(
             gap_after_ms=planned.gap_after_ms,
             gap_origin=planned.gap_origin,
             text=planned.fragment.text,
+            tier=planned.fragment.tier,
         )
         for planned in plan.fragments
     )
@@ -612,6 +617,7 @@ def build_report(
                 gain_db=source.gain_db,
                 first_output_ms=min(p.output_start_ms for p in mine),
                 geometry=f"{geometry.width}x{geometry.height} @ {round(geometry.fps)} fps",
+                timed_fragment_count=sum(1 for p in mine if p.fragment.tier == "timed"),
             )
         )
     return RenderReport(

@@ -19,7 +19,13 @@ from rytp.db import queries as q
 from rytp.models import NotFoundError
 from rytp.transcribe.registry import interpreter_for
 
-GROUP = ("settings.list", "settings.get", "settings.set", "settings.unset")
+GROUP = (
+    "settings.list",
+    "settings.catalog",
+    "settings.get",
+    "settings.set",
+    "settings.unset",
+)
 
 
 # -- registration ------------------------------------------------------
@@ -44,6 +50,15 @@ def test_list_on_a_freshly_migrated_database(db: Database) -> None:
     """
     result = resolve("settings.list").handler(db)
     assert result.rows == (("default_aligner", ""),)
+
+
+def test_list_points_at_catalog_when_something_known_is_unset(db: Database) -> None:
+    """`settings.list` never grows a second table (`CommandResult` holds one),
+    so the discoverability path is a one-line pointer to `settings.catalog`.
+    """
+    result = resolve("settings.list").handler(db)
+    assert result.message is not None
+    assert "settings catalog" in result.message
 
 
 def test_list_shows_every_key_alphabetically(db: Database) -> None:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -68,6 +69,58 @@ def utcnow() -> datetime:
 
 
 # --------------------------------------------------------------------------
+# The worker's own output (BUGS.md entries 3, 10, 22, 41). Distinct from
+# `rytp/progress.py`: a lifecycle line and a stats line are discrete events,
+# not an animation, so they always print — tty or not — and never go
+# through the tty-only throttle a progress repaint uses. `_LOG_LOCK` exists
+# because several pool threads can log at once; without it two concurrent
+# lines can interleave mid-write.
+# --------------------------------------------------------------------------
+
+_LOG_LOCK = threading.Lock()
+
+
+def _log(message: str) -> None:
+    """One plain line to the worker's own stderr. No control characters,
+    so `cmd /c "rytp worker ... > run.log 2>&1"` gets exactly this text.
+    """
+    with _LOG_LOCK:
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+
+def _log_claimed(job: Q.Job, pool: str) -> None:
+    _log(f"job {job.id} claimed: kind={job.kind} target={job.target_id} pool={pool}")
+
+
+def _log_settled(
+    job: Q.Job, pool: str, outcome: str, *, elapsed_s: float,
+    note: str | None = None, error: str | None = None,
+) -> None:
+    bits = [f"job {job.id} {outcome} in {elapsed_s:.1f}s: "
+            f"kind={job.kind} target={job.target_id} pool={pool}"]
+    if note:
+        bits.append(f"note={note}")
+    if error:
+        bits.append(f"error={error}")
+    _log(" ".join(bits))
+
+
+def _log_stats(db: Database) -> None:
+    """A periodic "is the queue draining" line. Silent when there is
+    nothing pending or running, so a drained queue does not repeat itself
+    forever while a worker sits waiting for Ctrl-C.
+    """
+    stats = Q.stats(db)
+    if stats.by_state.get("pending", 0) == 0 and stats.by_state.get("running", 0) == 0:
+        return
+    counts = ", ".join(
+        f"{state}={n}" for state, n in stats.by_state.items() if n
+    )
+    _log(f"queue: {counts}")
+
+
+# --------------------------------------------------------------------------
 # The lease. A crashed worker must not strand jobs in ``running`` forever,
 # and the jobs table has no column to record who owns a row, so ownership
 # lives in settings instead.
@@ -108,6 +161,24 @@ def acquire_lease(db: Database, *, now: datetime | None = None) -> None:
                     "heartbeat": stamp.isoformat()}),
     )
     Q.reclaim_running(db, now=stamp)
+
+
+def live_lease(db: Database, *, now: datetime | None = None) -> dict[str, object] | None:
+    """The lease of a worker that is actually alive, or None.
+
+    Same staleness rule `acquire_lease` enforces, read-only: a lease whose
+    heartbeat is older than `WORKER_LEASE_STALE_S` belongs to a worker that
+    died, and a caller should treat the queue as unattended.
+
+    Exists because "you queued work and nothing is draining it" was
+    invisible (BUGS.md entry 41) while the fact was already recorded here.
+    """
+    held = _lease(db)
+    if held is None:
+        return None
+    beat = str(held.get("heartbeat") or "")
+    cutoff = ((now or utcnow()) - timedelta(seconds=C.WORKER_LEASE_STALE_S)).isoformat()
+    return held if beat > cutoff else None
 
 
 def heartbeat(db: Database, *, now: datetime | None = None) -> None:
@@ -178,6 +249,8 @@ def _handle_failure(
     job: Q.Job,
     exc: Exception,
     *,
+    pool: str,
+    elapsed_s: float,
     policy: P.DownloadPolicy,
     report: WorkerReport,
     now: datetime,
@@ -198,18 +271,21 @@ def _handle_failure(
         Q.defer(db, job.id, not_before=until, error=message, refund_attempt=True)
         with report.lock:
             report.deferred += 1
+        _log_settled(job, pool, "deferred", elapsed_s=elapsed_s, error=message)
         return
 
     if permanent or job.attempts >= C.JOB_MAX_ATTEMPTS:
         Q.fail(db, job.id, error=message, now=now)
         with report.lock:
             report.failed += 1
+        _log_settled(job, pool, "failed", elapsed_s=elapsed_s, error=message)
         return
 
     retry_at = (now + timedelta(seconds=C.TRANSIENT_BACKOFF_S)).isoformat()
     Q.defer(db, job.id, not_before=retry_at, error=message)
     with report.lock:
         report.deferred += 1
+    _log_settled(job, pool, "deferred", elapsed_s=elapsed_s, error=message)
 
 
 def run_pool_once(
@@ -232,25 +308,44 @@ def run_pool_once(
         return False
     with report.lock:
         report.claimed += 1
+    _log_claimed(job, pool)
+    started = time.monotonic()
 
     spec = resolve_job_kind(job.kind)
     readiness = spec.readiness(db, job.target_id)
     if readiness is Readiness.SATISFIED:
-        Q.finish(db, job.id, now=now)
+        # Leave a note. Without one this row reads `done` with a blank
+        # note, indistinguishable from a job that did the work — which is
+        # how "I queued a transcribe and nothing happened" looks from the
+        # outside when the video already had words.
+        Q.finish(db, job.id, note=C.JOB_ALREADY_SATISFIED_NOTE, now=now)
         with report.lock:
             report.done += 1
+        _log_settled(job, pool, "done", elapsed_s=time.monotonic() - started,
+                     note=C.JOB_ALREADY_SATISFIED_NOTE)
         return True
     if readiness is Readiness.BLOCKED:
         Q.block(db, job.id, reason="prerequisites are not in place", now=now)
         with report.lock:
             report.blocked += 1
+        _log_settled(job, pool, "blocked", elapsed_s=time.monotonic() - started,
+                     error="prerequisites are not in place")
         return True
 
     try:
-        with PR.install(_DbProgressSink(db, job.id)):
+        # `PR.combine` folds in whatever sink was already installed — the
+        # terminal's default one on a foreground run — instead of replacing
+        # it the way a bare `PR.install(_DbProgressSink(...))` used to
+        # (BUGS.md entries 3, 10, 22): that swap is what made a foreground
+        # `rytp worker` silent for a whole handler call.
+        outer = PR.current()
+        with PR.install(PR.combine(outer, _DbProgressSink(db, job.id))):
             note = spec.handler(db, job.target_id, job.payload)
     except Exception as exc:
-        _handle_failure(db, job, exc, policy=policy, report=report, now=now_fn())
+        _handle_failure(
+            db, job, exc, pool=pool, elapsed_s=time.monotonic() - started,
+            policy=policy, report=report, now=now_fn(),
+        )
     else:
         if pool == "network":
             P.clear_throttle(db)
@@ -265,6 +360,8 @@ def run_pool_once(
         # target's namespace so a render's id can never collide with a video.
         Q.unblock(db, target_id=job.target_id, target_kind=spec.target_kind,
                   now=now_fn())
+        _log_settled(job, pool, "done", elapsed_s=time.monotonic() - started,
+                     note=note)
         with report.lock:
             report.done += 1
 
@@ -303,6 +400,7 @@ def _drain_inline(db: Database, options: WorkerOptions, report: WorkerReport,
     order would only work by accident.
     """
     policy = P.DownloadPolicy.from_settings(db)
+    last_stats = float("-inf")
     progressed = True
     while progressed and not _budget_spent(options, report):
         progressed = False
@@ -312,6 +410,10 @@ def _drain_inline(db: Database, options: WorkerOptions, report: WorkerReport,
                                      report=report, sleep=sleep, now_fn=now_fn):
                     break
                 progressed = True
+                now_mono = time.monotonic()
+                if now_mono - last_stats >= C.WORKER_STATS_LOG_INTERVAL_S:
+                    _log_stats(db)
+                    last_stats = now_mono
 
 
 def _pool_loop(db_path: Path, pool: str, options: WorkerOptions,
@@ -347,6 +449,12 @@ def run_worker(
     rng = rng or random.Random()
 
     acquire_lease(db, now=now_fn())
+    # Say hello. Without this a worker started against an empty queue
+    # prints nothing at all until a job arrives, which is the same "is it
+    # even running?" doubt that BUGS.md entries 41 and 42 are about — and
+    # the lease is what `jobs list` checks, so naming the pid here lets an
+    # operator match the two up.
+    _log(f"worker {os.getpid()} watching pools: {', '.join(options.pools)}")
     Q.reconcile(db, now=now_fn())
     try:
         if options.once:
@@ -372,10 +480,14 @@ def run_worker(
             # supervisor polls often and heartbeats on its own slower clock,
             # so shutdown is prompt even with a long heartbeat interval.
             last_beat = float("-inf")
+            last_stats = float("-inf")
             while any(t.is_alive() for t in threads):
                 if time.monotonic() - last_beat >= C.WORKER_HEARTBEAT_INTERVAL_S:
                     heartbeat(db, now=now_fn())
                     last_beat = time.monotonic()
+                if time.monotonic() - last_stats >= C.WORKER_STATS_LOG_INTERVAL_S:
+                    _log_stats(db)
+                    last_stats = time.monotonic()
                 stop.wait(options.poll_interval_s)
         except KeyboardInterrupt:
             pass

@@ -78,11 +78,13 @@ def render_result(result: CommandResult) -> str:
     piped into other tools, so column alignment by spaces beats box
     drawing that reflows with the terminal width.
 
-    A cell may carry embedded newlines — `transcript show --line-length`
-    wraps its text column this way (BUGS.md entry 15). A column's width is
-    the longest *single line* within it, not the raw string length, and a
-    wrapped cell prints as continuation lines under its own column instead
-    of spilling across the rest of the row.
+    A cell may carry embedded newlines. Nothing emits them today —
+    `transcript show` builds short rows rather than wrapping one long one
+    (BUGS.md entry 37) — but the handling is kept because the alternative
+    failure is ugly: a column's width is the longest *single line* within
+    it, not the raw string length, and a multi-line cell prints as
+    continuation lines under its own column instead of spilling across the
+    rest of the row.
     """
     lines: list[str] = []
     if result.message:

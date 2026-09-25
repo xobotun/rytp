@@ -12,6 +12,7 @@ from rytp.assemble.match import (
     Plan,
     SubstitutionHit,
     build_run_table,
+    diagnose_absence,
     edit_distance_at_most,
     find_occurrences,
     pad_fragments,
@@ -32,6 +33,15 @@ from tests.assembly_corpus import (
 )
 
 TARGET = "мы все понимаем что это неизбежно"
+
+
+def energy_floor(floor: float) -> MatchFilters:
+    """A filter whose only change from the default is the energy-scale floor
+    (plan §1a) — everything the fixtures here write is energy-scale by
+    default (see ``tests.assembly_corpus.add_words``)."""
+    return MatchFilters(
+        min_align_by_scale={**C.ASSEMBLE_MIN_ALIGN_BY_SCALE, C.ALIGN_SCALE_ENERGY: floor}
+    )
 
 
 @pytest.fixture()
@@ -135,8 +145,103 @@ def test_excluded_videos_are_dropped(db: Database, corpus: tuple[int, int]) -> N
 def test_min_align_score_drops_badly_anchored_words(db: Database) -> None:
     video_id = add_video(db, external_id="VIDEO_A")
     add_words(db, video_id, "неизбежно", align_score=0.3)
-    assert find_occurrences(db, "неизбежно", MatchFilters(min_align_score=0.5)) == []
-    assert find_occurrences(db, "неизбежно", MatchFilters(min_align_score=0.2)) != []
+    assert find_occurrences(db, "неизбежно", energy_floor(0.5)) == []
+    assert find_occurrences(db, "неизбежно", energy_floor(0.2)) != []
+
+
+# -- plan §1a: per-scale eligibility (BUGS.md entries 26, 28) --------------
+
+
+def test_a_wav2vec2_shaped_logprob_corpus_is_eligible(db: Database) -> None:
+    """entry 26: log-probabilities are negative by definition, so a fixed
+    0.0 floor rejected every wav2vec2-aligned word. The scale-keyed floor
+    fixes it without ever converting the score."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "неизбежно", align_score=-0.96, align_scale=C.ALIGN_SCALE_LOGPROB)
+    assert find_occurrences(db, "неизбежно", MatchFilters()) != []
+
+
+def test_a_logprob_word_below_its_own_floor_is_excluded(db: Database) -> None:
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "неизбежно", align_score=-9.0, align_scale=C.ALIGN_SCALE_LOGPROB)
+    assert find_occurrences(db, "неизбежно", MatchFilters()) == []
+
+
+def test_a_none_scale_word_has_no_floor_at_all(db: Database) -> None:
+    """MFA reports no score, and contracts §3 permits that: `align_scale =
+    'none'` with a NULL score is a real aligner having nothing to report,
+    not something to gate on."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "неизбежно", align_score=None, align_scale=C.ALIGN_SCALE_NONE)
+    assert find_occurrences(db, "неизбежно", MatchFilters()) != []
+
+
+def test_an_unknown_scale_word_is_excluded_regardless_of_its_score(db: Database) -> None:
+    """entry 36's fabricated boundaries, and entry 28's un-identifiable
+    sign flips: `unknown` is excluded outright, never floored — a very
+    good-looking score proves nothing about a corrupted row."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "неизбежно", align_score=0.99, align_scale=C.ALIGN_SCALE_UNKNOWN)
+    assert find_occurrences(db, "неизбежно", MatchFilters()) == []
+
+
+def test_ordering_within_a_scale_still_prefers_the_better_score(db: Database) -> None:
+    """entry 28: ordering must never cross scales, but within one scale
+    the best-anchored word still comes first."""
+    worse = add_video(db, external_id="VIDEO_A")
+    add_words(db, worse, "неизбежно", align_score=-3.0, align_scale=C.ALIGN_SCALE_LOGPROB)
+    better = add_video(db, external_id="VIDEO_B")
+    add_words(db, better, "неизбежно", align_score=-0.1, align_scale=C.ALIGN_SCALE_LOGPROB)
+    found = find_occurrences(db, "неизбежно", MatchFilters())
+    assert [row.video_id for row in found] == [better, worse]
+
+
+def test_timed_words_are_invisible_by_default_even_when_scored_well(db: Database) -> None:
+    """D1: `--allow-timed` gates by tier alone. A `timed` row is never
+    admitted by score, however good it looks, unless the flag is set."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "неизбежно", source="timed")
+    assert find_occurrences(db, "неизбежно", MatchFilters()) == []
+    assert find_occurrences(db, "неизбежно", MatchFilters(allow_timed=True)) != []
+
+
+def test_allow_timed_admits_timed_words_with_no_threshold(db: Database) -> None:
+    """D1: an override, not a gate — no threshold, no quality logic."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(
+        db, video_id, "неизбежно", source="timed", align_score=None, align_scale=None
+    )
+    found = find_occurrences(db, "неизбежно", MatchFilters(allow_timed=True))
+    assert [row.source for row in found] == ["timed"]
+
+
+def test_allow_timed_still_excludes_caption_tier(db: Database) -> None:
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "неизбежно", source="caption")
+    assert find_occurrences(db, "неизбежно", MatchFilters(allow_timed=True)) == []
+
+
+def test_the_occurrence_lookup_admits_both_tiers_under_allow_timed(db: Database) -> None:
+    """The UNION ALL branches independently: an aligned word and a timed
+    word for the same token both surface once the flag is set."""
+    aligned_video = add_video(db, external_id="VIDEO_A")
+    add_words(db, aligned_video, "неизбежно")
+    timed_video = add_video(db, external_id="VIDEO_B")
+    add_words(db, timed_video, "неизбежно", source="timed")
+    found = find_occurrences(db, "неизбежно", MatchFilters(allow_timed=True))
+    assert {row.video_id for row in found} == {aligned_video, timed_video}
+
+
+def test_a_run_reports_the_weakest_tier_it_contains(db: Database) -> None:
+    """A run mixing an aligned and a timed word (only possible under
+    --allow-timed) must report `timed`, not silently look fully aligned."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "мы")
+    add_words(db, video_id, "все", start_ms=WORD_MS, source="timed")
+    filters = MatchFilters(allow_timed=True)
+    table = build_run_table(db, ("мы", "все"), filters)
+    run = table[(0, 2)][video_id]
+    assert run.tier == "timed"
 
 
 def test_occurrences_are_capped_per_video_to_keep_sources_diverse(db: Database) -> None:
@@ -602,3 +707,31 @@ def test_substitutions_are_deterministic(db: Database, substitution_corpus: int)
     assert suggest_substitutions(db, "дела", MatchFilters()) == suggest_substitutions(
         db, "дела", MatchFilters()
     )
+
+
+def test_an_absent_word_names_the_forms_the_corpus_does_have(db: Database) -> None:
+    """BUGS.md entry 46: search finds an inflected form by stem and shows a
+    hit; assembly refuses, because cutting `каннибализмом` to say
+    `каннибализм` puts the wrong word in the video. The refusal is right —
+    reporting it as "never said in the corpus" while search displays a hit
+    is what made it read as a contradiction."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "нас окружает каннибализмом сегодня", source="timed")
+
+    diagnosis = diagnose_absence(db, "каннибализм", MatchFilters())
+
+    assert diagnosis.total == 0, "the exact form is genuinely absent"
+    assert diagnosis.stem_forms, "but a form sharing its stem is present"
+    assert diagnosis.stem_forms[0][0] == "каннибализмом"
+
+
+def test_a_word_absent_in_every_form_names_nothing(db: Database) -> None:
+    """The original message is still right when it is right."""
+    video_id = add_video(db, external_id="VIDEO_A")
+    add_words(db, video_id, "совершенно другие слова", source="timed")
+
+    diagnosis = diagnose_absence(db, "каннибализм", MatchFilters())
+
+    assert diagnosis.total == 0
+    assert diagnosis.stem_forms == ()
+

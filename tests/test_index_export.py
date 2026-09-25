@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import shutil
 import struct
 import subprocess
@@ -328,6 +329,78 @@ def test_an_unmapped_label_shows_the_raw_diarizer_label(db: Database) -> None:
 def test_an_undiarized_block_shows_the_null_cell(db: Database) -> None:
     video_id = corpus(db, "Добрый вечер")
     assert transcript_blocks(db, video_id)[0].speaker == C.NULL_CELL
+
+
+# -- entry 37: splitting a block into shorter rows, at a word boundary ------
+
+
+def test_max_chars_none_is_unsplit_and_unchanged(db: Database) -> None:
+    """The default (`transcript.build`'s durable file) is exactly the old
+    one-block-per-utterance shape — splitting is opt-in via `max_chars`."""
+    words = ["слово"] * 20 + ["конец"]
+    video_id = corpus(db, " ".join(words))
+    blocks = transcript_blocks(db, video_id)
+    assert len(blocks) == 1
+    assert blocks[0].text == " ".join(words)
+    assert blocks[0].anchor == f"v{video_id}:0-20"
+
+
+def test_a_long_block_splits_into_several_rows_at_word_boundaries(db: Database) -> None:
+    words = ["слово"] * 20 + ["конец"]
+    video_id = corpus(db, " ".join(words))
+    blocks = transcript_blocks(db, video_id, max_chars=20)
+    assert len(blocks) > 1
+    for block in blocks:
+        assert len(block.text) <= 20
+        # Never a word cut in half: every row is whole words, space-joined.
+        assert all(word in words for word in block.text.split())
+    # Reassembling every row's words, in order, reproduces the utterance.
+    assert " ".join(block.text for block in blocks) == " ".join(words)
+
+
+def test_a_word_longer_than_max_chars_is_its_own_row(db: Database) -> None:
+    """Never split a word, even one over the limit on its own (entry 37)."""
+    video_id = corpus(db, "тут оченьдлинноеслововотакоечтобывышлозалимит еще")
+    blocks = transcript_blocks(db, video_id, max_chars=5)
+    texts = [block.text for block in blocks]
+    assert "оченьдлинноеслововотакоечтобывышлозалимит" in texts
+
+
+def test_splitting_gives_every_row_its_own_anchor(db: Database) -> None:
+    """Entry 37's second decision: sub-anchors, not one anchor repeated.
+    `search play` resolves an anchor purely by word-ordinal range
+    (`span_for_anchor`, against `words`, never `utterances`), so a split
+    row's own range was always resolvable — this is what starts handing
+    one out per row instead of the whole utterance's."""
+    words = ["слово"] * 20 + ["конец"]
+    video_id = corpus(db, " ".join(words))
+    blocks = transcript_blocks(db, video_id, max_chars=20)
+    anchors = [block.anchor for block in blocks]
+    assert len(anchors) == len(set(anchors))
+    for block in blocks:
+        span = span_for_anchor(db, block.anchor)
+        assert span.start_ms == block.start_ms
+        assert span.end_ms == block.end_ms
+        assert span.text == block.text
+
+
+def test_a_caption_tier_split_rows_end_falls_back_to_the_next_words_start(
+    db: Database,
+) -> None:
+    """Caption words carry no `end_ms` (contracts §3). A split row that is
+    not the utterance's last row ends where the next row starts — the same
+    fallback `implied_end_ms` uses for a whole utterance, scoped to one."""
+    words = ["слово"] * 10 + ["конец"]
+    video_id = corpus(db, " ".join(words), source="caption")
+    whole = transcript_blocks(db, video_id)[0]
+    split = transcript_blocks(db, video_id, max_chars=20)
+    assert len(split) > 1
+    for row, next_row in itertools.pairwise(split):
+        assert row.end_ms == next_row.start_ms
+    # The last row's end is the *utterance's* own end — already computed
+    # with the next utterance (or the caption fallback cap) in mind, which
+    # a purely local, in-utterance fallback cannot see.
+    assert split[-1].end_ms == whole.end_ms
 
 
 def test_the_rendered_document_has_a_title_a_header_and_the_blocks(

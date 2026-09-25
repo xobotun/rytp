@@ -1,9 +1,19 @@
 """Catalog commands: register channels and videos, and list them (design §5).
 
-Cataloguing is deliberately separate from acquisition. These commands
-write rows and nothing else — no downloads, no jobs, no files on disk.
-Design §5: "`rytp videos add <url>` catalogs only. `rytp ingest <id>`
-enqueues the chain."
+Cataloguing writes rows; it never downloads and never runs anything
+synchronously. For a single video, though, it does enqueue that video's
+acquisition chain by default: `rytp videos add <url>` registers the row
+*and* enqueues the same chain `rytp ingest <id>` would (BUGS.md entry 1 —
+the owner's first command was `fetch-video <url>` on a video that had
+never been catalogued, because registering and acquiring were separate
+steps and nothing said so). `--register-only` restores the old
+catalog-and-stop behaviour. Enqueueing only writes job rows; nothing is
+fetched until a worker (`rytp worker`) drains them.
+
+`channel add` and `channel sync` are unchanged and still catalog only.
+A channel's chain is potentially thousands of videos, so auto-enqueueing
+there is not safe the way it is for one video; bulk ingestion stays an
+explicit `rytp ingest --channel-id <id> --pending`.
 """
 
 from __future__ import annotations
@@ -15,9 +25,16 @@ from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 
-from rytp import config
+from rytp import config, timefmt
 from rytp import constants as C
-from rytp.commands import Command, CommandResult, Param, register, resolve_video_id
+from rytp.commands import (
+    Command,
+    CommandResult,
+    Param,
+    register,
+    resolve,
+    resolve_video_id,
+)
 from rytp.db import Database
 from rytp.db import queries as q
 from rytp.models import (
@@ -173,13 +190,16 @@ def looks_local(target: str) -> bool:
 
 
 def format_duration(ms: int | None) -> str:
-    """Milliseconds as H:MM:SS, or the null placeholder."""
+    """Milliseconds as H:MM:SS, or the null placeholder.
+
+    A duration in a listing — delegates to
+    :func:`rytp.timefmt.format_length`; the ``None`` branch is this
+    command's own (a video with no measured duration), not the
+    formatter's (BUGS.md entry 31).
+    """
     if ms is None:
         return C.NULL_CELL
-    seconds, _ = divmod(int(ms), C.MS_PER_SECOND)
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return timefmt.format_length(ms)
 
 
 def resolve_channel(db: Database, ref: str) -> int:
@@ -205,8 +225,16 @@ def videos_add(
     title: str | None = None,
     kind: str | None = None,
     channel: str | None = None,
+    register_only: bool = False,
 ) -> CommandResult:
-    """Catalog one video from a URL or a local file. Nothing is downloaded."""
+    """Catalog one video from a URL or a local file, then enqueue its chain.
+
+    Nothing is downloaded here: enqueueing only writes `jobs` rows (BUGS.md
+    entry 41 — a worker still has to drain them). `--register-only` stops
+    after the catalog row, the module's old default. The chain itself is
+    `ingest`'s (`rytp/commands/ingest.py`) — reused via `resolve("ingest")`
+    rather than duplicated, so its composition stays defined in one place.
+    """
     target = target.strip()
     if not target:
         raise InvalidInputError("videos add needs a URL or a file path")
@@ -252,10 +280,30 @@ def videos_add(
         duration_ms=duration_ms,
         published_at=published_at,
     )
+    columns = ("id", "source", "kind", "title")
+    rows = ((str(video_id), source, resolved_kind, truncate(resolved_title)),)
+    catalog_message = f"{'added' if created else 'updated'} video {video_id}"
+    if register_only:
+        return CommandResult(columns=columns, rows=rows, message=catalog_message)
+
+    # Same handler `rytp ingest <id>` calls, so the chain's composition
+    # (contracts §5, INGEST_CHAIN_LOCAL/REMOTE) is defined once. This only
+    # writes job rows; the summary below is built from `ingest_result.rows`
+    # rather than reused verbatim, so it says "queued" — nothing has run,
+    # and a message that let "ingested" stand alone would say otherwise
+    # (BUGS.md entry 41).
+    ingest_result = resolve("ingest").handler(db, video=str(video_id))
+    queued_kinds = [kind for kind, *_ in ingest_result.rows]
+    if queued_kinds:
+        chain_message = (
+            f"queued {', '.join(queued_kinds)}; run `rytp worker` to drain them"
+        )
+    else:
+        chain_message = "nothing to queue"
     return CommandResult(
-        columns=("id", "source", "kind", "title"),
-        rows=((str(video_id), source, resolved_kind, truncate(resolved_title)),),
-        message=f"{'added' if created else 'updated'} video {video_id}",
+        columns=columns,
+        rows=rows,
+        message=f"{catalog_message}; {chain_message}",
     )
 
 
@@ -692,7 +740,11 @@ register(
     Command(
         name="videos.add",
         group="videos",
-        summary="Catalog one video from a URL or a local file. Nothing is downloaded.",
+        summary=(
+            "Catalog one video from a URL or a local file, and enqueue its "
+            "acquisition chain. Nothing is downloaded here; a worker still "
+            "has to drain the queue."
+        ),
         params=(
             Param("target", str, "A URL, or a path to a local media file.", positional=True),
             Param(
@@ -704,6 +756,13 @@ register(
             Param("kind", str, "Video kind.", default=None, choices=C.VIDEO_KINDS),
             Param(
                 "channel", str, "Channel id, URL or title to file it under.", default=None
+            ),
+            Param(
+                "register_only",
+                bool,
+                "Catalog the row and stop — do not enqueue the acquisition "
+                "chain. Enqueue it later with `rytp ingest <id>`.",
+                default=False,
             ),
         ),
         handler=videos_add,

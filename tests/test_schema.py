@@ -401,7 +401,7 @@ def test_migrating_from_version_12_backfills_align_scale(data_dir: Path) -> None
             (video_id,),
         )
 
-        assert database.migrate() == 15
+        assert database.migrate() == 16
 
         rows = {
             row["ord"]: (row["source"], row["align_score"], row["align_scale"])
@@ -447,6 +447,49 @@ def test_a_timed_row_with_no_score_backfills_no_scale(data_dir: Path) -> None:
             "SELECT align_scale FROM words WHERE ord = 0"
         ).fetchone()
         assert row["align_scale"] is None
+    finally:
+        database.close()
+
+
+def test_migrating_from_version_15_gains_the_original_timing_columns_as_null(
+    data_dir: Path,
+) -> None:
+    """Migration 16, contracts amendment §7. A database stopped at version
+    15 — the shape every live database had before this feature — gains
+    `orig_start_ms`/`orig_end_ms`, both NULL on every existing row: there is
+    no guess worth backfilling, the same call migration 13 made for
+    `align_scale`'s `unknown`."""
+    from rytp.config import ensure_dir, paths
+
+    ensure_dir(paths().root)
+    database = Database(paths().db)
+    try:
+        assert database.migrate_to(15) == 15
+
+        video_id = seed_video(database)
+        database.conn.execute(
+            "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text,"
+            " stem, source, engine)"
+            " VALUES (?, 0, 0, 100, 'да', 'да', 'да', 'timed', 'whisper')",
+            (video_id,),
+        )
+        database.conn.execute(
+            "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text,"
+            " stem, source, engine)"
+            " VALUES (?, 1, 100, 200, 'нет', 'нет', 'нет', 'aligned', 'wav2vec2')",
+            (video_id,),
+        )
+
+        assert database.migrate() == 16
+
+        rows = {
+            row["ord"]: (row["orig_start_ms"], row["orig_end_ms"])
+            for row in database.conn.execute(
+                "SELECT ord, orig_start_ms, orig_end_ms FROM words ORDER BY ord"
+            )
+        }
+        assert rows[0] == (None, None)
+        assert rows[1] == (None, None)
     finally:
         database.close()
 

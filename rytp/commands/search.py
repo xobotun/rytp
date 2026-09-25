@@ -10,7 +10,6 @@ surface decides what it looks like.
 
 from __future__ import annotations
 
-import textwrap
 from pathlib import Path
 
 from rytp import config
@@ -236,15 +235,21 @@ def transcript_show(
     leaving a file behind. Both render from these rows, which is what
     keeps the two surfaces saying the same thing (design §10).
 
-    `line_length` wraps each block's text to a chosen width instead of
-    whatever the table happens to do with a long line (BUGS.md entry 15).
-    It applies only here: `transcript.build` writes a regenerable file, not
-    a terminal-sized rendering, so it has no equivalent knob.
+    `line_length` is the maximum characters a row's text may hold, not a
+    wrap width (BUGS.md entry 37 — it replaces an earlier `textwrap.fill`
+    that folded a long block into a multi-line cell `DataTable.add_row`
+    then clipped to its first line). An utterance longer than that is
+    split at a word boundary into *more* rows instead, each with its own
+    start, end and anchor — `transcript_blocks` does the splitting, since
+    only there are the individual word rows, with their own `start_ms`,
+    still available. It applies only here: `transcript.build` writes a
+    regenerable markdown file, not a terminal-sized table, so it has no
+    equivalent knob.
     """
     video_id = resolve_video_id(db, video)
     if line_length < 1:
         raise RytpError(f"line_length must be at least 1, got {line_length}")
-    blocks = transcript_blocks(db, video_id)
+    blocks = transcript_blocks(db, video_id, max_chars=line_length)
     if not blocks:
         raise RytpError(
             f"video {video_id} has no utterances; run `rytp index build "
@@ -258,7 +263,7 @@ def transcript_show(
                 timestamp(block.start_ms),
                 timestamp(block.end_ms),
                 block.speaker,
-                textwrap.fill(block.text, width=line_length),
+                block.text,
             )
             for block in blocks
         ),
@@ -438,8 +443,8 @@ register(
         name="transcript.build",
         group="transcript",
         summary="Write the regenerable markdown transcript for one video. No "
-        "--line-length: a hard wrap would bake a terminal's width into the "
-        "stored file — see `transcript show` for that.",
+        "--line-length: splitting a long block into extra rows is a table "
+        "concern — see `transcript show` for that.",
         params=(
             Param("video", str, "Video to write a transcript for.", positional=True),
         ),
@@ -457,10 +462,11 @@ register(
             Param(
                 "line_length",
                 int,
-                "Wrap each line of text to this many characters. Only here, "
-                "not on `transcript build`: that command writes a durable "
-                "markdown file, where a hard wrap would bake a terminal's "
-                "width into a stored artefact.",
+                "Maximum characters a row's text may hold. A longer block is "
+                "split into more rows at a word boundary, each with its own "
+                "timestamps and anchor, rather than wrapped. Only here, not "
+                "on `transcript build`: that command writes a durable "
+                "markdown file, not a terminal-sized table.",
                 default=C.TRANSCRIPT_DEFAULT_LINE_LENGTH,
             ),
         ),

@@ -28,6 +28,25 @@ class NullDiarizer:
     out_of_process = False
     required_module: str | None = None
     extra: str | None = None
+    #: Contracts §6: a diarizer has no `words.align_score` to report, so
+    #: this is a fixed, honest placeholder — see
+    #: :class:`rytp.transcribe.engines.whisper.FasterWhisperTranscriber`.
+    score_scale = C.ALIGN_SCALE_NONE
+    #: No model, no GPU path — same as MFA (plan §1b).
+    device = "n/a"
+
+    def __init__(self, device: str = "n/a") -> None:
+        # Accepted and ignored: plan §1b has every adapter take the
+        # parameter uniformly (a caller may pass device= without special-
+        # casing the null diarizer), but there is no model here to place on
+        # a device, so the instance attribute stays "n/a" (MfaAligner's
+        # pattern).
+        del device
+        #: The null diarizer never has a non-fatal finding to report. Set
+        #: per instance (never a class-level default) so it satisfies the
+        #: `Diarizer` protocol's `notes: list[str]` as a genuine, mutable
+        #: instance attribute.
+        self.notes: list[str] = []
 
     def diarize(self, audio: Path) -> Iterable[DiarSegment]:
         yield DiarSegment(

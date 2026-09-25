@@ -6,9 +6,27 @@ it starts. Part 5 wrote the emitter and a loader built for a file a person has
 changed. What was missing is a place to make the change that is not another
 window with a text editor in it.
 
-Four verbs — swap, nudge, gap, undo — and a save. No database and no re-planning:
-the loader does not look at the database either, and a screen that quietly
-re-ran the assembler would discard the hand edits it exists to keep.
+Four verbs — swap, nudge, gap, undo — and a save. No database and no
+re-planning for any of the four: the loader does not look at the database
+either, and a screen that quietly re-ran the assembler on every keystroke
+would discard the hand edits it exists to keep.
+
+``retarget`` is the one deliberate exception (the owner's request: editing
+the target sentence — adding a word, or dropping one with no cuttable
+form — without losing the hand-tuning already done). It is the only method
+here that takes a ``Database``, for exactly the same reason `render`'s
+screen action takes one: this one edit really does need to consult the
+corpus, and design §8's "no quiet re-plan" is about the four boundary edits,
+not about refusing the owner's own explicit request to change the sentence.
+Nothing here writes to disk on its own — `retarget_cutlist` only builds a
+new in-memory `CutList`, dressed exactly like `assemble_target`'s, and this
+method folds it into the same undo/dirty machinery `swap`/`nudge`/etc. use,
+so the edit still waits for `ctrl+s` like any other.
+
+`play_target` is a fifth verb, of the harmless kind: it names a span to play
+but never plays it — the screen has the database handle `play_clip` needs
+and this module does not otherwise, so the screen calls `play_clip` itself,
+off the event loop, once this module has said which span.
 """
 
 from __future__ import annotations
@@ -17,19 +35,24 @@ import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from rytp import config
 from rytp import constants as C
+from rytp.assemble import retarget_cutlist
 from rytp.assemble.cutlist import (
     Alternative,
     CutList,
     CutlistError,
     Slot,
     load_cutlist,
+    newest_cutlist_paths,
+    target_from_slots,
     write_cutlist,
 )
+from rytp.assemble.match import SLOT_FRAGMENT
 from rytp.audio.energy import (
     AudioFormatError,
     find_energy_minimum,
@@ -38,6 +61,10 @@ from rytp.audio.energy import (
     snap_to_zero_crossing,
 )
 from rytp.audio.extract import wav_path
+from rytp.models import RytpError
+
+if TYPE_CHECKING:
+    from rytp.db import Database
 
 __all__ = ["CutlistSummary", "CutlistView", "available_cutlists"]
 
@@ -61,12 +88,10 @@ def available_cutlists() -> tuple[CutlistSummary, ...]:
 
     A file the owner mistyped is the one he most needs to find, so a load
     failure becomes a row with its complaint rather than a missing row.
+    Most recently modified first, matching `assemble list`.
     """
-    directory = config.paths().root / C.CUTLISTS_DIRNAME
-    if not directory.is_dir():
-        return ()
     found: list[CutlistSummary] = []
-    for path in sorted(directory.glob("*.toml")):
+    for path in newest_cutlist_paths():
         try:
             cutlist = load_cutlist(path)
         # `ValueError` because `tomllib.TOMLDecodeError` subclasses it, and a
@@ -109,7 +134,7 @@ def _ms(value: int | None) -> str:
 
 
 class CutlistView:
-    """The slots of one cut list, and the four edits worth making by hand."""
+    """The slots of one cut list, and the edits worth making by hand."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -201,12 +226,24 @@ class CutlistView:
         )
 
     # -- editing -----------------------------------------------------
+    #
+    # Owner's request: once a slot is hand-edited, the stored target no
+    # longer describes what the cut list will say — `retarget`'s own
+    # `каннибализм`/`каннибализмом` case, but also `remove`. Rather than
+    # mark it stale, `_replace_slot` and `remove` recompute it from the
+    # slots on every call (`target_from_slots`), so it is simply always
+    # true; `retarget` is the one exception, because it already writes a
+    # target its own new slots agree with by construction (see its own
+    # docstring) and recomputing over it here would be redundant, not
+    # wrong, but is skipped anyway rather than fought.
 
     def _replace_slot(self, index: int, slot: Slot) -> None:
         self._undo.append(self.cutlist)
         slots = list(self.cutlist.slots)
         slots[index] = slot
-        self.cutlist = dataclasses.replace(self.cutlist, slots=tuple(slots))
+        self.cutlist = dataclasses.replace(
+            self.cutlist, slots=tuple(slots), target=target_from_slots(slots)
+        )
         self.dirty = True
 
     def swap(self, slot_index: int, option_index: int) -> str:
@@ -397,6 +434,139 @@ class CutlistView:
             return f"no slot {slot_index}"
         self._replace_slot(slot_index, dataclasses.replace(slot, gap_before_ms=None))
         self.status = self._status(f"slot {slot_index} uses the measured pause again")
+        return self.status
+
+    def play_target(self, slot_index: int, option_index: int | None) -> tuple[int, int, int] | None:
+        """``(video_id, start_ms, end_ms)`` for whatever is selected, or
+        ``None`` when there is nothing to play.
+
+        The owner asked to hear the fragment being edited and the
+        candidates that could replace it, from one key. ``option_index``
+        is ``None`` when the fragment list holds the selection — this
+        plays the slot's *current, edited* span, never a span re-derived
+        from word ordinals, or a nudge would not be audible. Otherwise it
+        is the options pane's cursor row, and this plays that alternative
+        or substitution instead.
+
+        ``None`` covers a gap (no source, nothing to play) and an index
+        that is out of range — both are silent by design (BUGS.md-style
+        request from the owner): a gap is visibly a gap on screen, and a
+        key pressed repeatedly while auditioning fragments should not
+        narrate every miss.
+        """
+        slot = self.slot_at(slot_index)
+        if slot is None:
+            return None
+        if option_index is None:
+            if slot.kind != "fragment" or slot.video_id is None:
+                return None
+            if slot.start_ms is None or slot.end_ms is None:
+                return None
+            return slot.video_id, slot.start_ms, slot.end_ms
+        what, _ = self._options(slot)
+        if what == "alternative":
+            if not (0 <= option_index < len(slot.alternatives)):
+                return None
+            alt = slot.alternatives[option_index]
+            return alt.video_id, alt.start_ms, alt.end_ms
+        if not (0 <= option_index < len(slot.substitutions)):
+            return None
+        sub = slot.substitutions[option_index]
+        return sub.video_id, sub.start_ms, sub.end_ms
+
+    def remove(self, slot_index: int) -> str:
+        """Drop a slot out of the sequence entirely — not into a gap.
+
+        BUGS.md entry 46 already drew this line once, for search versus
+        assembly: "not said in this exact form" and "never said in the
+        corpus" are different facts, and reporting the first as the second
+        was the bug. The same distinction applies here, and matters more,
+        because it would be written to disk. ``kind = "gap"`` means the
+        corpus does not say this word at all — that is
+        ``rytp/assemble/match.py``'s own meaning for it, and
+        ``rytp/render/run.py``'s ``request_from_cutlist`` reads it that way
+        too: every slot whose ``kind`` is not ``"fragment"`` becomes a
+        ``MissingWord`` in the render's report and source list. A fragment
+        the owner no longer wants in the splice is not that — the corpus
+        does say it, the edit just does not want it *here* — so turning a
+        removal into a gap would have the render announce, for a word it
+        plainly did cut before, "the corpus does not say this."
+
+        A third ``kind`` was considered and is not what this does.
+        ``rytp/assemble/cutlist.py``'s reader accepts exactly
+        ``{"fragment", "gap"}`` and ``render/run.py``'s dispatch is
+        binary — fragment, or else missing — so a third value would either
+        fail to load or silently fall into "missing" anyway. Either way
+        that is a schema change touching a module this task does not own,
+        so it is not made here without raising it as a contracts question.
+
+        Instead this removes the slot from ``cutlist.slots`` outright. The
+        file format is unchanged — one fewer fragment or gap, nothing new
+        in either — and everything downstream already treats the sequence
+        as authoritative, so dropping a position from it needs no new
+        machinery: undo restores the whole prior list, save writes exactly
+        what remains, and a save/load round trip is exactly as faithful as
+        it is for any other edit.
+
+        The one guard: never remove the last slot. ``load_cutlist`` itself
+        refuses a file with none ("no slots; a cut list needs at least one
+        [[slot]] table") — this borrows that rule rather than saving a file
+        that cannot be read back.
+        """
+        slot = self.slot_at(slot_index)
+        if slot is None:
+            return f"no slot {slot_index}"
+        if len(self.cutlist.slots) <= 1:
+            return "cannot remove the only slot left; a cut list needs at least one"
+        self._undo.append(self.cutlist)
+        slots = list(self.cutlist.slots)
+        del slots[slot_index]
+        self.cutlist = dataclasses.replace(
+            self.cutlist, slots=tuple(slots), target=target_from_slots(slots)
+        )
+        self.dirty = True
+        kind_word = "fragment" if slot.kind == SLOT_FRAGMENT else "gap"
+        self.status = self._status(
+            f'slot {slot_index} removed ({kind_word} "{slot.text}")'
+        )
+        return self.status
+
+    def retarget(self, db: Database, new_target: str) -> str:
+        """Edit the target sentence, replanning only the words that changed
+        (owner's request; BUGS.md entry 26/`каннибализм`'s "the only remedy
+        throws away every hand edit").
+
+        Joins the same undo/dirty machinery every other edit here uses: on
+        success the new, dressed `CutList` replaces `self.cutlist` and
+        `dirty` is set, but nothing is written until `save`. A no-op edit
+        (retyping the same text) touches neither, so pressing the key twice
+        by habit does not manufacture an unsaved change.
+
+        `retarget_cutlist` raises `InvalidInputError` for an empty or
+        too-long target, or for a cut list whose slots no longer partition
+        its recorded target (a hand edit could in principle break that);
+        either is reported here rather than crashing the screen.
+        """
+        new_target = new_target.strip()
+        if not new_target:
+            return "a target cannot be empty"
+        if new_target == self.cutlist.target:
+            self.status = self._status("target unchanged")
+            return self.status
+        try:
+            result = retarget_cutlist(db, self.cutlist, new_target)
+        except RytpError as exc:
+            return str(exc)
+        self._undo.append(self.cutlist)
+        self.cutlist = result.cutlist
+        self.dirty = True
+        note = (
+            f"retargeted: kept {result.kept} slot{'' if result.kept == 1 else 's'}, "
+            f"replanned {result.replanned}"
+        )
+        if result.gap_notes:
+            note += "; " + "; ".join(result.gap_notes)
+        self.status = self._status(note)
         return self.status
 
     def undo(self) -> str:

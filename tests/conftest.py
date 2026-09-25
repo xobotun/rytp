@@ -69,3 +69,23 @@ def db(data_dir: Path) -> Iterator[Database]:
         yield database
     finally:
         database.close()
+
+
+@pytest.fixture(autouse=True)
+def _stable_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the rendering environment so assertions on output are stable.
+
+    Several tests assert on rendered help and tables. `rich` honours
+    `FORCE_COLOR`/`CLICOLOR_FORCE` even when stdout is not a terminal, and
+    reads `COLUMNS` for its width — so a developer whose shell exports
+    either gets ANSI escapes and a different wrap width, and assertions
+    like `"--kind" in result.stdout` fail for reasons unrelated to the
+    code. Seen for real: `FORCE_COLOR=3` with `COLUMNS=0` split a flag
+    across two lines.
+
+    A test that genuinely cares about colour should set it itself.
+    """
+    for name in ("FORCE_COLOR", "CLICOLOR_FORCE", "NO_COLOR", "CLICOLOR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("COLUMNS", "100")
+

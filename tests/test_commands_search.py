@@ -11,6 +11,7 @@ from rytp import constants as C
 from rytp.commands import COMMANDS, CommandResult, resolve
 from rytp.db import Database
 from rytp.index import export
+from rytp.index.search import span_for_anchor
 from rytp.index.utterances import index_video
 from rytp.models import NotFoundError, RytpError
 from tests.test_index_search import add_words, corpus, name_speaker
@@ -503,17 +504,62 @@ def test_transcript_show_defaults_to_the_configured_line_length(db: Database) ->
     assert param.default == C.TRANSCRIPT_DEFAULT_LINE_LENGTH
 
 
-def test_transcript_show_wraps_a_long_line_to_the_requested_width(db: Database) -> None:
-    video_id = corpus(db, "слово " * 30 + "конец")
+def test_transcript_show_splits_a_long_line_into_more_rows_not_more_lines(
+    db: Database,
+) -> None:
+    """BUGS.md entry 37: `--line-length` is a row-building parameter now,
+    not a wrap width. A block over the limit becomes *more rows*, each a
+    single line — never a multi-line cell, which is what used to collide
+    with `DataTable.add_row`'s `height=1` default in the TUI."""
+    words = ["слово"] * 30 + ["конец"]
+    video_id = corpus(db, " ".join(words))
     wide = resolve("transcript.show").handler(db, video=str(video_id))
     narrow = resolve("transcript.show").handler(
         db, video=str(video_id), line_length=20
     )
-    wide_text = wide.rows[0][4]
-    narrow_text = narrow.rows[0][4]
-    assert max(len(line) for line in narrow_text.splitlines()) <= 20
-    assert max(len(line) for line in wide_text.splitlines()) <= C.TRANSCRIPT_DEFAULT_LINE_LENGTH
-    assert narrow_text.replace("\n", " ") == wide_text.replace("\n", " ")
+    # Split into more, smaller rows — never a "\n" inside one cell.
+    assert len(narrow.rows) > len(wide.rows) > 1
+    for result, width in ((wide, C.TRANSCRIPT_DEFAULT_LINE_LENGTH), (narrow, 20)):
+        for row in result.rows:
+            assert "\n" not in row[4]
+            assert len(row[4]) <= width
+    # Reassembling every row's text, in order, reproduces the utterance —
+    # splitting only changes how it is grouped into rows, never the words.
+    assert " ".join(row[4] for row in wide.rows) == " ".join(words)
+    assert " ".join(row[4] for row in narrow.rows) == " ".join(words)
+
+
+def test_transcript_show_split_rows_each_get_their_own_playable_anchor(
+    db: Database,
+) -> None:
+    """Entry 37's second decision, pinned: a block that splits into several
+    rows gets a distinct anchor per row (a sub-anchor), not the whole
+    utterance's anchor repeated — `search play` on the second row must
+    seek to *that* row's span, not to the start of the first."""
+    words = ["слово"] * 30 + ["конец"]
+    video_id = corpus(db, " ".join(words))
+    result = resolve("transcript.show").handler(
+        db, video=str(video_id), line_length=20
+    )
+    anchors = [row[0] for row in result.rows]
+    assert len(anchors) == len(set(anchors)), "rows must not share an anchor"
+    for row in result.rows:
+        span = span_for_anchor(db, row[0])
+        assert export.timestamp(span.start_ms) == row[1]
+        assert export.timestamp(span.end_ms) == row[2]
+        assert span.text == row[4]
+
+
+def test_transcript_show_keeps_the_whole_utterance_anchor_when_it_fits(
+    db: Database,
+) -> None:
+    """A block under `line_length` is one row, and that row keeps the
+    ordinary whole-utterance anchor — splitting is a no-op there, not a
+    second code path with a different anchor rule."""
+    video_id = corpus(db, "Добрый вечер дорогие друзья")
+    result = resolve("transcript.show").handler(db, video=str(video_id))
+    assert len(result.rows) == 1
+    assert result.rows[0][0] == f"v{video_id}:0-3"
 
 
 def test_transcript_show_leaves_a_short_line_untouched(db: Database) -> None:

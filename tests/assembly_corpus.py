@@ -17,6 +17,7 @@ import re
 import sqlite3
 from typing import Any
 
+from rytp import constants as C
 from rytp.db import Database
 from rytp.models import normalize_text, stem_text, utc_now_iso
 
@@ -112,6 +113,7 @@ def add_words(
     gap_ms: int = GAP_MS,
     source: str = "aligned",
     align_score: float | None = 0.9,
+    align_scale: str | None = None,
     engine: str = "fake",
     video_speaker_id: int | None = None,
 ) -> int:
@@ -126,6 +128,16 @@ def add_words(
     no ``align_score``, because nothing measured one — that is what makes
     them searchable and not cuttable. Only ``aligned`` rows carry a score,
     and even then it may be None when the aligner reports no confidence.
+
+    ``align_scale`` (plan §1a) defaults per the score table rather than to
+    a fixed value, so that untouched fixtures keep the meaning they always
+    had: a numeric ``align_score`` on an ``aligned`` row reads as the 0-1
+    ``energy`` measure every existing test already treats it as, and a
+    ``None`` score on an ``aligned`` row reads as ``none`` — the aligner
+    ran and reported nothing (MFA), never ``unknown``, which is reserved
+    for pre-batch rows this helper never produces. Pass it explicitly to
+    build a ``logprob``-scale (wav2vec2-shaped) or ``unknown``-scale
+    fixture.
     """
     row = db.conn.execute(
         "SELECT COALESCE(MAX(ord) + 1, 0) AS next FROM words WHERE video_id = ?", (video_id,)
@@ -133,6 +145,12 @@ def add_words(
     ordinal = int(row["next"])
     captions = source == "caption"
     scored = source == "aligned"
+    if align_scale is not None:
+        row_scale = align_scale
+    elif scored:
+        row_scale = C.ALIGN_SCALE_NONE if align_score is None else C.ALIGN_SCALE_ENERGY
+    else:
+        row_scale = None
     cursor_ms = start_ms
     rows: list[tuple[Any, ...]] = []
     # Split each whitespace-separated word on internal punctuation too, so
@@ -160,6 +178,7 @@ def add_words(
                     stem_text(normalized),
                     None,
                     align_score if scored else None,
+                    row_scale,
                     source,
                     engine,
                     video_speaker_id,
@@ -170,8 +189,8 @@ def add_words(
         cursor_ms += gap_ms
     db.conn.executemany(
         "INSERT INTO words (video_id, ord, start_ms, end_ms, text, normalized_text, stem, "
-        "confidence, align_score, source, engine, video_speaker_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "confidence, align_score, align_scale, source, engine, video_speaker_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     db.conn.commit()

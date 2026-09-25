@@ -10,6 +10,7 @@ refuses to run and no worker to run it.
 from __future__ import annotations
 
 from rytp import constants as C
+from rytp import timefmt
 from rytp.assemble import (
     SLOT_FRAGMENT,
     AssembleControls,
@@ -17,7 +18,9 @@ from rytp.assemble import (
     MatchFilters,
     assemble_target,
     cutlist_path,
+    newest_cutlist_paths,
     read_cutlist,
+    retarget_cutlist,
     suggest_substitutions,
     write_cutlist,
 )
@@ -26,8 +29,10 @@ from rytp.db import Database
 from rytp.models import InvalidInputError, NotFoundError, RytpError
 
 __all__ = [
+    "assemble_list",
     "assemble_plan",
     "assemble_remove",
+    "assemble_retarget",
     "assemble_show",
     "assemble_suggest",
     "format_ms",
@@ -57,13 +62,16 @@ def parse_ids(text: str) -> tuple[int, ...]:
 
 
 def format_ms(value: int) -> str:
-    """Milliseconds as a timestamp a person can find in a player."""
-    seconds, milliseconds = divmod(max(0, value), C.MS_PER_SECOND)
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
-    return f"{minutes}:{seconds:02d}.{milliseconds:03d}"
+    """Milliseconds as a timestamp a person can find in a player.
+
+    A seek target — the same purpose ``render run``'s report prints for a
+    fragment's source and output offsets — so this delegates to
+    :func:`rytp.timefmt.format_seek` and always carries the hour field.
+    Before BUGS.md entry 31 this printed `M:SS.mmm` (no hour below one
+    hour) while the render report printed `H:MM:SS.mmm`; the two are now
+    the same shape for the same measurement.
+    """
+    return timefmt.format_seek(value)
 
 
 def _slot_rows(cutlist: CutList) -> tuple[tuple[str, ...], ...]:
@@ -85,19 +93,30 @@ def _slot_rows(cutlist: CutList) -> tuple[tuple[str, ...], ...]:
 
 
 def _summary(cutlist: CutList) -> str:
-    """One line: how many pieces, from how many sources, how long, what is missing."""
+    """One line: how many pieces, from how many sources, how long, what is missing.
+
+    BUGS.md entry 26's acceptance criterion: an empty or partial result
+    must never read as silence. ``cutlist.gap_notes`` (plan-time only,
+    never persisted) names why each missing word matched nothing, so
+    "not found" is never the whole story.
+    """
     sources = {slot.video_id for slot in cutlist.fragments if slot.video_id is not None}
+    timed = sum(1 for slot in cutlist.fragments if slot.tier == "timed")
     parts = [
         f"{len(cutlist.fragments)} fragment{'' if len(cutlist.fragments) == 1 else 's'}",
         f"{len(sources)} source{'' if len(sources) == 1 else 's'}",
         format_ms(cutlist.duration_ms),
     ]
+    if timed:
+        parts.append(f"{timed} from the timed tier (--allow-timed)")
     if cutlist.gaps:
         missing = ", ".join(slot.text for slot in cutlist.gaps)
         parts.append(
             f"{len(cutlist.gaps)} word{'' if len(cutlist.gaps) == 1 else 's'} "
             f"not found: {missing}"
         )
+    if cutlist.gap_notes:
+        parts.append("; ".join(cutlist.gap_notes))
     return "; ".join(parts)
 
 
@@ -112,6 +131,7 @@ def assemble_plan(
     speaker: str | None = None,
     exclude: str = "",
     min_align: float = C.ASSEMBLE_MIN_ALIGN_SCORE,
+    allow_timed: bool = False,
     force: bool = False,
 ) -> CommandResult:
     """Work out which real fragments say ``target``, and write the cut list."""
@@ -122,6 +142,7 @@ def assemble_plan(
         speaker=speaker,
         exclude=parse_ids(exclude),
         min_align_score=min_align,
+        allow_timed=allow_timed,
     )
     cutlist = assemble_target(db, target, name=name or None, controls=controls)
     path = cutlist_path(cutlist.name)
@@ -135,8 +156,31 @@ def assemble_plan(
     )
 
 
-def assemble_show(db: Database, *, name: str) -> CommandResult:
+def assemble_list(db: Database) -> CommandResult:
+    """Every cut list's bare name — copy-pasteable into `assemble show`.
+
+    BUGS.md entry 27: the only way to enumerate cut lists before this was
+    to look in ``data/cutlists/`` by hand. Output is bare names, never
+    paths and never ``<name>.toml``, exactly what `assemble show` and
+    `render run` already accept. Most recently modified first, so a fresh
+    plan is the first thing the owner sees.
+    """
+    names = [path.stem for path in newest_cutlist_paths()]
+    return CommandResult(
+        columns=("name",),
+        rows=tuple((name,) for name in names),
+        message=f"{len(names)} cut list{'' if len(names) == 1 else 's'}",
+    )
+
+
+def assemble_show(db: Database, *, name: str = "") -> CommandResult:
     """Read a cut list back, validate it, and say what is in it."""
+    if not name:
+        # Typer would otherwise refuse this before the handler ever runs
+        # (`Missing argument 'name'`), which cannot point anywhere useful
+        # (BUGS.md entry 27). Giving the param a default and raising here
+        # keeps the pointer inside this command's own files.
+        raise InvalidInputError("no cut list named; try `assemble list`")
     cutlist = read_cutlist(name)
     wanted = sorted({slot.video_id for slot in cutlist.fragments if slot.video_id is not None})
     known: set[int] = set()
@@ -156,6 +200,33 @@ def assemble_show(db: Database, *, name: str) -> CommandResult:
         listed = ", ".join(str(video_id) for video_id in missing)
         message += f"; NOT RENDERABLE — not in the catalog: {listed}"
     return CommandResult(columns=_SLOT_COLUMNS, rows=_slot_rows(cutlist), message=message)
+
+
+def assemble_retarget(db: Database, *, name: str, target: str) -> CommandResult:
+    """Edit a cut list's target sentence, replanning only what changed.
+
+    The owner's ask: adding a word, or swapping one that has no cuttable
+    form for one that does, without re-running the whole plan and losing
+    every nudge, snap, swap and substitution already done by hand. See
+    `rytp.assemble.retarget_cutlist` for the algorithm and the cohesion
+    trade-off it accepts in exchange for keeping the rest of the file
+    untouched.
+    """
+    cutlist = read_cutlist(name)
+    result = retarget_cutlist(db, cutlist, target)
+    path = cutlist_path(name)
+    write_cutlist(result.cutlist, path)
+    message = (
+        f"wrote {path} — kept {result.kept} slot{'' if result.kept == 1 else 's'}, "
+        f"replanned {result.replanned}"
+    )
+    if result.gap_notes:
+        message += "; " + "; ".join(result.gap_notes)
+    return CommandResult(
+        columns=_SLOT_COLUMNS,
+        rows=_slot_rows(result.cutlist),
+        message=message,
+    )
 
 
 def assemble_suggest(
@@ -228,8 +299,14 @@ register(
             Param(
                 "min_align",
                 float,
-                "Skip words whose alignment score is below this.",
+                "Skip energy-scale aligned words below this score (0.0-1.0).",
                 default=C.ASSEMBLE_MIN_ALIGN_SCORE,
+            ),
+            Param(
+                "allow_timed",
+                bool,
+                "Also cut timed-tier words: no threshold, an override not a gate.",
+                default=False,
             ),
             Param("force", bool, "Replace an existing cut list of this name.", default=False),
         ),
@@ -242,8 +319,34 @@ register(
         name="assemble.show",
         group="assemble",
         summary="Read a cut list back and show its fragments and gaps.",
-        params=(Param("name", str, "Cut list name.", positional=True),),
+        params=(Param("name", str, "Cut list name.", positional=True, default=""),),
         handler=assemble_show,
+    )
+)
+
+register(
+    Command(
+        name="assemble.retarget",
+        group="assemble",
+        summary=(
+            "Edit a cut list's target sentence, keeping hand-tuned slots for "
+            "the words that didn't change."
+        ),
+        params=(
+            Param("name", str, "Cut list name.", positional=True),
+            Param("target", str, "The new target sentence.", positional=True),
+        ),
+        handler=assemble_retarget,
+    )
+)
+
+register(
+    Command(
+        name="assemble.list",
+        group="assemble",
+        summary="List every cut list by name.",
+        params=(),
+        handler=assemble_list,
     )
 )
 
@@ -284,7 +387,8 @@ def orphaned_renders(db: Database, name: str) -> tuple[tuple[str, ...], ...]:
     return tuple(
         (str(row["id"]), str(row["state"]), str(row["output_path"] or C.NULL_CELL))
         for row in db.conn.execute(
-            "SELECT id, state, output_path FROM renders WHERE cutlist_name = ? ORDER BY id",
+            "SELECT id, state, output_path FROM renders WHERE cutlist_name = ? "
+            "ORDER BY id DESC",
             (name,),
         )
     )

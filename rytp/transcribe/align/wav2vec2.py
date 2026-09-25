@@ -22,7 +22,7 @@ from rytp import constants as C
 from rytp.models import RytpError, Span
 from rytp.transcribe.base import slice_wav_window
 from rytp.transcribe.registry import register_aligner
-from rytp.transcribe.subproc import resolve_device, run_child
+from rytp.transcribe.subproc import load_cached, resolve_device, run_child
 
 
 def spans_from_frames(
@@ -161,43 +161,75 @@ def _resolve_delimiter(tokenizer: Any, vocabulary: Mapping[str, int], model: str
 
 def build_target_ids(
     words: Sequence[str], vocabulary: Mapping[str, int], *, delimiter: int
-) -> list[int]:
+) -> tuple[list[int], frozenset[int]]:
     """The full CTC target sequence: each word's own tokens, delimiter between.
 
-    No leading or trailing delimiter — :func:`word_frames` infers a frame's
-    word index from how many delimiter targets came before it, which only
-    works if delimiters appear strictly *between* words. Pure Python and
-    imports nothing heavy, so it is testable without torch.
+    Delimiters appear strictly *between* words — :func:`word_frames` infers a
+    frame's word index from how many delimiter targets came before it — with
+    one deliberate exception: a word none of whose characters are in the
+    model's vocabulary (wav2vec2's is Cyrillic letters, so a digit string
+    such as ``'22'`` has none) contributes zero tokens of its own. It still
+    gets its delimiter, so its position in the sequence is marked even though
+    its span between delimiters is empty. That is not a leading or trailing
+    delimiter in the *word* sense the invariant is about; it just means an
+    out-of-vocabulary word at either end of the whole sequence produces one.
+
+    Dropping such a word from the target sequence instead — the previous
+    behaviour raised outright — would desynchronise the CTC grouping and
+    misalign every word after it. Keeping its (empty) place means
+    :func:`word_frames` sees it exactly like a word that received no CTC
+    frames for other reasons: no entry in its bucket, so its boundary is
+    interpolated between its neighbours and a note names it, rather than the
+    whole video failing over one digit. The second return value is the set
+    of word indexes this happened to, so the caller can report which.
+
+    Pure Python and imports nothing heavy, so it is testable without torch.
     """
     case = _vocabulary_case(vocabulary)
     target_ids: list[int] = []
+    oov_indices: set[int] = set()
     for index, word in enumerate(words):
         tokens = _encode_word(word, vocabulary, case)
-        if not tokens:
-            raise RytpError(
-                f"wav2vec2 cannot align the word '{word}': none of its "
-                "characters are in the model's vocabulary"
-            )
         if index:
             target_ids.append(delimiter)
-        target_ids.extend(tokens)
-    return target_ids
+        if tokens:
+            target_ids.extend(tokens)
+        else:
+            oov_indices.add(index)
+    return target_ids, frozenset(oov_indices)
+
+
+def _load_processor_and_model(model_name: str, device: str) -> tuple[Any, Any]:
+    """Load once per ``(model, device)`` and cache — see :func:`load_cached`."""
+    from transformers import AutoModelForCTC, AutoProcessor
+
+    def _load() -> tuple[Any, Any]:
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = AutoModelForCTC.from_pretrained(model_name).eval().to(device)
+        return processor, model
+
+    return load_cached(("wav2vec2", model_name, device), _load)
 
 
 def child_main(request: dict[str, Any]) -> dict[str, Any]:
-    """Runs inside the torch interpreter. The only import of torch."""
+    """Runs inside the torch interpreter. The only import of torch.
+
+    The processor and model are cached across calls in this process (keyed
+    by model name and device) — the resident worker's whole reason for
+    existing over the old per-chunk one-shot child.
+    """
     import tempfile
     import wave
 
     import torch
     import torchaudio
-    from transformers import AutoModelForCTC, AutoProcessor
 
     device = resolve_device(str(request.get("device", C.ENGINE_DEFAULT_DEVICE)))
 
     start_ms = int(request["start_ms"])
     end_ms = int(request["end_ms"])
     words = [str(word) for word in request["words"]]
+    processor, model = _load_processor_and_model(str(request["model"]), device)
     with tempfile.TemporaryDirectory(prefix="rytp-w2v-") as tmp:
         window = slice_wav_window(
             Path(request["audio"]), Path(tmp) / "window.wav", start_ms, end_ms
@@ -208,13 +240,11 @@ def child_main(request: dict[str, Any]) -> dict[str, Any]:
             torch.frombuffer(bytearray(frames), dtype=torch.int16).float() / 32768.0
         ).unsqueeze(0).to(device)
 
-        processor = AutoProcessor.from_pretrained(request["model"])
-        model = AutoModelForCTC.from_pretrained(request["model"]).eval().to(device)
         with torch.inference_mode():
             emissions = torch.log_softmax(model(waveform).logits, dim=-1)
         vocabulary = processor.tokenizer.get_vocab()
         delimiter = _resolve_delimiter(processor.tokenizer, vocabulary, request["model"])
-        target_ids = build_target_ids(words, vocabulary, delimiter=delimiter)
+        target_ids, oov_indices = build_target_ids(words, vocabulary, delimiter=delimiter)
 
         targets = torch.tensor([target_ids], dtype=torch.int32, device=device)
         aligned, scores = torchaudio.functional.forced_align(
@@ -222,7 +252,12 @@ def child_main(request: dict[str, Any]) -> dict[str, Any]:
         )
 
     frames_out, notes = word_frames(
-        aligned[0].tolist(), scores[0].tolist(), targets=target_ids, delimiter=delimiter
+        aligned[0].tolist(),
+        scores[0].tolist(),
+        targets=target_ids,
+        delimiter=delimiter,
+        words=words,
+        oov_indices=oov_indices,
     )
     return {"frames": frames_out, "notes": notes, "device": device}
 
@@ -234,6 +269,8 @@ def word_frames(
     targets: Sequence[int],
     delimiter: int,
     blank: int = 0,
+    words: Sequence[str] | None = None,
+    oov_indices: frozenset[int] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Group the character-level CTC path back into one entry per word.
 
@@ -254,7 +291,15 @@ def word_frames(
 
     Returns the per-word frame entries, pure Python, and a list of notes for
     any word that received no frames of its own — a narrow, observable
-    fallback, not the silent equal-division this replaces.
+    fallback, not the silent equal-division this replaces. ``oov_indices``
+    (from :func:`build_target_ids`) names which of those, if any, were empty
+    by construction — no characters in the vocabulary — rather than a CTC
+    miss, so the note can say which and, with ``words``, name the word
+    itself. Its `align_score` for that entry is `None` regardless: this
+    function never scored it, so the pipeline's `resolve_word_scale` treats
+    it exactly like an aligner that ran and had nothing to report for that
+    word (`align_scale = 'none'`, or `'energy'` if `--refine` fills it) — the
+    honest description of what happened, not a fifth scale.
     """
     num_words = list(targets).count(delimiter) + 1 if targets else 1
 
@@ -299,10 +344,18 @@ def word_frames(
         if entry is not None:
             out.append(entry)
             continue
-        notes.append(
-            f"wav2vec2: word {index} received no CTC frames; its boundary was "
-            "interpolated between its neighbours"
-        )
+        if index in oov_indices:
+            name = repr(words[index]) if words is not None and index < len(words) else "?"
+            notes.append(
+                f"wav2vec2: word {index} ({name}) has no characters in the "
+                "model's vocabulary; its boundary was interpolated between "
+                "its neighbours"
+            )
+        else:
+            notes.append(
+                f"wav2vec2: word {index} received no CTC frames; its boundary "
+                "was interpolated between its neighbours"
+            )
         left = next((resolved[j] for j in range(index - 1, -1, -1) if resolved[j]), None)
         right = next(
             (resolved[j] for j in range(index + 1, num_words) if resolved[j]), None

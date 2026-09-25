@@ -141,3 +141,103 @@ information with no signature change anywhere. This mirrors exactly the
 reasoning that gave job handlers a return note (§5): an operation that can
 only raise or stay silent has nowhere to put "this succeeded, and there is
 something you should know."
+
+## 7. `words.orig_start_ms` / `words.orig_end_ms`, and `transcribe.unalign`
+
+**Forces the change:** `BUGS.md` entry 44. `words.start_ms`/`end_ms` are
+overwritten in place by both `realign_video` and, when `--refine` is on, by
+the energy refiner — so the transcriber's own timing is gone the instant
+either runs, and the entry's own proposed fix (relabel `aligned` back to
+`timed`, keeping whatever timings happen to be on the row) was only ever a
+consolation prize. It made `--allow-timed`'s two rows in "Score precedence
+and scale" — a `timed` row with a real energy score vs. one with none —
+indistinguishable from a `timed` row that is secretly still carrying aligned
+boundaries wearing the wrong label. The owner asked for the real fix:
+capture the original at write time, so an alignment is reversible for real.
+
+**What breaks if not made:** `transcribe unalign` (below) has no source of
+truth to restore from and degrades back into "relabel and hope," which is
+the exact non-fix the entry already rejected.
+
+**The columns.** Two new nullable `INTEGER` columns on `words`, gained by
+migration 16, no `CHECK` (same reason as `align_scale`: SQLite cannot add one
+via `ALTER TABLE`, and there is nothing to check here anyway — both are
+either both `NULL` or both set). Written **once, at INSERT time, by whichever
+writer creates the row**, and never touched again — not by `--refine`, not by
+`realign_video`, not by anything. That last part is the entire point: a
+second alignment's input must never become the new "original," or the
+ratchet breaks after one round trip.
+
+**What counts as "original."** The transcriber's own per-token timing,
+*before* alignment and *before* `--refine` touches anything — i.e. `RawWord`
+after `_expand_tokens`' per-token split, read before `refine_boundaries` ever
+runs. Not post-refinement. Three reasons, strongest first:
+
+1. Restoring pre-refinement originals and clearing `align_score`/
+   `align_scale` lands exactly on the "No aligner, no refine" row of the
+   score-precedence table — a state the schema already knows how to mean.
+   Restoring *post*-refinement boundaries with a cleared score would match no
+   row in that table: a refined boundary with no score is not a state
+   anything else in the system produces.
+2. In the combined path, `refine_boundaries` runs on the *aligner's* spans,
+   not the transcriber's own — so "post-refinement transcriber timing" is not
+   even a coherent thing to ask for there. Pre-refinement is the only
+   definition that means the same thing in both the combined path and
+   `realign_video`.
+3. It is the more honest reading of "original": what the transcriber said,
+   full stop, with nothing measured or aligned laid on top of it yet.
+
+**Both bounds or neither.** A token whose transcriber timing is a start with
+no end (Whisper-class engines routinely omit one) is not restorable — writing
+just the start would make `unalign` produce a `timed` row with `end_ms NULL`,
+which the schema's own `CHECK` rejects for anything but `caption`. Both
+`orig_start_ms` and `orig_end_ms` are set only when the transcriber supplied
+both; otherwise both stay `NULL`.
+
+**Captions have no original.** `caption`-tier rows are never produced by
+`transcribe_video`/`replace_words` — they come from `rytp/transcribe/captions.py`'s
+own `INSERT`, which this change does not touch. There is nothing to restore a
+caption row *to*: alignment promotes a video away from `caption` (§3, "Should
+captions be promotable" aside), it never demotes back to it, so `unalign`
+never needs to reach a caption row. Both columns stay `NULL` for `caption`
+words by construction, and that is the whole of the decision.
+
+**Pre-existing rows, and the other way a row can lack an original.** Every
+row written before migration 16 has `NULL` in both columns — there is no
+guess worth backfilling, the same call migration 13 made for `align_scale`'s
+`unknown`. But a second, distinct case produces the same `NULL`: a row
+written *after* migration 16 by a transcriber that emitted text only under an
+aligner (contracts §4 permits `RawWord.start_ms`/`end_ms` to both be `None`),
+so there was never an original to capture regardless of when the row was
+written. `transcribe unalign` treats both cases identically — refuse, with a
+message naming both possibilities, rather than resolve them differently or
+guess. `replace_words` rewrites every row of a video in one transaction, so
+in practice a given video's `aligned` rows are uniformly restorable or
+uniformly not; the command need not — and does not — support restoring half a
+video.
+
+**`transcribe.unalign <video>`.** Sets `source = 'timed'` for the video's
+`aligned` rows, restores `start_ms`/`end_ms` from the two new columns, clears
+`align_score` and `align_scale`, and resets `engine` to the base transcriber
+name (`engine.split("+")[0]`, the same recovery `realign_video` already does
+the other direction) — because `words.engine` is documented as recording
+"every stage that touched these timings" (contracts §3), and a `timed` row
+still tagged `gigaam+wav2vec2+energy` would be exactly that lie, visible in
+`videos list --long`'s `engines` column. Text, ordinals, `video_speaker_id`
+and confidence are untouched. `utterances` are deleted (they copy timings)
+and the index job is re-enqueued, the same as `transcribe.align`. Refuses
+outright, for the whole video, when any `aligned` row has no recorded
+original — see above. Not a job kind: it is a single `UPDATE` plus a
+`DELETE`, cheap enough to run inline, so it is registered `long_running=False`
+and does not appear in `tests/test_consistency_jobs.py`'s job-kind roster.
+
+**Alternative rejected:** keep `words.start_ms`/`end_ms` as the only timing
+columns and have `unalign` merely flip `source` back to `timed`, per the
+entry's own original, more modest proposal. Rejected because it was written
+*before* this fix was possible — the entry says so explicitly ("a downgrade
+therefore cannot restore \[the old boundaries] — it can only relabel the
+current boundaries as `timed`"). Now that the originals survive, doing the
+weaker thing on purpose would be strictly worse than what the schema can
+support, and would leave `--allow-timed` reasoning about a `timed` tier that
+sometimes secretly holds aligned-quality boundaries under a `timed` label
+with no way to tell which.

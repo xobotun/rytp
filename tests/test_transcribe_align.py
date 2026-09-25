@@ -227,6 +227,33 @@ def test_word_frames_with_no_frames_at_all_falls_back_to_frame_zero() -> None:
     assert len(notes) == 1
 
 
+def test_word_frames_names_an_out_of_vocabulary_word_distinctly() -> None:
+    """Defect 2: a word with no vocabulary tokens (e.g. a digit) contributes
+    no frames by construction, not by a CTC miss — the note must say so and
+    name the word, not just "received no CTC frames"."""
+    targets = [1, _DELIM, _DELIM, 2]  # word 1 ('22') is empty between delimiters
+    path = [1, 1, 0, _DELIM, 0, _DELIM, 0, 2, 2]
+    scores = [0.0] * len(path)
+    frames, notes = word_frames(
+        path,
+        scores,
+        targets=targets,
+        delimiter=_DELIM,
+        words=["раз", "22", "три"],
+        oov_indices=frozenset({1}),
+    )
+    assert len(frames) == 3
+    assert frames[1] == {
+        "first_frame": frames[0]["last_frame"] + 1,
+        "last_frame": max(frames[0]["last_frame"] + 1, frames[2]["first_frame"] - 1),
+        "score": None,
+    }
+    assert len(notes) == 1
+    assert "22" in notes[0]
+    assert "vocabulary" in notes[0]
+    assert "word 1" in notes[0]
+
+
 # --- The upstream defect: the delimiter and the vocabulary case ---
 
 
@@ -254,21 +281,41 @@ def test_resolve_delimiter_raises_naming_the_model_when_neither_resolves() -> No
 
 def test_build_target_ids_uses_the_delimiter_only_between_words() -> None:
     vocabulary = {"а": 1, "б": 2, "|": 9}
-    assert build_target_ids(["а", "б"], vocabulary, delimiter=9) == [1, 9, 2]
-    assert build_target_ids(["а"], vocabulary, delimiter=9) == [1]
+    ids, oov = build_target_ids(["а", "б"], vocabulary, delimiter=9)
+    assert (ids, oov) == ([1, 9, 2], frozenset())
+    ids, oov = build_target_ids(["а"], vocabulary, delimiter=9)
+    assert (ids, oov) == ([1], frozenset())
 
 
 def test_build_target_ids_case_folds_to_the_vocabulary() -> None:
     # Vocabulary is lower-case only; an upper-case word must still encode.
     # "а" is the letter _vocabulary_case probes on to decide the model's case.
     vocabulary = {"а": 0, "п": 1, "р": 2, "и": 3, "в": 4, "е": 5, "т": 6, "|": 9}
-    assert build_target_ids(["ПРИВЕТ"], vocabulary, delimiter=9) == [1, 2, 3, 4, 5, 6]
+    ids, oov = build_target_ids(["ПРИВЕТ"], vocabulary, delimiter=9)
+    assert (ids, oov) == ([1, 2, 3, 4, 5, 6], frozenset())
 
 
-def test_build_target_ids_raises_naming_the_word_with_no_vocabulary_tokens() -> None:
+def test_build_target_ids_keeps_an_out_of_vocabulary_word_marked_not_dropped() -> None:
+    """A digit such as '22' has no Cyrillic characters in the vocabulary.
+
+    It must not be dropped from the target sequence — that would
+    desynchronise every word after it — nor raise. It gets a delimiter
+    marking its place and no tokens of its own, and its index comes back in
+    the OOV set so the caller can report it.
+    """
+    vocabulary = {"а": 1, "б": 2, "|": 9}
+    ids, oov = build_target_ids(["а", "22", "б"], vocabulary, delimiter=9)
+    # word 0's token, delimiter, (nothing for '22'), delimiter, word 2's token.
+    assert ids == [1, 9, 9, 2]
+    assert oov == frozenset({1})
+
+
+def test_build_target_ids_out_of_vocabulary_word_at_either_end() -> None:
     vocabulary = {"а": 1, "|": 9}
-    with pytest.raises(RytpError, match="бб"):
-        build_target_ids(["а", "бб"], vocabulary, delimiter=9)
+    ids, oov = build_target_ids(["22", "а"], vocabulary, delimiter=9)
+    assert (ids, oov) == ([9, 1], frozenset({0}))
+    ids, oov = build_target_ids(["а", "22"], vocabulary, delimiter=9)
+    assert (ids, oov) == ([1, 9], frozenset({1}))
 
 
 def test_vocabulary_case_is_probed_not_assumed() -> None:

@@ -138,6 +138,24 @@ def test_the_occurrence_lookup_uses_the_partial_index(db: Database) -> None:
     assert "words_alignable" in plan, plan
 
 
+def test_allow_timed_uses_both_partial_indexes(db: Database) -> None:
+    """plan Task 6, "how to implement D1": the flag's path must be a
+    UNION ALL of two per-tier queries, each sitting on its own partial
+    index, or the caption tier gets scanned inside the timed half.
+    `source IN (...)` would satisfy neither `words_alignable` nor
+    `words_timed`, so this is the test that would catch that regression;
+    statement counting cannot."""
+    build(db, 2)
+    db.conn.execute("ANALYZE")
+    sql, params = occurrence_query(MatchFilters(allow_timed=True))
+    plan = " ".join(
+        str(row["detail"]) for row in db.conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+    )
+    assert "words_alignable" in plan, plan
+    assert "words_timed" in plan, plan
+    assert "words_normalized" not in plan, plan
+
+
 def test_the_caption_corpus_does_not_change_the_answer(db: Database) -> None:
     """Whatever the captions say, only the aligned minority is cut."""
     build(db, 1)

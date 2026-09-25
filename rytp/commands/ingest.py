@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -398,7 +399,7 @@ def jobs_list(
     db: Database, *, state: str = "", pool: str = "", kind: str = "",
     limit: int = C.JOB_LIST_LIMIT,
 ) -> CommandResult:
-    """Show jobs, highest priority first."""
+    """Show jobs, most recently created first."""
     jobs = Q.list_jobs(
         db, state=state or None, pool=pool or None, kind=kind or None, limit=limit
     )
@@ -406,18 +407,48 @@ def jobs_list(
     def _cell(text: str | None) -> str:
         return next(iter((text or "").splitlines()), "")[: C.JOB_ERROR_PREVIEW_CHARS]
 
+    def _progress_cell(j: Q.Job) -> str:
+        # contracts §5: `jobs.progress` is advisory and cleared the instant a
+        # job leaves `running` — but a job that just finished can still carry
+        # a value written a moment before the clearing write committed (or an
+        # older row from before this batch's migration). Gating on `state`
+        # here, not just on the column being set, is what keeps a `done` or
+        # `failed` row from reading as if it were still moving.
+        if j.state != "running":
+            return ""
+        return _cell(j.progress)
+
     rows = tuple(
         (
             str(j.id), j.kind, str(j.target_id), j.state, j.pool, str(j.attempts),
-            j.not_before or "", _cell(j.last_error), _cell(j.note),
+            j.not_before or "", _cell(j.last_error), _cell(j.note), _progress_cell(j),
         )
         for j in jobs
     )
     return CommandResult(
         columns=("id", "kind", "target", "state", "pool", "attempts",
-                 "not_before", "error", "note"),
+                 "not_before", "error", "note", "progress"),
         rows=rows,
-        message=None if rows else "no jobs match",
+        message=_queue_message(db, jobs) if rows else "no jobs match",
+    )
+
+
+def _queue_message(db: Database, jobs: Sequence[Q.Job]) -> str | None:
+    """Warn when work is queued and nothing is draining it.
+
+    BUGS.md entry 41: enqueueing only writes a row — a separate `rytp
+    worker` process does the work — and nothing said so, so a full queue
+    looked like a broken one. The lease already records whether a worker is
+    alive; this just reads it.
+    """
+    from rytp.jobs.worker import live_lease
+
+    pending = sum(1 for job in jobs if job.state == "pending")
+    if not pending or live_lease(db) is not None:
+        return None
+    return (
+        f"{pending} job(s) pending and no worker is running — "
+        f"start one with: rytp worker"
     )
 
 

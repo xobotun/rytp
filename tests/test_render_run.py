@@ -191,6 +191,29 @@ def test_a_failed_fragment_stops_the_render_with_ffmpegs_complaint(
         RUN.render_cutlist(db, two_fragment_request(vid), tools=Tools.faked(runner))
 
 
+def test_newest_existing_prefers_the_newest_rendition_that_is_still_on_disk(
+    db: Database, tmp_path: Path
+) -> None:
+    """design §4: upgrading a rendition is just another insert, so the
+    newest row wins — but only among the ones whose file is actually there
+    (contracts §3, "existence is checked"). ``assets_for`` now returns
+    newest-first; this is the one caller that depends on that order, so it
+    is pinned directly rather than trusted to the shared helper's own tests.
+    """
+    from rytp.db.queries import insert_asset
+    from tests.fakes import make_video, touch
+
+    vid = make_video(db)
+    older = touch(tmp_path / "v360.mp4")
+    newer = touch(tmp_path / "v720.mp4")
+    insert_asset(db, video_id=vid, role="video", format_id="360", path=str(older))
+    insert_asset(db, video_id=vid, role="video", format_id="720", path=str(newer))
+    assert RUN._newest_existing(db, vid, "video") == newer
+
+    newer.unlink()  # the newest rendition's file vanished outside the tool
+    assert RUN._newest_existing(db, vid, "video") == older
+
+
 def test_the_job_payload_carries_the_options_and_nothing_else() -> None:
     options = RUN.RenderOptions(canvas_mode="bbox", gap_ms=0, loudnorm=False, crf=24)
     payload = RUN.payload_for(options)

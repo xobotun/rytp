@@ -17,9 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from rytp import constants as C
-
-_MS_PER_MINUTE = 60_000
-_MS_PER_HOUR = 3_600_000
+from rytp import timefmt
 
 
 @dataclass(frozen=True)
@@ -59,6 +57,13 @@ class FragmentReport:
     gap_after_ms: int
     gap_origin: str
     text: str
+    #: The tier this fragment was cut from (``aligned`` | ``timed``), or
+    #: ``None`` when the adapter did not supply one. D1: `--allow-timed`
+    #: is an override with no quality check, so this is the only signal
+    #: that a cut came from unaligned data, and the render's source list
+    #: is what the owner publishes — never default a missing tier to
+    #: ``aligned``, that would hide exactly what this field exists to show.
+    tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,10 @@ class SourceReport:
     gain_db: float | None
     first_output_ms: int
     geometry: str
+    #: How many of this source's fragments were cut from the `timed`
+    #: tier (`--allow-timed`), out of `fragment_count`. Zero for a source
+    #: cut entirely from `aligned` fragments.
+    timed_fragment_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,23 +106,23 @@ class RenderReport:
 
 
 def format_timecode(ms: int) -> str:
-    """``H:MM:SS.mmm`` — precise enough to seek to in a player."""
-    ms = max(0, int(ms))
-    hours, rest = divmod(ms, _MS_PER_HOUR)
-    minutes, rest = divmod(rest, _MS_PER_MINUTE)
-    secs, millis = divmod(rest, C.MS_PER_SECOND)
-    return f"{hours}:{minutes:02d}:{secs:02d}.{millis:03d}"
+    """``H:MM:SS.mmm`` — precise enough to seek to in a player.
+
+    Delegates to :func:`rytp.timefmt.format_seek`, kept as a re-export so
+    every existing call site (this module's own table renderer,
+    ``rytp/commands/render.py``) is unchanged. A plan's fragment offsets
+    and a render's report offsets are the same purpose — a seek target —
+    so both go through the one formatter (BUGS.md entry 31).
+    """
+    return timefmt.format_seek(ms)
 
 
 def format_clock(ms: int) -> str:
-    """``M:SS``, or ``H:MM:SS`` past an hour — the form a description wants."""
-    ms = max(0, int(ms))
-    hours, rest = divmod(ms, _MS_PER_HOUR)
-    minutes, rest = divmod(rest, _MS_PER_MINUTE)
-    secs = rest // C.MS_PER_SECOND
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
+    """``M:SS``, or ``H:MM:SS`` past an hour — the form a description wants.
+
+    Delegates to :func:`rytp.timefmt.format_spoken`.
+    """
+    return timefmt.format_spoken(ms)
 
 
 def _cell(text: str | None) -> str:
@@ -166,8 +175,8 @@ def render_markdown(report: RenderReport) -> str:
     out += [
         "## Fragments",
         "",
-        "| # | output | source | speaker | source in → out | gap after | text |",
-        "|--:|---|---|---|---|--:|---|",
+        "| # | output | source | tier | speaker | source in → out | gap after | text |",
+        "|--:|---|---|---|---|---|--:|---|",
     ]
     for fragment in report.fragments:
         out.append(
@@ -175,6 +184,7 @@ def render_markdown(report: RenderReport) -> str:
             f"| {format_timecode(fragment.output_start_ms)} → "
             f"{format_timecode(fragment.output_end_ms)} "
             f"| video {fragment.video_id} — {_cell(fragment.video_title)} "
+            f"| {_cell(fragment.tier)} "
             f"| {_cell(fragment.speaker)} "
             f"| {format_timecode(fragment.source_start_ms)} → "
             f"{format_timecode(fragment.source_end_ms)} "
@@ -206,10 +216,13 @@ def render_markdown(report: RenderReport) -> str:
         "|--:|---|--:|--:|---|---|---|",
     ]
     for source in report.sources:
+        fragment_count = str(source.fragment_count)
+        if source.timed_fragment_count:
+            fragment_count += f" ({source.timed_fragment_count} timed)"
         out.append(
             f"| {source.video_id} "
             f"| {_cell(source.title)} "
-            f"| {source.fragment_count} "
+            f"| {fragment_count} "
             f"| {format_timecode(source.used_ms)} "
             f"| {_cell(source.geometry)} "
             f"| {_number(source.measured_lufs, suffix=' LUFS')} "
